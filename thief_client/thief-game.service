@@ -1,0 +1,16 @@
+[Unit]
+Description=Thief Game Client
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/thief_client
+ExecStart=/usr/bin/python3 /home/pi/thief_client/main.py
+Restart=always
+RestartSec=3
+Environment=DISPLAY=:0
+Environment=SDL_VIDEODRIVER=kmsdrm
+
+[Install]
+WantedBy=multi-user.target
