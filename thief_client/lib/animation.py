@@ -120,17 +120,20 @@ class ThiefAnimator:
     ROW_SOUTH = 2  # Aşağı
     ROW_WEST = 3   # Sola
     
-    def __init__(self, sprite_sheet_path: str, scale: int = 4, anim_fps: int = 12):
+    def __init__(self, sprite_sheet_path: str, scale: int = 4, anim_fps: int = 12, 
+                 fall_sprite_path: Optional[str] = None):
         """
         Args:
-            sprite_sheet_path: Sprite sheet dosya yolu
+            sprite_sheet_path: Ana sprite sheet dosya yolu (walk için)
             scale: Büyütme faktörü
             anim_fps: Animasyon FPS
+            fall_sprite_path: Düşme sprite sheet yolu (opsiyonel)
         """
         # 48x64 sprite sheet için
         self.sheet = SpriteSheet(sprite_sheet_path, 48, 64)
         self.scale = scale
         self.anim_fps = anim_fps
+        self.fall_sprite_path = fall_sprite_path
         
         # Frame boyutları
         self.frame_width = 48 * scale
@@ -167,18 +170,63 @@ class ThiefAnimator:
         self.run_frames_left = self.west_frames
         self.run_frames_right = self.east_frames
         
-        # Fall animasyonları (her iki yön için)
-        self.fall_frames_left = self._create_fall_frames(self.west_frames[1], -1)
-        self.fall_frames_right = self._create_fall_frames(self.east_frames[1], 1)
+        # Fall animasyonları - gerçek sprite varsa kullan, yoksa döndürme efekti
+        if self.fall_sprite_path and os.path.exists(self.fall_sprite_path):
+            self.fall_frames_left = self._load_fall_sprites(self.fall_sprite_path, flip=False)
+            self.fall_frames_right = self._load_fall_sprites(self.fall_sprite_path, flip=True)
+        else:
+            self.fall_frames_left = self._create_fall_frames_rotate(self.west_frames[1], -1)
+            self.fall_frames_right = self._create_fall_frames_rotate(self.east_frames[1], 1)
         
         # Animatörler (varsayılan: sola)
         self.run_animator = Animator(self.run_frames_left, self.anim_fps)
         self.fall_animator = Animator(self.fall_frames_left, self.anim_fps)
     
-    def _create_fall_frames(self, base_frame: pygame.Surface, direction: int = -1) -> List[pygame.Surface]:
+    def _load_fall_sprites(self, path: str, flip: bool = False) -> List[pygame.Surface]:
         """
-        Düşme animasyonu oluştur (basit döndürme efekti)
-        Gerçek projede özel fall sprite'ları kullanılmalı
+        Gerçek düşme sprite'larını yükle
+        
+        Args:
+            path: Sprite sheet yolu (üst satır: walk, alt satır: fall)
+            flip: Yatay çevir (sağa gidiş için)
+        """
+        fall_frames = []
+        
+        # Sprite sheet'i yükle
+        sheet = pygame.image.load(path).convert_alpha()
+        sheet_width = sheet.get_width()
+        sheet_height = sheet.get_height()
+        
+        # Fall frame'leri alt satırda, frame genişliği ~48-50px, yükseklik ~50-60px
+        # Sprite sheet'in alt yarısını kullan
+        frame_width = 48
+        frame_height = 64
+        num_frames = 3
+        
+        # Alt satır y offset (sheet yüksekliğinin yarısı civarı)
+        fall_row_y = 64  # Walk row'dan sonra
+        
+        for i in range(num_frames):
+            x = i * frame_width
+            y = fall_row_y
+            
+            # Frame'i kes
+            frame = pygame.Surface((frame_width, frame_height), pygame.SRCALPHA)
+            frame.blit(sheet, (0, 0), (x, y, frame_width, frame_height))
+            
+            # Flip gerekiyorsa
+            if flip:
+                frame = pygame.transform.flip(frame, True, False)
+            
+            # Ölçekle
+            scaled = pygame.transform.scale(frame, (self.frame_width, self.frame_height))
+            fall_frames.append(scaled)
+        
+        return fall_frames
+    
+    def _create_fall_frames_rotate(self, base_frame: pygame.Surface, direction: int = -1) -> List[pygame.Surface]:
+        """
+        Döndürme efekti ile düşme animasyonu oluştur (fallback)
         
         Args:
             base_frame: Temel frame
@@ -187,11 +235,9 @@ class ThiefAnimator:
         fall_frames = []
         
         # 6 frame'lik düşme animasyonu
-        # Sola gidiyorsa sağa dönerek düşer, sağa gidiyorsa sola dönerek düşer
         angles = [0, 15, 30, 45, 60, 90]
         
         for angle in angles:
-            # Yöne göre döndürme yönünü belirle
             rotated = pygame.transform.rotate(base_frame, angle * (-direction))
             fall_frames.append(rotated)
         

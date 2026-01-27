@@ -72,11 +72,20 @@ class ThiefGame:
             print("Lütfen thief.png dosyasını assets/ klasörüne kopyalayın")
             sys.exit(1)
         
+        # Fall sprite yolu (düşme animasyonu)
+        fall_sprite_path = os.path.join(script_dir, "assets", "thief_with_fall.png")
+        if not os.path.exists(fall_sprite_path):
+            # Alternatif yol
+            fall_sprite_path = os.path.join(script_dir, "..", "thief-1.0", "thief.png")
+        if not os.path.exists(fall_sprite_path):
+            fall_sprite_path = None  # Fallback: döndürme efekti kullanılacak
+        
         # Animatör
         self.animator = ThiefAnimator(
             sprite_path,
             scale=self.config.thief_scale,
-            anim_fps=self.config.anim_fps
+            anim_fps=self.config.anim_fps,
+            fall_sprite_path=fall_sprite_path
         )
         self.animator.set_state("run")
         
