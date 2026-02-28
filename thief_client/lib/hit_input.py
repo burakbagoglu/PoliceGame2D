@@ -1,6 +1,12 @@
 """
-Hit Input modülü - Arduino'dan serial port üzerinden "HIT" sinyali okuma
-Thread + Queue modeli ile ana loop'u bloklamadan çalışır
+Hit Input modülü - Piezo sensörden GPIO üzerinden vuruş algılama
+3 pinli dijital piezo modülü (VCC, GND, S) doğrudan Pi GPIO'ya bağlanır
+Arduino'ya gerek yoktur.
+
+Donanım Bağlantısı (Piezo Modül → Pi Zero 2 W):
+  VCC → 3.3V (Pin 1)
+  GND → GND  (Pin 6)
+  S   → GPIO 17 (Pin 11)  [config ile değiştirilebilir]
 """
 import threading
 import queue
@@ -8,127 +14,104 @@ import time
 from typing import Optional
 
 try:
-    import serial
-    SERIAL_AVAILABLE = True
+    import RPi.GPIO as GPIO
+    GPIO_AVAILABLE = True
 except ImportError:
-    SERIAL_AVAILABLE = False
-    print("[UYARI] pyserial yüklü değil, simülasyon modunda çalışacak")
+    GPIO_AVAILABLE = False
+    print("[UYARI] RPi.GPIO yüklü değil, simülasyon modunda çalışacak")
 
 
 class HitInput:
-    """Arduino'dan hit sinyali okuyan sınıf"""
+    """Piezo sensörden GPIO ile hit algılayan sınıf"""
     
-    def __init__(self, port: str = "/dev/ttyUSB0", baud: int = 9600, debug: bool = False):
+    def __init__(self, gpio_pin: int = 17, debounce_ms: int = 200, debug: bool = False):
         """
         Args:
-            port: Serial port (örn: /dev/ttyUSB0, COM3)
-            baud: Baud rate
+            gpio_pin: Piezo sensörün bağlı olduğu GPIO pin numarası (BCM)
+            debounce_ms: Debounce süresi (ms) - art arda vuruşları engeller
             debug: Debug modunda mı çalışacak
         """
-        self.port = port
-        self.baud = baud
+        self.gpio_pin = gpio_pin
+        self.debounce_ms = debounce_ms
         self.debug = debug
         
         self.hit_queue: queue.Queue = queue.Queue()
-        self.serial_conn: Optional[serial.Serial] = None
         self.running = False
-        self.thread: Optional[threading.Thread] = None
         
         # Bağlantı durumu
         self.connected = False
         self.last_error: Optional[str] = None
+        
+        # Debounce için son hit zamanı
+        self._last_hit_time: float = 0
     
     def start(self):
-        """Serial okuma thread'ini başlat"""
-        if not SERIAL_AVAILABLE:
-            print("[HitInput] Serial kütüphanesi yok, simülasyon modunda")
+        """GPIO pin'ini yapılandır ve interrupt'ı başlat"""
+        if not GPIO_AVAILABLE:
+            print("[HitInput] RPi.GPIO kütüphanesi yok, simülasyon modunda")
             self.connected = False
             return
         
-        self.running = True
-        self.thread = threading.Thread(target=self._read_loop, daemon=True)
-        self.thread.start()
-        
-        if self.debug:
-            print(f"[HitInput] Thread başlatıldı: {self.port}")
-    
-    def stop(self):
-        """Serial okuma thread'ini durdur"""
-        self.running = False
-        
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=1.0)
-        
-        if self.serial_conn and self.serial_conn.is_open:
-            self.serial_conn.close()
-        
-        if self.debug:
-            print("[HitInput] Thread durduruldu")
-    
-    def _connect(self) -> bool:
-        """Serial bağlantısını kur"""
         try:
-            self.serial_conn = serial.Serial(
-                port=self.port,
-                baudrate=self.baud,
-                timeout=0.1  # 100ms timeout
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setup(self.gpio_pin, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+            
+            # Falling edge: sensör vuruş algıladığında HIGH→LOW geçişi
+            # Rising edge: sensör vuruş algıladığında LOW→HIGH geçişi
+            # Modüle göre ikisinden birini kullanabiliriz, BOTH ile her iki durumu da yakalarız
+            GPIO.add_event_detect(
+                self.gpio_pin,
+                GPIO.RISING,
+                callback=self._gpio_callback,
+                bouncetime=self.debounce_ms
             )
+            
             self.connected = True
+            self.running = True
             self.last_error = None
             
             if self.debug:
-                print(f"[HitInput] Bağlantı kuruldu: {self.port}")
-            
-            return True
-        except serial.SerialException as e:
+                print(f"[HitInput] GPIO {self.gpio_pin} yapılandırıldı (debounce: {self.debounce_ms}ms)")
+        
+        except Exception as e:
             self.connected = False
             self.last_error = str(e)
             
             if self.debug:
-                print(f"[HitInput] Bağlantı hatası: {e}")
-            
-            return False
+                print(f"[HitInput] GPIO yapılandırma hatası: {e}")
     
-    def _read_loop(self):
-        """
-        Serial okuma döngüsü (ayrı thread'de çalışır)
-        Arduino'dan "HIT\n" geldiğinde queue'ya ekler
-        """
-        reconnect_delay = 1.0  # Yeniden bağlanma bekleme süresi
+    def stop(self):
+        """GPIO temizliği yap"""
+        self.running = False
         
-        while self.running:
-            # Bağlantı yoksa bağlan
-            if not self.connected or not self.serial_conn or not self.serial_conn.is_open:
-                if not self._connect():
-                    time.sleep(reconnect_delay)
-                    continue
-            
+        if GPIO_AVAILABLE:
             try:
-                # Satır oku
-                line = self.serial_conn.readline()
-                
-                if line:
-                    # Decode et ve temizle
-                    text = line.decode("utf-8", errors="ignore").strip()
-                    
-                    if text == "HIT":
-                        self.hit_queue.put("HIT")
-                        
-                        if self.debug:
-                            print("[HitInput] HIT algılandı!")
+                GPIO.remove_event_detect(self.gpio_pin)
+                GPIO.cleanup(self.gpio_pin)
+            except Exception:
+                pass
+        
+        if self.debug:
+            print("[HitInput] GPIO temizlendi")
+    
+    def _gpio_callback(self, channel):
+        """
+        GPIO interrupt callback (ayrı thread'de çalışır)
+        Piezo modül vuruş algıladığında tetiklenir
+        """
+        if not self.running:
+            return
+        
+        current_time = time.time()
+        elapsed_ms = (current_time - self._last_hit_time) * 1000
+        
+        # Yazılımsal debounce (donanım bouncetime'a ek güvenlik)
+        if elapsed_ms >= self.debounce_ms:
+            self._last_hit_time = current_time
+            self.hit_queue.put("HIT")
             
-            except serial.SerialException as e:
-                self.connected = False
-                self.last_error = str(e)
-                
-                if self.debug:
-                    print(f"[HitInput] Okuma hatası: {e}")
-                
-                time.sleep(reconnect_delay)
-            
-            except Exception as e:
-                if self.debug:
-                    print(f"[HitInput] Beklenmeyen hata: {e}")
+            if self.debug:
+                print("[HitInput] HIT algılandı! (GPIO)")
     
     def get_hit(self) -> bool:
         """
@@ -155,7 +138,7 @@ class HitInput:
     def simulate_hit(self):
         """
         Test için hit simüle et
-        Debug modunda veya serial bağlantısı olmadığında kullanılır
+        Debug modunda veya GPIO bağlantısı olmadığında kullanılır
         """
         self.hit_queue.put("HIT")
         

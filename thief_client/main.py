@@ -94,8 +94,8 @@ class ThiefGame:
             self.hit_input = KeyboardHitInput(debug=True)
         else:
             self.hit_input = HitInput(
-                port=self.config.serial_port,
-                baud=self.config.serial_baud,
+                gpio_pin=self.config.gpio_pin,
+                debounce_ms=self.config.debounce_ms,
                 debug=self.config.debug
             )
         self.hit_input.start()
@@ -372,7 +372,7 @@ class ThiefGame:
         
         # Hit input durumu
         hit_text = self.small_font.render(
-            f"Hit Input: {'SPACE tuşu' if isinstance(self.hit_input, KeyboardHitInput) else 'Serial'}", 
+            f"Hit Input: {'SPACE tuşu' if isinstance(self.hit_input, KeyboardHitInput) else f'GPIO {self.config.gpio_pin}'}", 
             True, 
             self.text_color
         )
