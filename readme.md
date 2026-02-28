@@ -24,20 +24,17 @@ Her skor artışı Pi 5’e event olarak gönderilir.
 
 Raspberry Pi Zero 2 W
 
-Dijital Piezo Sensör Modülü (3 pin: VCC, GND, S)
+Arduino (piezo okuma + debounce)
 
-Bağlantı: Piezo → Pi GPIO (doğrudan, Arduino'ya gerek yok)
-  VCC → 3.3V (Pin 1)
-  GND → GND  (Pin 6)
-  S   → GPIO 17 (Pin 11)
+Bağlantı: Arduino USB → Pi (Serial)
 
-Piezo modül görevi:
+Arduino görevi:
 
-Titreşim algılayıp dijital sinyal üretmek
+Piezo analog okuyup “tek hit” üretmek
 
-Debounce: yazılımsal (200 ms, config ile ayarlanabilir)
+Debounce/refractory: 150–300 ms
 
-GPIO edge detection ile vuruş algılanır
+Serial output: HIT\n
 
 2.2 Server (merkez)
 

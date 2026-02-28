@@ -22,8 +22,8 @@ class GameConfig:
     band_x_max: int
     hit_cooldown_ms: int
     fullscreen: bool
-    gpio_pin: int
-    debounce_ms: int
+    serial_port: str
+    serial_baud: int
     screen_width: int
     screen_height: int
     thief_scale: int
@@ -59,8 +59,8 @@ class GameConfig:
             band_x_max=data.get("band_x_max", 1020),
             hit_cooldown_ms=data.get("hit_cooldown_ms", 200),
             fullscreen=data.get("fullscreen", True),
-            gpio_pin=data.get("gpio_pin", 17),
-            debounce_ms=data.get("debounce_ms", 200),
+            serial_port=data.get("serial_port", "/dev/ttyUSB0"),
+            serial_baud=data.get("serial_baud", 9600),
             screen_width=data.get("screen_width", 1920),
             screen_height=data.get("screen_height", 1080),
             thief_scale=data.get("thief_scale", 4),
