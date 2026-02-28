@@ -26,11 +26,12 @@ Raspberry Pi Zero 2 W
 
 Arduino (piezo okuma + debounce)
 
-Bağlantı: Arduino USB → Pi (Serial)
+Bağlantı: Arduino USB → Pi (Serial Port)
+  NOT: Pi Zero 2 W için **Micro-USB OTG adaptörü** gereklidir.
 
 Arduino görevi:
 
-Piezo analog okuyup “tek hit” üretmek
+Piezo analog okuyup "tek hit" üretmek
 
 Debounce/refractory: 150–300 ms
 
