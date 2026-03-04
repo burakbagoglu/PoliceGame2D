@@ -1,6 +1,14 @@
 {
   "host": "0.0.0.0",
   "port": 8000,
-  "num_screens": 5,
+  "num_screens": 12,
+  "game_duration_minutes": 20,
+  "base_score_per_child": 15,
+  "base_spawn_interval": 3.0,
+  "min_spawn_interval": 0.5,
+  "max_spawn_interval": 8.0,
+  "max_concurrent_spawns": 3,
+  "default_piezo_threshold": 100,
+  "default_piezo_refractory_ms": 200,
   "debug": true
 }

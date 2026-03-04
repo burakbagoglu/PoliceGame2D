@@ -1,6 +1,9 @@
 {
   "screen_id": 1,
   "server_url": "http://localhost:8000/event",
+  "server_base_url": "http://localhost:8000",
+  "server_controlled": true,
+  "poll_interval_ms": 500,
   "fps": 30,
   "thief_speed_px_s": 360,
   "spawn_x": 1920,
@@ -9,7 +12,12 @@
   "band_enabled": false,
   "band_x_min": 900,
   "band_x_max": 1020,
-  "band_color": [255, 255, 0, 80],
+  "band_color": [
+    255,
+    255,
+    0,
+    80
+  ],
   "hit_cooldown_ms": 200,
   "fullscreen": true,
   "serial_port": "/dev/ttyUSB0",

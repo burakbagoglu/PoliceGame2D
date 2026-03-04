@@ -12,6 +12,9 @@ class GameConfig:
     """Oyun konfigürasyon sınıfı"""
     screen_id: int
     server_url: str
+    server_base_url: str
+    server_controlled: bool
+    poll_interval_ms: int
     fps: int
     thief_speed_px_s: float
     spawn_x: int
@@ -36,19 +39,31 @@ class GameConfig:
     shadow_scale_y: float
     shadow_offset_y: int
     debug: bool
-    
+
     @classmethod
     def from_file(cls, filepath: str) -> "GameConfig":
         """JSON dosyasından config oku"""
         if not os.path.exists(filepath):
             raise FileNotFoundError(f"Config dosyası bulunamadı: {filepath}")
-        
+
         with open(filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
-        
+
+        # server_base_url: server_url'den türet (yoksa)
+        server_url = data.get("server_url", "http://192.168.1.10:8000/event")
+        server_base_url = data.get("server_base_url", "")
+        if not server_base_url:
+            # server_url'den base URL çıkar
+            # "http://192.168.1.10:8000/event" → "http://192.168.1.10:8000"
+            parts = server_url.rsplit("/", 1)
+            server_base_url = parts[0] if len(parts) > 1 else server_url
+
         return cls(
             screen_id=data.get("screen_id", 1),
-            server_url=data.get("server_url", "http://192.168.1.10:8000/event"),
+            server_url=server_url,
+            server_base_url=server_base_url,
+            server_controlled=data.get("server_controlled", True),
+            poll_interval_ms=data.get("poll_interval_ms", 500),
             fps=data.get("fps", 30),
             thief_speed_px_s=data.get("thief_speed_px_s", 360),
             spawn_x=data.get("spawn_x", 1920),
@@ -74,12 +89,12 @@ class GameConfig:
             shadow_offset_y=data.get("shadow_offset_y", 5),
             debug=data.get("debug", False),
         )
-    
+
     @property
     def band_width(self) -> int:
         """Hedef bandının genişliği"""
         return self.band_x_max - self.band_x_min
-    
+
     @property
     def band_center(self) -> int:
         """Hedef bandının merkezi"""
