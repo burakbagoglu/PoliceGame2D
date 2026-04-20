@@ -242,8 +242,8 @@ class ThiefGame:
         else:
             self.screen.fill(self.bg_color)
 
-        # IDLE durumunda bekleme mesajı göster
-        if self.game.is_idle():
+        # IDLE durumunda ve oyun aktif değilse bekleme mesajı göster
+        if self.game.is_idle() and not self.net_client.server_game_active:
             self._draw_idle()
         else:
             # Hedef bandı çiz
@@ -297,13 +297,18 @@ class ThiefGame:
             )
             shadow.blit(frame, (0, 0))
 
-            shadow_array = pygame.surfarray.pixels3d(shadow)
-            shadow_array[:, :, :] = 0
-            del shadow_array
+            try:
+                shadow_array = pygame.surfarray.pixels3d(shadow)
+                shadow_array[:, :, :] = 0
+                del shadow_array
 
-            alpha_array = pygame.surfarray.pixels_alpha(shadow)
-            alpha_array[alpha_array > 0] = self.config.shadow_alpha
-            del alpha_array
+                alpha_array = pygame.surfarray.pixels_alpha(shadow)
+                alpha_array[alpha_array > 0] = self.config.shadow_alpha
+                del alpha_array
+            except (NotImplementedError, ModuleNotFoundError):
+                # Numpy yüklü değilse düz siyah gölge çiz (veya hiç çizme)
+                shadow.fill((0, 0, 0, self.config.shadow_alpha), special_flags=pygame.BLEND_RGBA_MULT)
+                # Sadece bir kere uyarı vermek için shadow'u kapatabiliriz ama fill yöntemi çalışır
 
             shadow = pygame.transform.scale(shadow, (shadow_width, shadow_height))
 

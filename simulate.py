@@ -88,10 +88,14 @@ def start_server():
     """Server'ı arka planda başlat"""
     print("🚀 Server başlatılıyor...")
 
+    # Log dosyasına yaz (pipe buffer overflow önlemi)
+    os.makedirs(TEMP_CONFIG_DIR, exist_ok=True)
+    server_log = open(os.path.join(TEMP_CONFIG_DIR, "server.log"), "w", encoding="utf-8")
+
     process = subprocess.Popen(
         [sys.executable, "main.py"],
         cwd=SERVER_DIR,
-        stdout=subprocess.PIPE,
+        stdout=server_log,
         stderr=subprocess.STDOUT,
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0,
     )
@@ -100,7 +104,10 @@ def start_server():
     time.sleep(2)
 
     if process.poll() is not None:
-        output = process.stdout.read().decode("utf-8", errors="ignore")
+        server_log.close()
+        log_path = os.path.join(TEMP_CONFIG_DIR, "server.log")
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            output = f.read()
         print(f"❌ Server başlatılamadı!\n{output}")
         sys.exit(1)
 
@@ -121,11 +128,15 @@ def start_client(screen_id: int, config_path: str):
     y = 50 + row * 520
     env["SDL_VIDEO_WINDOW_POS"] = f"{x},{y}"
 
+    # Log dosyasına yaz (pipe buffer overflow önlemi)
+    log_path = os.path.join(TEMP_CONFIG_DIR, f"client_{screen_id}.log")
+    client_log = open(log_path, "w", encoding="utf-8")
+
     process = subprocess.Popen(
         [sys.executable, "main.py", config_path],
         cwd=CLIENT_DIR,
         env=env,
-        stdout=subprocess.PIPE,
+        stdout=client_log,
         stderr=subprocess.STDOUT,
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0,
     )
@@ -133,8 +144,10 @@ def start_client(screen_id: int, config_path: str):
     time.sleep(0.5)
 
     if process.poll() is not None:
-        output = process.stdout.read().decode("utf-8", errors="ignore")
-        print(f"   ❌ Client #{screen_id} hatası: {output[:200]}")
+        client_log.close()
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            output = f.read()
+        print(f"   ❌ Client #{screen_id} hatası: {output[:500]}")
         return None
 
     print(f"   ✅ Client #{screen_id} (PID: {process.pid})")
@@ -164,8 +177,8 @@ def cleanup(processes: list):
                 p.kill()
 
     # Temp config dosyalarını temizle
-    if os.path.exists(TEMP_CONFIG_DIR):
-        shutil.rmtree(TEMP_CONFIG_DIR, ignore_errors=True)
+    # if os.path.exists(TEMP_CONFIG_DIR):
+    #     shutil.rmtree(TEMP_CONFIG_DIR, ignore_errors=True)
 
     print("✅ Temizlendi.")
 

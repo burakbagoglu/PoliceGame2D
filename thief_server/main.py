@@ -163,6 +163,10 @@ piezo_config = PiezoConfigManager(
 # Spawn scheduler (oyun başlatılınca oluşturulur)
 spawn_scheduler: Optional[SpawnScheduler] = None
 
+# Global aktif ekran takibi (oyun başlamadan ÖNCE de kaydeder)
+import time as _time
+active_polling_screens: Dict[int, float] = {}  # screen_id -> last_poll_time
+
 
 # ============== FastAPI App ==============
 
@@ -231,6 +235,18 @@ async def start_game(req: StartGameRequest):
         phase_spawner=phase_spawner,
         debug=CONFIG.get("debug", False),
     )
+
+    # Oyun başlamadan önce poll yapan ekranları hemen kaydet
+    for sid, last_t in active_polling_screens.items():
+        spawn_scheduler._active_screens[sid] = last_t
+        # Dinamik kuyruk oluştur
+        if sid not in spawn_scheduler.spawn_queues:
+            import queue
+            spawn_scheduler.spawn_queues[sid] = queue.Queue()
+
+    if CONFIG.get("debug"):
+        print(f"[Game] Kayıtlı aktif ekranlar: {list(active_polling_screens.keys())}")
+
     spawn_scheduler.start()
 
     # Skorları sıfırla
@@ -288,6 +304,9 @@ async def end_game():
 @app.get("/spawn/poll")
 async def spawn_poll(screen_id: int = Query(...)):
     """Client spawn kontrolü"""
+    # Ekranı GLOBAL olarak kaydet (oyun başlamadan önce de)
+    active_polling_screens[screen_id] = _time.time()
+
     if not spawn_scheduler or not spawn_scheduler.session.is_active:
         return {"spawn": False, "game_active": False}
 

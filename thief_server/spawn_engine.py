@@ -342,6 +342,10 @@ class SpawnScheduler:
             i: queue.Queue() for i in range(1, session.screen_count + 1)
         }
 
+        # Aktif ekran takibi (poll yapan ekranlar)
+        self._active_screens: Dict[int, float] = {}  # screen_id -> last_poll_time
+        self._active_timeout = 10.0  # 10 saniye poll yoksa pasif say
+
         # Thread kontrolü
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -352,7 +356,7 @@ class SpawnScheduler:
         self.session.start_time = time.time()
         self.session.is_active = True
         self._running = True
-        self._last_spawn_time = time.time()
+        self._last_spawn_time = 0  # İlk spawn hemen olsun
         self._thread = threading.Thread(target=self._spawn_loop, daemon=True)
         self._thread.start()
 
@@ -372,11 +376,17 @@ class SpawnScheduler:
     def poll_spawn(self, screen_id: int) -> dict:
         """
         Client'ın spawn kontrolü. Kuyruğunda spawn varsa consume eder.
+        Ayrıca ekranı aktif olarak işaretler.
 
         Returns:
             {"spawn": True/False}
         """
+        # Ekranı aktif olarak işaretle
+        self._active_screens[screen_id] = time.time()
+
         if screen_id not in self.spawn_queues:
+            # Dinamik kuyruk oluştur (beklenmeyen screen_id için)
+            self.spawn_queues[screen_id] = queue.Queue()
             return {"spawn": False}
 
         try:
@@ -443,6 +453,15 @@ class SpawnScheduler:
                     print(f"[SpawnScheduler] Hata: {e}")
                 time.sleep(1)
 
+    def _get_active_screen_ids(self) -> List[int]:
+        """Aktif (poll yapan) ekranları döndür"""
+        now = time.time()
+        active = [
+            sid for sid, last_poll in self._active_screens.items()
+            if now - last_poll < self._active_timeout
+        ]
+        return active if active else list(range(1, self.session.screen_count + 1))
+
     def _trigger_spawn(self, params: dict):
         """Hırsız spawn et"""
         concurrent = params['concurrent_spawns']
@@ -454,15 +473,16 @@ class SpawnScheduler:
         concurrent = max(concurrent, phase_hint)
         concurrent = min(concurrent, self.adaptive.max_concurrent_spawns)
 
-        # Aktif ekranları al (şimdilik tümü aktif)
-        active_screens = list(range(1, self.session.screen_count + 1))
+        # Sadece aktif (poll yapan) ekranları kullan
+        active_screens = self._get_active_screen_ids()
 
         selected = self.screen_selector.select_screens(concurrent, active_screens)
 
         # Seçilen ekranların kuyruğuna spawn ekle
         for screen_id in selected:
-            if screen_id in self.spawn_queues:
-                self.spawn_queues[screen_id].put({"spawn": True})
+            if screen_id not in self.spawn_queues:
+                self.spawn_queues[screen_id] = queue.Queue()
+            self.spawn_queues[screen_id].put({"spawn": True})
 
         self.session.total_spawns += len(selected)
         self._last_spawn_time = time.time()
@@ -470,6 +490,7 @@ class SpawnScheduler:
         if self.debug:
             print(
                 f"[SpawnScheduler] SPAWN → Ekranlar: {selected} | "
+                f"Aktif: {active_screens} | "
                 f"Urgency: {params['urgency']} | "
                 f"Interval: {params['spawn_interval']:.1f}s"
             )

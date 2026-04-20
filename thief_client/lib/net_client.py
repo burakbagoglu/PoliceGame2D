@@ -88,6 +88,7 @@ class NetClient:
         self.events_sent = 0
         self.events_failed = 0
         self.spawns_received = 0
+        self.server_game_active = False
 
         # Offline queue'yu yükle
         self._load_offline_queue()
@@ -238,6 +239,7 @@ class NetClient:
             if response.status_code == 200:
                 data = response.json()
                 self.connected = True
+                self.server_game_active = data.get("game_active", False)
 
                 if data.get("spawn"):
                     self.spawn_queue.put(data)
@@ -341,6 +343,7 @@ class NetClient:
         """Client durumunu döndür"""
         return {
             "connected": self.connected,
+            "game_active": self.server_game_active,
             "events_sent": self.events_sent,
             "events_failed": self.events_failed,
             "spawns_received": self.spawns_received,
