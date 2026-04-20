@@ -163,6 +163,7 @@ class ThiefGame:
         self.shake_timer = 0.0
         self.shake_magnitude = 0.0
         self.thief_alpha = 255
+        self.hit_stop_timer = 0.0  # Zaman donması efekti
 
         # Arka plan yükle (varsa)
         self.background = None
@@ -174,11 +175,14 @@ class ThiefGame:
                 (self.screen_width, self.screen_height),
             )
 
-    def _on_score(self, points: int):
+    def _on_score(self, points: int, combo: int = 1):
         """Skor arttığında çağrılır"""
         self.net_client.send_score(points)
         self.hit_flash = True
         self.hit_flash_end = pygame.time.get_ticks() + 200
+
+        # Hit Stop (Zamanı dondur)
+        self.hit_stop_timer = 0.15  # 150ms boyunca oyun dursun, sadece sarsılsın
 
         # Sarsıntı tetikle
         self.shake_timer = 0.2  # 0.2 saniye sarsıntı
@@ -192,6 +196,11 @@ class ThiefGame:
         self.floating_texts.append(
             FloatingText(thief_x, self.config.thief_y - 100, f"+{points}", self.idle_font, (255, 255, 0))
         )
+        
+        if combo > 1:
+            self.floating_texts.append(
+                FloatingText(thief_x, self.config.thief_y - 200, f"{combo}x KOMBO!", self.font, (255, 150, 0))
+            )
 
         # Para/Altın parçacıkları fırlat
         for _ in range(15):
@@ -205,6 +214,12 @@ class ThiefGame:
         """Ana oyun döngüsü"""
         while self.running:
             dt = self.clock.tick(self.config.fps) / 1000.0
+
+            # Hit Stop (Zaman donması) hesaplaması
+            game_dt = dt
+            if self.hit_stop_timer > 0:
+                self.hit_stop_timer -= dt
+                game_dt = 0.0  # Oyun mantığı ve animasyon ilerlemesin!
 
             # Event'leri işle
             self._handle_events()
@@ -226,13 +241,13 @@ class ThiefGame:
                     piezo_config.get("refractory_ms", 200),
                 )
 
-            # Oyun güncelle
-            self.game.update(dt)
+            # Oyun güncelle (Donmuş zaman ile)
+            self.game.update(game_dt)
 
-            # Animasyonu güncelle
-            self._update_animation(dt)
+            # Animasyonu güncelle (Donmuş zaman ile)
+            self._update_animation(game_dt)
 
-            # Efektleri güncelle
+            # Efektleri güncelle (Gerçek zaman ile, sarsıntı devam etsin)
             self._update_effects(dt)
 
             # Çiz
@@ -443,13 +458,20 @@ class ThiefGame:
         self.screen.blit(score_text, (x, y))
 
     def _draw_hit_flash(self, offset_x=0, offset_y=0):
-        """Hit flash efekti çiz"""
+        """Hit flash (Polis Sireni) efekti çiz"""
         if self.hit_flash:
             if pygame.time.get_ticks() < self.hit_flash_end:
-                flash = pygame.Surface((self.screen_width, self.screen_height))
-                flash.fill(self.hit_flash_color)
-                flash.set_alpha(50)
-                self.screen.blit(flash, (offset_x, offset_y))
+                # Sol Kırmızı, Sağ Mavi Çakar efekti
+                red_surf = pygame.Surface((self.screen_width // 2, self.screen_height))
+                red_surf.fill((255, 0, 0))
+                red_surf.set_alpha(60)
+                
+                blue_surf = pygame.Surface((self.screen_width // 2, self.screen_height))
+                blue_surf.fill((0, 0, 255))
+                blue_surf.set_alpha(60)
+                
+                self.screen.blit(red_surf, (offset_x, offset_y))
+                self.screen.blit(blue_surf, (self.screen_width // 2 + offset_x, offset_y))
             else:
                 self.hit_flash = False
 

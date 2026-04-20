@@ -116,8 +116,9 @@ class GameLogic:
                 direction=initial_direction,
             )
 
-        # Skor
+        # Skor ve Kombo
         self.score = 0
+        self.combo = 0
 
         # Fall animasyonu süresi (saniye) — 10 frame @ 12fps = 0.83s + yerde kalma
         self.fall_duration = 1.5
@@ -185,10 +186,12 @@ class GameLogic:
         # Yöne göre hareket et
         self.thief.x += self.speed_px_s * dt * self.thief.direction.value
 
-        # Ekran dışına çıktıysa reset
+        # Ekran dışına çıktıysa reset (Hırsız kaçtı, kombo sıfırlanır)
         if self.thief.direction == Direction.LEFT and self.thief.x < self.reset_x_left:
+            self.combo = 0
             self.thief.state = GameState.RESET
         elif self.thief.direction == Direction.RIGHT and self.thief.x > self.reset_x_right:
+            self.combo = 0
             self.thief.state = GameState.RESET
 
     def _update_fall(self, current_time: float):
@@ -254,19 +257,21 @@ class GameLogic:
 
         if hit_success:
             self.score += 1
+            self.combo += 1
             self.thief.state = GameState.FALL
             self.thief.fall_start = time.time()
 
             if self.debug:
-                print(f"[Game] BAŞARILI HIT! Skor: {self.score}")
+                print(f"[Game] BAŞARILI HIT! Skor: {self.score} | Kombo: {self.combo}")
 
             if self.on_score:
-                self.on_score(1)
+                self.on_score(1, self.combo)
 
             return True
         else:
+            self.combo = 0  # Iska geçildi, kombo sıfırlandı
             if self.debug:
-                print(f"[Game] MISS - x: {self.thief.x}, band: [{self.band_x_min}, {self.band_x_max}]")
+                print(f"[Game] MISS - Kombo sıfırlandı. x: {self.thief.x}, band: [{self.band_x_min}, {self.band_x_max}]")
             return False
 
     def _is_in_band(self) -> bool:
