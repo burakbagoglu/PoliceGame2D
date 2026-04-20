@@ -119,8 +119,8 @@ class GameLogic:
         # Skor
         self.score = 0
 
-        # Fall animasyonu süresi (saniye)
-        self.fall_duration = 0.5
+        # Fall animasyonu süresi (saniye) — 10 frame @ 12fps = 0.83s + yerde kalma
+        self.fall_duration = 1.5
 
     def trigger_spawn(self):
         """

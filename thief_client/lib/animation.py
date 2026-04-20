@@ -121,19 +121,22 @@ class ThiefAnimator:
     ROW_WEST = 3   # Sola
     
     def __init__(self, sprite_sheet_path: str, scale: int = 4, anim_fps: int = 12, 
-                 fall_sprite_path: Optional[str] = None):
+                 fall_sprite_path: Optional[str] = None,
+                 death_sprite_path: Optional[str] = None):
         """
         Args:
             sprite_sheet_path: Ana sprite sheet dosya yolu (walk için)
             scale: Büyütme faktörü
             anim_fps: Animasyon FPS
-            fall_sprite_path: Düşme sprite sheet yolu (opsiyonel)
+            fall_sprite_path: Düşme sprite sheet yolu (opsiyonel, eski format)
+            death_sprite_path: Ölüm sprite sheet yolu (deadthief.png, 256x256 grid)
         """
         # 48x64 sprite sheet için
         self.sheet = SpriteSheet(sprite_sheet_path, 48, 64)
         self.scale = scale
         self.anim_fps = anim_fps
         self.fall_sprite_path = fall_sprite_path
+        self.death_sprite_path = death_sprite_path
         
         # Frame boyutları
         self.frame_width = 48 * scale
@@ -170,8 +173,11 @@ class ThiefAnimator:
         self.run_frames_left = self.west_frames
         self.run_frames_right = self.east_frames
         
-        # Fall animasyonları - gerçek sprite varsa kullan, yoksa döndürme efekti
-        if self.fall_sprite_path and os.path.exists(self.fall_sprite_path):
+        # Fall animasyonları - öncelik sırası: death_sprite > fall_sprite > döndürme
+        if self.death_sprite_path and os.path.exists(self.death_sprite_path):
+            self.fall_frames_left = self._load_death_sprites(self.death_sprite_path, flip=False)
+            self.fall_frames_right = self._load_death_sprites(self.death_sprite_path, flip=True)
+        elif self.fall_sprite_path and os.path.exists(self.fall_sprite_path):
             self.fall_frames_left = self._load_fall_sprites(self.fall_sprite_path, flip=False)
             self.fall_frames_right = self._load_fall_sprites(self.fall_sprite_path, flip=True)
         else:
@@ -223,6 +229,68 @@ class ThiefAnimator:
             fall_frames.append(scaled)
         
         return fall_frames
+    
+    def _load_death_sprites(self, path: str, flip: bool = False) -> List[pygame.Surface]:
+        """
+        deadthief.png'den ölüm animasyonu frame'lerini yükle
+        
+        Sprite sheet: 1280x1280, 5x5 grid (her frame 256x256)
+        Satır 3: Bize dönme (col 0-1) + düşme geçişi (col 2-4) = 5 frame
+        Satır 4: Yerde yatma (col 0-4) = 5 frame
+        Toplam: 10 frame
+        
+        Not: 256x256 hücrelerde karakter küçük kaldığı için
+        walk sprite'ı ile aynı boyutta görünmesi için 2.5x ölçeklenir.
+        
+        Args:
+            path: deadthief.png dosya yolu
+            flip: Yatay çevir (sola gidiş için)
+        """
+        death_frames = []
+        
+        sheet = pygame.image.load(path).convert_alpha()
+        cell_w = sheet.get_width() // 5   # 256
+        cell_h = sheet.get_height() // 5  # 256
+        
+        # Satır 3: Bize dönme + düşme geçişi (tüm 5 frame)
+        for col in range(5):
+            frame = pygame.Surface((cell_w, cell_h), pygame.SRCALPHA)
+            frame.blit(sheet, (0, 0), (col * cell_w, 3 * cell_h, cell_w, cell_h))
+            death_frames.append(frame)
+        
+        # Satır 4: Yerde yatma (tüm 5 frame)
+        for col in range(5):
+            frame = pygame.Surface((cell_w, cell_h), pygame.SRCALPHA)
+            frame.blit(sheet, (0, 0), (col * cell_w, 4 * cell_h, cell_w, cell_h))
+            death_frames.append(frame)
+        
+        # Kırpılmış karakteri yürüme animasyonu ile aynı görsel boyuta getirmek için:
+        # deadthief.png içindeki karakter yüksekliği ~175px iken,
+        # yürüme sprite'ındaki (48x64_scale2x) karakter yüksekliği ~57px'dir (tam 3 katı oran).
+        # Bu yüzden ölçeği 3'e bölerek eşitliyoruz.
+        scale_factor = self.scale / 3.0
+        
+        # Crop, Flip ve Ölçekle
+        result = []
+        for frame in death_frames:
+            # Sadece karakterin olduğu (boş olmayan) alanı kırp
+            bbox = frame.get_bounding_rect()
+            if bbox.width > 0 and bbox.height > 0:
+                cropped = frame.subsurface(bbox).copy()
+            else:
+                cropped = frame
+                
+            if flip:
+                cropped = pygame.transform.flip(cropped, True, False)
+                
+            # Kırpılmış hali 2.5x büyüt
+            new_w = int(cropped.get_width() * scale_factor)
+            new_h = int(cropped.get_height() * scale_factor)
+            
+            scaled = pygame.transform.scale(cropped, (new_w, new_h))
+            result.append(scaled)
+        
+        return result
     
     def _create_fall_frames_rotate(self, base_frame: pygame.Surface, direction: int = -1) -> List[pygame.Surface]:
         """
