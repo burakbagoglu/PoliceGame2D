@@ -6,6 +6,7 @@ Ana giriş noktası. Server kontrollü veya bağımsız çalışabilir.
 import sys
 import os
 import pygame
+import time
 
 # Modül yolunu ekle
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -145,6 +146,8 @@ class ThiefGame:
         self.font = pygame.font.Font(None, 72)
         self.small_font = pygame.font.Font(None, 36)
         self.idle_font = pygame.font.Font(None, 48)
+        self.score_surface = None
+        self._score_surface_value = None
 
         # Renkler
         self.bg_color = (40, 44, 52)
@@ -152,6 +155,25 @@ class ThiefGame:
         self.text_color = (255, 255, 255)
         self.hit_flash_color = (255, 255, 0)
         self.idle_text_color = (150, 150, 150)
+
+        # Frame icinde tekrar olusturulmeyen render yuzeyleri
+        self.idle_surface = self.idle_font.render("Oyun bekleniyor...", True, self.idle_text_color)
+        self.band_surface = None
+        if self.config.band_enabled:
+            self.band_surface = pygame.Surface(
+                (self.config.band_width, self.screen_height),
+                pygame.SRCALPHA,
+            )
+            self.band_surface.fill(self.band_color)
+
+        self.flash_red_surface = pygame.Surface((self.screen_width // 2, self.screen_height))
+        self.flash_red_surface.fill((255, 0, 0))
+        self.flash_red_surface.set_alpha(60)
+        self.flash_blue_surface = pygame.Surface((self.screen_width // 2, self.screen_height))
+        self.flash_blue_surface.fill((0, 0, 255))
+        self.flash_blue_surface.set_alpha(60)
+
+        self.shadow_cache = {}
 
         # Hit flash efekti
         self.hit_flash = False
@@ -180,6 +202,7 @@ class ThiefGame:
         self.net_client.send_score(points)
         self.hit_flash = True
         self.hit_flash_end = pygame.time.get_ticks() + 200
+        self._score_surface_value = None
 
         # Hit Stop (Zamanı dondur)
         self.hit_stop_timer = 0.15  # 150ms boyunca oyun dursun, sadece sarsılsın
@@ -307,7 +330,6 @@ class ThiefGame:
         self.floating_texts = alive_texts
 
         # Hırsızın ölüm sonrası fade out efekti
-        import time
         self.thief_alpha = 255
         if self.game.thief.state in [GameState.FALL, GameState.COOLDOWN, GameState.IDLE]:
             if hasattr(self.game.thief, "fall_start") and self.game.thief.fall_start > 0:
@@ -371,19 +393,43 @@ class ThiefGame:
 
     def _draw_idle(self, offset_x=0, offset_y=0):
         """IDLE durumunda bekleme mesajı"""
-        text = self.idle_font.render("Oyun bekleniyor...", True, self.idle_text_color)
+        text = self.idle_surface
         x = (self.screen_width - text.get_width()) // 2 + offset_x
         y = (self.screen_height - text.get_height()) // 2 + offset_y
         self.screen.blit(text, (x, y))
 
     def _draw_band(self, offset_x=0, offset_y=0):
         """Hedef bandını çiz"""
-        band_surface = pygame.Surface(
-            (self.config.band_width, self.screen_height),
+        if self.band_surface:
+            self.screen.blit(self.band_surface, (self.config.band_x_min + offset_x, offset_y))
+
+    def _get_shadow_surface(self, frame):
+        """Mevcut sprite frame'i icin cache'lenmis golge yuzeyi dondur."""
+        cache_key = id(frame)
+        shadow = self.shadow_cache.get(cache_key)
+        if shadow:
+            return shadow
+
+        shadow_width = int(frame.get_width() * self.config.shadow_scale_x)
+        shadow_height = int(frame.get_height() * self.config.shadow_scale_y)
+
+        shadow = pygame.Surface(
+            (frame.get_width(), frame.get_height()),
             pygame.SRCALPHA,
         )
-        band_surface.fill(self.band_color)
-        self.screen.blit(band_surface, (self.config.band_x_min + offset_x, offset_y))
+        shadow.blit(frame, (0, 0))
+
+        try:
+            import numpy as np
+            alpha_array = pygame.surfarray.pixels_alpha(shadow)
+            alpha_array[:] = np.where(alpha_array > 0, self.config.shadow_alpha, 0)
+            del alpha_array
+        except (NotImplementedError, ModuleNotFoundError):
+            shadow.fill((0, 0, 0, self.config.shadow_alpha), special_flags=pygame.BLEND_RGBA_MULT)
+
+        shadow = pygame.transform.scale(shadow, (shadow_width, shadow_height))
+        self.shadow_cache[cache_key] = shadow
+        return shadow
 
     def _draw_shadow(self, offset_x=0, offset_y=0):
         """Hırsızın gölgesini çiz"""
@@ -394,25 +440,9 @@ class ThiefGame:
 
         if frame:
             # Gölge boyutunu mevcut frame'e göre ayarla
-            shadow_width = int(frame.get_width() * self.config.shadow_scale_x)
-            shadow_height = int(frame.get_height() * self.config.shadow_scale_y)
-
-            shadow = pygame.Surface(
-                (frame.get_width(), frame.get_height()),
-                pygame.SRCALPHA,
-            )
-            shadow.blit(frame, (0, 0))
-
-            try:
-                import numpy as np
-                alpha_array = pygame.surfarray.pixels_alpha(shadow)
-                alpha_array[:] = np.where(alpha_array > 0, self.config.shadow_alpha, 0)
-                del alpha_array
-            except (NotImplementedError, ModuleNotFoundError):
-                # Numpy yüklü değilse düz siyah gölge çiz
-                shadow.fill((0, 0, 0, self.config.shadow_alpha), special_flags=pygame.BLEND_RGBA_MULT)
-
-            shadow = pygame.transform.scale(shadow, (shadow_width, shadow_height))
+            shadow = self._get_shadow_surface(frame)
+            shadow_width = shadow.get_width()
+            shadow_height = shadow.get_height()
 
             x = self.game.thief.x - shadow_width // 2 + offset_x
             y = self.game.thief.y - shadow_height // 2 + self.config.shadow_offset_y + offset_y
@@ -422,10 +452,12 @@ class ThiefGame:
                 y += 15 * self.config.thief_scale
 
             # Saydamlık uygula
+            draw_shadow = shadow
             if self.thief_alpha < 255:
-                shadow.set_alpha(self.thief_alpha)
+                draw_shadow = shadow.copy()
+                draw_shadow.set_alpha(self.thief_alpha)
 
-            self.screen.blit(shadow, (x, y))
+            self.screen.blit(draw_shadow, (x, y))
 
     def _draw_thief(self, offset_x=0, offset_y=0):
         """Hırsızı çiz"""
@@ -452,7 +484,11 @@ class ThiefGame:
 
     def _draw_score(self, offset_x=0, offset_y=0):
         """Skoru çiz"""
-        score_text = self.font.render(f"Skor: {self.game.score}", True, self.text_color)
+        if self._score_surface_value != self.game.score:
+            self.score_surface = self.font.render(f"Skor: {self.game.score}", True, self.text_color)
+            self._score_surface_value = self.game.score
+
+        score_text = self.score_surface
         x = self.screen_width - score_text.get_width() - 20 + offset_x
         y = 20 + offset_y
         self.screen.blit(score_text, (x, y))
@@ -462,16 +498,8 @@ class ThiefGame:
         if self.hit_flash:
             if pygame.time.get_ticks() < self.hit_flash_end:
                 # Sol Kırmızı, Sağ Mavi Çakar efekti
-                red_surf = pygame.Surface((self.screen_width // 2, self.screen_height))
-                red_surf.fill((255, 0, 0))
-                red_surf.set_alpha(60)
-                
-                blue_surf = pygame.Surface((self.screen_width // 2, self.screen_height))
-                blue_surf.fill((0, 0, 255))
-                blue_surf.set_alpha(60)
-                
-                self.screen.blit(red_surf, (offset_x, offset_y))
-                self.screen.blit(blue_surf, (self.screen_width // 2 + offset_x, offset_y))
+                self.screen.blit(self.flash_red_surface, (offset_x, offset_y))
+                self.screen.blit(self.flash_blue_surface, (self.screen_width // 2 + offset_x, offset_y))
             else:
                 self.hit_flash = False
 

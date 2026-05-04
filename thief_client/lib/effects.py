@@ -68,6 +68,9 @@ class Particle:
         # Yaşam süresi
         self.life = random.uniform(0.5, 1.2)
         self.max_life = self.life
+
+        self.surface = pygame.Surface((self.size, self.size), pygame.SRCALPHA)
+        pygame.draw.rect(self.surface, self.color, (0, 0, self.size, self.size))
         
     def update(self, dt: float, floor_y: int) -> bool:
         """
@@ -99,8 +102,10 @@ class Particle:
             alpha = int((self.life / fade_point) * 255)
             
         # Parçacık yüzeyi
-        surf = pygame.Surface((self.size, self.size), pygame.SRCALPHA)
-        pygame.draw.rect(surf, (*self.color, alpha), (0, 0, self.size, self.size))
+        surf = self.surface
+        if alpha < 255:
+            surf = self.surface.copy()
+            surf.set_alpha(alpha)
         
         # Biraz dönme efekti için boyutu rastgele değiştirerek yanıltsama yapılabilir
         # (Şimdilik basit kare kalsın)
