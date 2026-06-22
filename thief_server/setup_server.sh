@@ -9,7 +9,7 @@ sudo apt update && sudo apt upgrade -y
 
 # Gerekli paketler
 echo "[2/4] Python paketleri yükleniyor..."
-pip3 install --user fastapi uvicorn pydantic
+pip3 install --user -r requirements.txt
 
 # Service dosyasını kopyala
 echo "[3/4] Systemd service kuruluyor..."
@@ -27,10 +27,12 @@ echo ""
 echo "Server IP Adresi: $IP_ADDR"
 echo ""
 echo "Client'larda config.json içinde şunu ayarlayın:"
-echo "  \"server_url\": \"http://$IP_ADDR:8000/event\""
+echo "  \"server_url\": \"http://$IP_ADDR:8078/event\""
+echo "  \"server_base_url\": \"http://$IP_ADDR:8078\""
 echo ""
-echo "Manuel başlatma: python3 -m uvicorn main:app --host 0.0.0.0 --port 8000"
+echo "Manuel başlatma: python3 main.py"
 echo "Service başlatma: sudo systemctl start thief-server"
 echo "Logları görme: journalctl -u thief-server -f"
 echo ""
-echo "Dashboard: http://$IP_ADDR:8000/"
+echo "Dashboard: http://$IP_ADDR:8078/dashboard"
+echo "Ekran: http://$IP_ADDR:8078/screen"

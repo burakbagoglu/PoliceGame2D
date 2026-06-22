@@ -350,13 +350,15 @@ class SpawnScheduler:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._last_spawn_time = 0.0
+        self._lock = threading.RLock()
 
     def start(self):
         """Spawn loop thread'ini başlat"""
-        self.session.start_time = time.time()
-        self.session.is_active = True
-        self._running = True
-        self._last_spawn_time = 0  # İlk spawn hemen olsun
+        with self._lock:
+            self.session.start_time = time.time()
+            self.session.is_active = True
+            self._running = True
+            self._last_spawn_time = 0  # İlk spawn hemen olsun
         self._thread = threading.Thread(target=self._spawn_loop, daemon=True)
         self._thread.start()
 
@@ -365,9 +367,14 @@ class SpawnScheduler:
 
     def stop(self):
         """Spawn loop'u durdur"""
-        self._running = False
-        self.session.is_active = False
-        if self._thread and self._thread.is_alive():
+        with self._lock:
+            self._running = False
+            self.session.is_active = False
+        if (
+            self._thread
+            and self._thread.is_alive()
+            and threading.current_thread() is not self._thread
+        ):
             self._thread.join(timeout=2.0)
 
         if self.debug:
@@ -381,52 +388,64 @@ class SpawnScheduler:
         Returns:
             {"spawn": True/False}
         """
-        # Ekranı aktif olarak işaretle
-        self._active_screens[screen_id] = time.time()
+        with self._lock:
+            # Ekranı aktif olarak işaretle
+            self._active_screens[screen_id] = time.time()
 
-        if screen_id not in self.spawn_queues:
-            # Dinamik kuyruk oluştur (beklenmeyen screen_id için)
-            self.spawn_queues[screen_id] = queue.Queue()
-            return {"spawn": False}
+            if screen_id not in self.spawn_queues:
+                # Dinamik kuyruk oluştur (beklenmeyen screen_id için)
+                self.spawn_queues[screen_id] = queue.Queue()
+                return {"spawn": False}
 
-        try:
-            self.spawn_queues[screen_id].get_nowait()
-            return {"spawn": True}
-        except queue.Empty:
-            return {"spawn": False}
+            try:
+                self.spawn_queues[screen_id].get_nowait()
+                return {"spawn": True}
+            except queue.Empty:
+                return {"spawn": False}
 
     def update_score(self, points: int = 1):
         """Skor güncelle (hit geldiğinde çağrılır)"""
-        self.session.current_score += points
+        with self._lock:
+            self.session.current_score += points
+
+    def reset_score(self):
+        """Oturum skorunu sıfırla."""
+        with self._lock:
+            self.session.current_score = 0
 
     def get_status(self) -> dict:
         """Mevcut durum bilgisi"""
-        adaptive_params = self.adaptive.calculate(self.session)
-        current_phase = self.phase.get_phase(self.session.elapsed_seconds)
+        with self._lock:
+            adaptive_params = self.adaptive.calculate(self.session)
+            current_phase = self.phase.get_phase(self.session.elapsed_seconds)
 
-        status = self.session.to_dict()
-        status.update({
-            'phase': current_phase['name'],
-            'phase_multiplier': current_phase['multiplier'],
-            'spawn_interval': adaptive_params['spawn_interval'],
-            'concurrent_spawns': adaptive_params['concurrent_spawns'],
-            'delta': adaptive_params['delta'],
-            'urgency': adaptive_params['urgency'],
-            'screen_stats': self.screen_selector.get_stats(),
-        })
-        return status
+            status = self.session.to_dict()
+            status.update({
+                'phase': current_phase['name'],
+                'phase_multiplier': current_phase['multiplier'],
+                'spawn_interval': adaptive_params['spawn_interval'],
+                'concurrent_spawns': adaptive_params['concurrent_spawns'],
+                'delta': adaptive_params['delta'],
+                'urgency': adaptive_params['urgency'],
+                'screen_stats': self.screen_selector.get_stats(),
+            })
+            return status
 
     def _spawn_loop(self):
         """Arka planda çalışan spawn döngüsü"""
         while self._running and self.session.is_active:
             try:
                 # Süre kontrolü
-                if self.session.elapsed_seconds >= self.session.total_seconds:
+                with self._lock:
+                    elapsed_done = self.session.elapsed_seconds >= self.session.total_seconds
+                    target_done = self.session.current_score >= self.session.target_score
+
+                if elapsed_done:
                     self.stop()
                     break
 
                 # Hedef tamamlandı mı?
-                if self.session.current_score >= self.session.target_score:
+                if target_done:
                     if self.debug:
                         print("[SpawnScheduler] Hedef tamamlandı!")
                     self.stop()
@@ -455,12 +474,13 @@ class SpawnScheduler:
 
     def _get_active_screen_ids(self) -> List[int]:
         """Aktif (poll yapan) ekranları döndür"""
-        now = time.time()
-        active = [
-            sid for sid, last_poll in self._active_screens.items()
-            if now - last_poll < self._active_timeout
-        ]
-        return active if active else list(range(1, self.session.screen_count + 1))
+        with self._lock:
+            now = time.time()
+            active = [
+                sid for sid, last_poll in self._active_screens.items()
+                if now - last_poll < self._active_timeout
+            ]
+            return active if active else list(range(1, self.session.screen_count + 1))
 
     def _trigger_spawn(self, params: dict):
         """Hırsız spawn et"""
@@ -476,16 +496,17 @@ class SpawnScheduler:
         # Sadece aktif (poll yapan) ekranları kullan
         active_screens = self._get_active_screen_ids()
 
-        selected = self.screen_selector.select_screens(concurrent, active_screens)
+        with self._lock:
+            selected = self.screen_selector.select_screens(concurrent, active_screens)
 
-        # Seçilen ekranların kuyruğuna spawn ekle
-        for screen_id in selected:
-            if screen_id not in self.spawn_queues:
-                self.spawn_queues[screen_id] = queue.Queue()
-            self.spawn_queues[screen_id].put({"spawn": True})
+            # Seçilen ekranların kuyruğuna spawn ekle
+            for screen_id in selected:
+                if screen_id not in self.spawn_queues:
+                    self.spawn_queues[screen_id] = queue.Queue()
+                self.spawn_queues[screen_id].put({"spawn": True})
 
-        self.session.total_spawns += len(selected)
-        self._last_spawn_time = time.time()
+            self.session.total_spawns += len(selected)
+            self._last_spawn_time = time.time()
 
         if self.debug:
             print(

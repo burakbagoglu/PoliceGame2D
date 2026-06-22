@@ -77,6 +77,17 @@ class TestNetClientUnit:
         result = client.get_piezo_config()
         assert result == config
 
+    def test_consume_score_reset(self):
+        client = NetClient(
+            server_url="http://test:8000/event",
+            server_base_url="http://test:8000",
+            screen_id=1,
+        )
+        assert client.consume_score_reset() is False
+        client.score_reset_queue.put(2)
+        assert client.consume_score_reset() is True
+        assert client.consume_score_reset() is False
+
     def test_send_score_queues(self):
         client = NetClient(
             server_url="http://test:8000/event",
@@ -164,6 +175,29 @@ class TestNetClientPolling:
         )
         client._poll_spawn()
         assert client.get_spawn() is False
+
+    @responses.activate
+    def test_poll_spawn_score_version_change_queues_reset(self):
+        responses.get(
+            "http://test:8000/spawn/poll",
+            json={"spawn": False, "game_active": True, "score_version": 1},
+            status=200,
+        )
+        responses.get(
+            "http://test:8000/spawn/poll",
+            json={"spawn": False, "game_active": True, "score_version": 2},
+            status=200,
+        )
+
+        client = NetClient(
+            server_url="http://test:8000/event",
+            server_base_url="http://test:8000",
+            screen_id=1,
+        )
+        client._poll_spawn()
+        assert client.consume_score_reset() is False
+        client._poll_spawn()
+        assert client.consume_score_reset() is True
 
     @responses.activate
     def test_poll_piezo_config_changed(self):

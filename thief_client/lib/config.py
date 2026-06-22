@@ -49,17 +49,28 @@ class GameConfig:
         with open(filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
 
+        def env_bool(name: str, default: bool) -> bool:
+            value = os.environ.get(name)
+            if value is None:
+                return default
+            return value.lower() in ("1", "true", "yes")
+
         # server_base_url: server_url'den türet (yoksa)
-        server_url = data.get("server_url", "http://192.168.1.10:8000/event")
-        server_base_url = data.get("server_base_url", "")
+        server_url = os.environ.get(
+            "THIEF_SERVER_URL",
+            data.get("server_url", "http://192.168.1.10:8078/event"),
+        )
+        server_base_url = os.environ.get("THIEF_SERVER_BASE_URL", data.get("server_base_url", ""))
         if not server_base_url:
             # server_url'den base URL çıkar
-            # "http://192.168.1.10:8000/event" → "http://192.168.1.10:8000"
+            # "http://192.168.1.10:8078/event" → "http://192.168.1.10:8078"
             parts = server_url.rsplit("/", 1)
             server_base_url = parts[0] if len(parts) > 1 else server_url
+        elif "THIEF_SERVER_URL" not in os.environ:
+            server_url = f"{server_base_url.rstrip('/')}/event"
 
         return cls(
-            screen_id=data.get("screen_id", 1),
+            screen_id=int(os.environ.get("THIEF_SCREEN_ID", data.get("screen_id", 1))),
             server_url=server_url,
             server_base_url=server_base_url,
             server_controlled=data.get("server_controlled", True),
@@ -73,8 +84,8 @@ class GameConfig:
             band_x_min=data.get("band_x_min", 900),
             band_x_max=data.get("band_x_max", 1020),
             hit_cooldown_ms=data.get("hit_cooldown_ms", 200),
-            fullscreen=data.get("fullscreen", True),
-            serial_port=data.get("serial_port", "/dev/ttyUSB0"),
+            fullscreen=env_bool("THIEF_FULLSCREEN", data.get("fullscreen", True)),
+            serial_port=os.environ.get("THIEF_SERIAL_PORT", data.get("serial_port", "/dev/ttyUSB0")),
             serial_baud=data.get("serial_baud", 9600),
             screen_width=data.get("screen_width", 1920),
             screen_height=data.get("screen_height", 1080),
@@ -87,7 +98,7 @@ class GameConfig:
             shadow_scale_x=data.get("shadow_scale_x", 1.0),
             shadow_scale_y=data.get("shadow_scale_y", 0.3),
             shadow_offset_y=data.get("shadow_offset_y", 5),
-            debug=data.get("debug", False),
+            debug=env_bool("THIEF_DEBUG", data.get("debug", False)),
         )
 
     @property

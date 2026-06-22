@@ -54,8 +54,8 @@ class NetClient:
     ):
         """
         Args:
-            server_url: Server event endpoint URL (örn: http://192.168.1.10:8000/event)
-            server_base_url: Server base URL (örn: http://192.168.1.10:8000)
+            server_url: Server event endpoint URL (örn: http://192.168.1.10:8078/event)
+            server_base_url: Server base URL (örn: http://192.168.1.10:8078)
             screen_id: Bu ekranın ID'si
             poll_interval_ms: Spawn polling aralığı (ms)
             queue_file: Offline event'ler için dosya yolu
@@ -76,6 +76,10 @@ class NetClient:
 
         # Piezo config kuyruğu (server'dan gelen ayar değişiklikleri)
         self.piezo_config_queue: queue.Queue = queue.Queue()
+
+        # Server skor reset bildirimi
+        self.score_reset_queue: queue.Queue = queue.Queue()
+        self.last_score_version: Optional[int] = None
 
         # Thread kontrolü
         self.running = False
@@ -160,6 +164,14 @@ class NetClient:
         except queue.Empty:
             return None
 
+    def consume_score_reset(self) -> bool:
+        """Server'da skor sifirlandiysa True dondurur."""
+        try:
+            self.score_reset_queue.get_nowait()
+            return True
+        except queue.Empty:
+            return False
+
     # ============== Send Loop ==============
 
     def _send_loop(self):
@@ -240,6 +252,13 @@ class NetClient:
                 data = response.json()
                 self.connected = True
                 self.server_game_active = data.get("game_active", False)
+                score_version = data.get("score_version")
+                if score_version is not None:
+                    if self.last_score_version is None:
+                        self.last_score_version = score_version
+                    elif score_version != self.last_score_version:
+                        self.last_score_version = score_version
+                        self.score_reset_queue.put(score_version)
 
                 if data.get("spawn"):
                     self.spawn_queue.put(data)
@@ -347,6 +366,7 @@ class NetClient:
             "events_sent": self.events_sent,
             "events_failed": self.events_failed,
             "spawns_received": self.spawns_received,
+            "score_version": self.last_score_version,
             "queue_size": self.send_queue.qsize(),
             "last_error": self.last_error,
         }

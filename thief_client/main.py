@@ -251,6 +251,10 @@ class ThiefGame:
             if self.hit_input.get_hit():
                 self.game.process_hit()
 
+            if self.net_client.consume_score_reset():
+                self.game.reset_score()
+                self._score_surface_value = None
+
             # Server spawn kontrolü
             if self.config.server_controlled and self.game.is_idle():
                 if self.net_client.get_spawn():

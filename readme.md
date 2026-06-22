@@ -142,7 +142,7 @@ Fail: +0 (opsiyonel miss efekt/ses)
 6) Network: Event gönderimi (Pi Zero → Pi 5)
 6.1 Endpoint
 
-POST http://<PI5_IP>:8000/event
+POST http://<PI5_IP>:8078/event
 
 Payload:
 
@@ -193,7 +193,7 @@ thief_client/
 8) config.json (ekran bazlı ayar)
 {
   "screen_id": 1,
-  "server_url": "http://192.168.1.10:8000/event",
+  "server_url": "http://192.168.1.10:8078/event",
   "fps": 30,
   "thief_speed_px_s": 360,
   "spawn_x": 2100,

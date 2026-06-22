@@ -118,6 +118,15 @@ class TestHitProcessing:
         assert game.score == 1
         assert game.thief.state == GameState.FALL
 
+    def test_reset_score(self):
+        game = make_game()
+        game.process_hit()
+        assert game.score == 1
+        assert game.combo == 1
+        game.reset_score()
+        assert game.score == 0
+        assert game.combo == 0
+
     def test_hit_during_idle(self):
         game = make_game(server_controlled=True)
         result = game.process_hit()

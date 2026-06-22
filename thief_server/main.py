@@ -6,6 +6,7 @@ Tüm client'lardan gelen skorları toplar, spawn zamanlamasını yönetir ve das
 import json
 import os
 import time
+import threading
 from datetime import datetime
 from typing import Dict, Set, Optional
 from contextlib import asynccontextmanager
@@ -30,26 +31,33 @@ from spawn_engine import (
 def load_config(filepath: str = "config.json") -> dict:
     """Config dosyasını yükle"""
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.path.join(script_dir, filepath)
+    config_path = os.environ.get("THIEF_SERVER_CONFIG") or os.path.join(script_dir, filepath)
 
     if os.path.exists(config_path):
         with open(config_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            config = json.load(f)
+    else:
+        config = {
+            "host": "0.0.0.0",
+            "port": 8078,
+            "num_screens": 12,
+            "game_duration_minutes": 45,
+            "base_score_per_child": 15,
+            "base_spawn_interval": 3.0,
+            "min_spawn_interval": 0.5,
+            "max_spawn_interval": 8.0,
+            "max_concurrent_spawns": 3,
+            "default_piezo_threshold": 100,
+            "default_piezo_refractory_ms": 200,
+            "debug": False,
+            "access_log": False,
+        }
 
-    return {
-        "host": "0.0.0.0",
-        "port": 8000,
-        "num_screens": 12,
-        "game_duration_minutes": 45,
-        "base_score_per_child": 15,
-        "base_spawn_interval": 3.0,
-        "min_spawn_interval": 0.5,
-        "max_spawn_interval": 8.0,
-        "max_concurrent_spawns": 3,
-        "default_piezo_threshold": 100,
-        "default_piezo_refractory_ms": 200,
-        "debug": True,
-    }
+    config["host"] = os.environ.get("THIEF_HOST", config.get("host", "0.0.0.0"))
+    config["port"] = int(os.environ.get("THIEF_PORT", config.get("port", 8078)))
+    config["debug"] = os.environ.get("THIEF_DEBUG", str(config.get("debug", False))).lower() in ("1", "true", "yes")
+    config["access_log"] = os.environ.get("THIEF_ACCESS_LOG", str(config.get("access_log", False))).lower() in ("1", "true", "yes")
+    return config
 
 
 CONFIG = load_config()
@@ -71,6 +79,7 @@ class ScoreResponse(BaseModel):
     screen_scores: Dict[int, int]
     event_count: int
     last_event_time: Optional[str]
+    score_version: int
 
 
 class StartGameRequest(BaseModel):
@@ -93,6 +102,7 @@ class ScoreManager:
     """Skor yöneticisi - idempotent event işleme"""
 
     def __init__(self, num_screens: int = 12):
+        self._lock = threading.RLock()
         self.num_screens = num_screens
         self.screen_scores: Dict[int, int] = {i: 0 for i in range(1, num_screens + 1)}
         self.total_score: int = 0
@@ -101,52 +111,66 @@ class ScoreManager:
         self.last_event_time: Optional[datetime] = None
         self.event_history: list = []
         self.max_history = 100
+        self.score_version: int = 0
 
     def process_event(self, event: ScoreEvent) -> bool:
         """Event'i işle. True: yeni, False: duplicate"""
-        if event.event_id in self.processed_events:
-            return False
+        with self._lock:
+            if event.event_id in self.processed_events:
+                return False
 
-        self.processed_events.add(event.event_id)
+            self.processed_events.add(event.event_id)
 
-        screen_id = event.screen_id
-        if 1 <= screen_id <= self.num_screens:
-            self.screen_scores[screen_id] = self.screen_scores.get(screen_id, 0) + event.points
-            self.total_score += event.points
+            screen_id = event.screen_id
+            if 1 <= screen_id <= self.num_screens:
+                self.screen_scores[screen_id] = self.screen_scores.get(screen_id, 0) + event.points
+                self.total_score += event.points
 
-        self.event_count += 1
-        self.last_event_time = datetime.now()
+            self.event_count += 1
+            self.last_event_time = datetime.now()
 
-        self.event_history.append({
-            "event_id": event.event_id[:8] + "...",
-            "screen_id": event.screen_id,
-            "points": event.points,
-            "time": self.last_event_time.strftime("%H:%M:%S"),
-        })
+            self.event_history.append({
+                "event_id": event.event_id[:8] + "...",
+                "screen_id": event.screen_id,
+                "points": event.points,
+                "time": self.last_event_time.strftime("%H:%M:%S"),
+            })
 
-        if len(self.event_history) > self.max_history:
-            self.event_history.pop(0)
+            if len(self.event_history) > self.max_history:
+                self.event_history.pop(0)
 
-        return True
+            return True
 
     def get_scores(self) -> ScoreResponse:
-        return ScoreResponse(
-            total_score=self.total_score,
-            screen_scores=self.screen_scores,
-            event_count=self.event_count,
-            last_event_time=(
-                self.last_event_time.strftime("%Y-%m-%d %H:%M:%S")
-                if self.last_event_time else None
-            ),
-        )
+        with self._lock:
+            return ScoreResponse(
+                total_score=self.total_score,
+                screen_scores=self.screen_scores.copy(),
+                event_count=self.event_count,
+                last_event_time=(
+                    self.last_event_time.strftime("%Y-%m-%d %H:%M:%S")
+                    if self.last_event_time else None
+                ),
+                score_version=self.score_version,
+            )
+
+    def get_screen_score(self, screen_id: int) -> int:
+        with self._lock:
+            return self.screen_scores[screen_id]
+
+    def get_history(self) -> list:
+        with self._lock:
+            return list(self.event_history)
 
     def reset(self):
-        self.screen_scores = {i: 0 for i in range(1, self.num_screens + 1)}
-        self.total_score = 0
-        self.processed_events.clear()
-        self.event_count = 0
-        self.last_event_time = None
-        self.event_history.clear()
+        with self._lock:
+            self.screen_scores = {i: 0 for i in range(1, self.num_screens + 1)}
+            self.total_score = 0
+            self.processed_events.clear()
+            self.event_count = 0
+            self.last_event_time = None
+            self.event_history.clear()
+            self.score_version += 1
 
 
 # ============== Global Instances ==============
@@ -166,6 +190,7 @@ spawn_scheduler: Optional[SpawnScheduler] = None
 # Global aktif ekran takibi (oyun başlamadan ÖNCE de kaydeder)
 import time as _time
 active_polling_screens: Dict[int, float] = {}  # screen_id -> last_poll_time
+active_polling_lock = threading.RLock()
 
 
 # ============== FastAPI App ==============
@@ -237,7 +262,9 @@ async def start_game(req: StartGameRequest):
     )
 
     # Oyun başlamadan önce poll yapan ekranları hemen kaydet
-    for sid, last_t in active_polling_screens.items():
+    with active_polling_lock:
+        active_snapshot = list(active_polling_screens.items())
+    for sid, last_t in active_snapshot:
         spawn_scheduler._active_screens[sid] = last_t
         # Dinamik kuyruk oluştur
         if sid not in spawn_scheduler.spawn_queues:
@@ -245,12 +272,14 @@ async def start_game(req: StartGameRequest):
             spawn_scheduler.spawn_queues[sid] = queue.Queue()
 
     if CONFIG.get("debug"):
-        print(f"[Game] Kayıtlı aktif ekranlar: {list(active_polling_screens.keys())}")
+        print(f"[Game] Kayıtlı aktif ekranlar: {[sid for sid, _ in active_snapshot]}")
 
     spawn_scheduler.start()
 
     # Skorları sıfırla
     score_manager.reset()
+    if spawn_scheduler:
+        spawn_scheduler.reset_score()
 
     if CONFIG.get("debug"):
         print(f"[Game] Oyun başlatıldı! Çocuk: {req.child_count}, Hedef: {target_score}")
@@ -282,8 +311,9 @@ async def end_game():
     global spawn_scheduler
 
     if spawn_scheduler:
-        final_score = spawn_scheduler.session.current_score
-        target = spawn_scheduler.session.target_score
+        status = spawn_scheduler.get_status()
+        final_score = status["current_score"]
+        target = status["target_score"]
         spawn_scheduler.stop()
 
         if CONFIG.get("debug"):
@@ -305,13 +335,27 @@ async def end_game():
 async def spawn_poll(screen_id: int = Query(...)):
     """Client spawn kontrolü"""
     # Ekranı GLOBAL olarak kaydet (oyun başlamadan önce de)
-    active_polling_screens[screen_id] = _time.time()
+    with active_polling_lock:
+        active_polling_screens[screen_id] = _time.time()
 
-    if not spawn_scheduler or not spawn_scheduler.session.is_active:
-        return {"spawn": False, "game_active": False}
+    if not spawn_scheduler:
+        return {
+            "spawn": False,
+            "game_active": False,
+            "score_version": score_manager.get_scores().score_version,
+        }
+
+    scheduler_status = spawn_scheduler.get_status()
+    if not scheduler_status["is_active"]:
+        return {
+            "spawn": False,
+            "game_active": False,
+            "score_version": score_manager.get_scores().score_version,
+        }
 
     result = spawn_scheduler.poll_spawn(screen_id)
     result["game_active"] = True
+    result["score_version"] = score_manager.get_scores().score_version
     return result
 
 
@@ -333,7 +377,7 @@ async def receive_event(event: ScoreEvent):
     return {
         "success": True,
         "is_new": is_new,
-        "total_score": score_manager.total_score,
+        "total_score": score_manager.get_scores().total_score,
     }
 
 
@@ -348,33 +392,44 @@ async def get_screen_score(screen_id: int):
         raise HTTPException(status_code=404, detail=f"Ekran {screen_id} bulunamadı")
     return {
         "screen_id": screen_id,
-        "score": score_manager.screen_scores[screen_id],
+        "score": score_manager.get_screen_score(screen_id),
     }
 
 
 @app.post("/reset")
 async def reset_scores():
     score_manager.reset()
+    if spawn_scheduler:
+        spawn_scheduler.reset_score()
     if CONFIG.get("debug"):
         print("🔄 Skorlar sıfırlandı!")
-    return {"success": True, "message": "Skorlar sıfırlandı"}
+    return {
+        "success": True,
+        "message": "Skorlar sifirlandi",
+        "score_version": score_manager.get_scores().score_version,
+    }
 
 
 @app.get("/history")
 async def get_history():
+    events = score_manager.get_history()
     return {
-        "events": score_manager.event_history,
-        "count": len(score_manager.event_history),
+        "events": events,
+        "count": len(events),
     }
 
 
 @app.get("/health")
 async def health_check():
+    scores = score_manager.get_scores()
+    game_active = False
+    if spawn_scheduler:
+        game_active = spawn_scheduler.get_status()["is_active"]
     return {
         "status": "healthy",
         "uptime": "ok",
-        "total_score": score_manager.total_score,
-        "game_active": spawn_scheduler.session.is_active if spawn_scheduler else False,
+        "total_score": scores.total_score,
+        "game_active": game_active,
     }
 
 
@@ -733,20 +788,237 @@ DASHBOARD_HTML = """
             h1 { font-size: 1.8rem; }
             .total-score .score { font-size: 3rem; }
         }
+
+        /* === Minimal dashboard refresh === */
+        body {
+            background: #0b111c;
+            color: #e5e7eb;
+            padding: 24px;
+        }
+
+        .container {
+            max-width: 1280px;
+        }
+
+        h1 {
+            text-align: left;
+            font-size: 2rem;
+            margin-bottom: 18px;
+            text-shadow: none;
+            letter-spacing: 0;
+        }
+
+        .top-layout {
+            display: grid;
+            grid-template-columns: minmax(280px, 420px) 1fr;
+            gap: 16px;
+            align-items: stretch;
+            margin-bottom: 16px;
+        }
+
+        .total-score {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            text-align: left;
+            background: #111827;
+            border: 1px solid #1f2937;
+            border-radius: 8px;
+            box-shadow: none;
+            margin-bottom: 0;
+            padding: 20px;
+        }
+
+        .total-score h2,
+        .card h3 {
+            font-size: 0.82rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: #9ca3af;
+            opacity: 1;
+        }
+
+        .total-score .score {
+            font-size: 4.25rem;
+            line-height: 1;
+            color: #fbbf24;
+            text-shadow: none;
+        }
+
+        .total-score .target {
+            font-size: 1rem;
+            color: #9ca3af;
+            opacity: 1;
+        }
+
+        .progress-container {
+            height: 10px;
+            margin: 16px 0 4px;
+            background: #1f2937;
+            border-radius: 999px;
+        }
+
+        .progress-bar {
+            background: #fbbf24;
+            border-radius: 999px;
+        }
+
+        .progress-text {
+            position: static;
+            transform: none;
+            display: block;
+            margin-top: 10px;
+            color: #9ca3af;
+            text-shadow: none;
+            font-size: 0.9rem;
+        }
+
+        .quick-starts {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 12px;
+        }
+
+        .quick-card {
+            border: 1px solid #1f2937;
+            border-radius: 8px;
+            background: #0f172a;
+            color: #e5e7eb;
+            padding: 16px;
+            text-align: left;
+            cursor: pointer;
+            transition: border-color 0.16s ease, background 0.16s ease, transform 0.16s ease;
+        }
+
+        .quick-card:hover {
+            border-color: #fbbf24;
+            background: #111c31;
+            transform: translateY(-1px);
+        }
+
+        .quick-card strong {
+            display: block;
+            margin-bottom: 8px;
+            font-size: 1.05rem;
+        }
+
+        .quick-card span {
+            display: block;
+            color: #9ca3af;
+            font-size: 0.9rem;
+            line-height: 1.45;
+        }
+
+        .grid {
+            grid-template-columns: minmax(320px, 1.05fr) minmax(320px, 0.95fr);
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+
+        .card {
+            background: #111827;
+            border: 1px solid #1f2937;
+            border-radius: 8px;
+            padding: 18px;
+            backdrop-filter: none;
+        }
+
+        .controls {
+            gap: 8px;
+        }
+
+        .btn {
+            border-radius: 7px;
+            padding: 9px 14px;
+            font-size: 0.9rem;
+            font-weight: 650;
+        }
+
+        .btn:hover {
+            transform: translateY(-1px);
+        }
+
+        .btn-green { background: #16a34a; }
+        .btn-red { background: #dc2626; }
+        .btn-blue { background: #2563eb; }
+        .btn-orange { background: #d97706; }
+
+        input[type="number"],
+        select {
+            background: #0b1220;
+            border: 1px solid #263244;
+            color: #e5e7eb;
+            border-radius: 7px;
+        }
+
+        .screen-card {
+            background: #0f172a;
+            border: 1px solid #1f2937;
+            border-radius: 8px;
+            padding: 12px;
+        }
+
+        .screen-card:hover {
+            transform: none;
+            box-shadow: none;
+            border-color: #374151;
+        }
+
+        .history {
+            max-height: 210px;
+        }
+
+        .history-item {
+            background: #0f172a;
+            border: 1px solid #1f2937;
+            border-radius: 7px;
+        }
+
+        .stat-row {
+            border-bottom-color: #1f2937;
+        }
+
+        @media (max-width: 900px) {
+            .top-layout,
+            .grid,
+            .quick-starts {
+                grid-template-columns: 1fr;
+            }
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>🎮 Hırsız Oyunu — Kontrol Paneli</h1>
 
-        <!-- Skor -->
-        <div class="total-score">
-            <h2>TOPLAM SKOR</h2>
-            <div class="score" id="total-score">0</div>
-            <div class="target">Hedef: <span id="target-score">—</span></div>
-            <div class="progress-container">
-                <div class="progress-bar" id="progress-bar" style="width: 0%"></div>
+        <div class="top-layout">
+            <!-- Skor -->
+            <div class="total-score">
+                <h2>TOPLAM SKOR</h2>
+                <div class="score" id="total-score">0</div>
+                <div class="target">Hedef: <span id="target-score">—</span></div>
+                <div class="progress-container">
+                    <div class="progress-bar" id="progress-bar" style="width: 0%"></div>
+                </div>
                 <div class="progress-text" id="progress-text">0%</div>
+            </div>
+
+            <div class="card">
+                <h3>Hızlı Başlangıç</h3>
+                <div class="quick-starts">
+                    <button class="quick-card" onclick="quickStart(2, 5, 6, 'easy')">
+                        <strong>Kısa Tur</strong>
+                        <span>2 çocuk · 5 ekran · 6 dk · Kolay</span>
+                    </button>
+                    <button class="quick-card" onclick="quickStart(5, 12, 20, 'normal')">
+                        <strong>Standart</strong>
+                        <span>5 çocuk · 12 ekran · 20 dk · Normal</span>
+                    </button>
+                    <button class="quick-card" onclick="quickStart(10, 12, 30, 'hard')">
+                        <strong>Yoğun Mod</strong>
+                        <span>10 çocuk · 12 ekran · 30 dk · Zor</span>
+                    </button>
+                </div>
             </div>
         </div>
 
@@ -884,6 +1156,14 @@ DASHBOARD_HTML = """
         document.getElementById('piezo-refractory').addEventListener('input', function() {
             document.getElementById('refractory-value').textContent = this.value + 'ms';
         });
+
+        function quickStart(childCount, screenCount, durationMinutes, difficulty) {
+            document.getElementById('child-count').value = childCount;
+            document.getElementById('screen-count').value = screenCount;
+            document.getElementById('duration-minutes').value = durationMinutes;
+            document.getElementById('difficulty').value = difficulty;
+            startGame();
+        }
 
         // === Oyun başlat ===
         async function startGame() {
@@ -1070,10 +1350,403 @@ DASHBOARD_HTML = """
 """
 
 
+SCREEN_HTML = """
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hirsiz Oyunu - Ekran</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        :root {
+            --gold: #ffd166;
+            --gold-strong: #f7b731;
+            --ink: #07111f;
+            --panel: rgba(10, 18, 32, 0.72);
+            --line: rgba(255, 255, 255, 0.14);
+        }
+        body {
+            min-height: 100vh;
+            overflow: hidden;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: #fff;
+            background:
+                radial-gradient(circle at 18% 16%, rgba(255, 209, 102, 0.22), transparent 28%),
+                radial-gradient(circle at 84% 18%, rgba(87, 123, 255, 0.18), transparent 30%),
+                linear-gradient(145deg, #122018 0%, #081422 46%, #251d44 100%);
+        }
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            background:
+                linear-gradient(rgba(255,255,255,0.035) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255,255,255,0.035) 1px, transparent 1px);
+            background-size: 88px 88px;
+            mask-image: linear-gradient(to bottom, black 0%, transparent 78%);
+        }
+        .stage {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            display: grid;
+            grid-template-rows: auto 1fr;
+            padding: clamp(26px, 4vw, 60px);
+            isolation: isolate;
+        }
+        .topbar {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 24px;
+            z-index: 5;
+        }
+        .brand {
+            font-size: clamp(34px, 4.3vw, 72px);
+            font-weight: 900;
+            letter-spacing: 0;
+            text-shadow: 0 12px 36px rgba(0,0,0,0.35);
+        }
+        .status {
+            padding: 12px 22px;
+            border: 1px solid var(--line);
+            border-radius: 999px;
+            background: rgba(255,255,255,0.1);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.18), 0 12px 32px rgba(0,0,0,0.22);
+            font-size: clamp(16px, 1.5vw, 24px);
+            backdrop-filter: blur(12px);
+        }
+        .score-wrap {
+            position: relative;
+            z-index: 4;
+            display: grid;
+            place-items: center;
+            text-align: center;
+            padding-bottom: 17vh;
+        }
+        .score-card {
+            width: min(940px, 78vw);
+            padding: clamp(24px, 3vw, 44px);
+            border: 1px solid var(--line);
+            border-radius: 28px;
+            background:
+                linear-gradient(180deg, rgba(255,255,255,0.12), rgba(255,255,255,0.035)),
+                var(--panel);
+            box-shadow: 0 28px 90px rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.16);
+            backdrop-filter: blur(18px);
+        }
+        .label {
+            font-size: clamp(18px, 1.7vw, 30px);
+            color: rgba(255,255,255,0.74);
+            text-transform: uppercase;
+            font-weight: 900;
+            letter-spacing: 0.12em;
+        }
+        .score {
+            font-size: clamp(128px, 19vw, 310px);
+            line-height: 0.82;
+            font-weight: 1000;
+            color: var(--gold);
+            text-shadow: 0 20px 70px rgba(247,183,49,0.36), 0 4px 0 rgba(0,0,0,0.12);
+            transition: transform 0.25s ease;
+        }
+        .score.bump { transform: scale(1.08); }
+        .target {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            margin-top: 14px;
+            padding: 10px 22px;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.08);
+            color: rgba(255,255,255,0.92);
+            font-size: clamp(22px, 2.7vw, 46px);
+            font-weight: 850;
+        }
+        .progress {
+            width: 100%;
+            height: 20px;
+            border-radius: 999px;
+            background: rgba(0,0,0,0.28);
+            overflow: hidden;
+            margin-top: 26px;
+            box-shadow: inset 0 1px 8px rgba(0,0,0,0.38);
+        }
+        .bar {
+            height: 100%;
+            width: 0%;
+            border-radius: inherit;
+            background: linear-gradient(90deg, #35d07f, var(--gold), #ff6b6b);
+            box-shadow: 0 0 24px rgba(255,209,102,0.36);
+            transition: width 0.5s ease;
+        }
+        .meta-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 14px;
+            margin-top: 18px;
+            text-align: left;
+        }
+        .meta {
+            min-height: 74px;
+            padding: 14px 18px;
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 18px;
+            background: rgba(0,0,0,0.18);
+        }
+        .meta span {
+            display: block;
+            color: rgba(255,255,255,0.58);
+            font-size: clamp(12px, 1vw, 16px);
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            margin-bottom: 6px;
+        }
+        .meta strong {
+            font-size: clamp(18px, 1.7vw, 28px);
+            font-weight: 800;
+        }
+        .city {
+            position: absolute;
+            inset: auto 0 0 0;
+            height: 34vh;
+            z-index: 1;
+            background:
+                linear-gradient(90deg, transparent 0 5%, rgba(255,255,255,0.07) 5% 6%, transparent 6% 12%),
+                linear-gradient(0deg, #06101d 0%, #101b2d 100%);
+            background-size: 180px 100%, 100% 100%;
+            border-top: 1px solid rgba(255,255,255,0.08);
+            opacity: 0.92;
+        }
+        .road {
+            position: absolute;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            height: 13vh;
+            z-index: 2;
+            background: linear-gradient(180deg, #1b1b1f 0%, #090909 100%);
+            border-top: 5px solid rgba(255,255,255,0.13);
+            box-shadow: 0 -18px 50px rgba(0,0,0,0.26);
+        }
+        .dash {
+            position: absolute;
+            top: 48%;
+            left: 0;
+            width: 200%;
+            border-top: 7px dashed rgba(255,209,102,0.94);
+            animation: roadMove 1.2s linear infinite;
+        }
+        .police-shadow {
+            position: absolute;
+            bottom: 11.8vh;
+            left: -260px;
+            width: 240px;
+            height: 28px;
+            z-index: 2;
+            border-radius: 50%;
+            background: rgba(0,0,0,0.38);
+            filter: blur(8px);
+            animation: patrol 8s linear infinite;
+        }
+        .police-car {
+            position: absolute;
+            bottom: 11.6vh;
+            left: -260px;
+            width: 238px;
+            height: 92px;
+            z-index: 3;
+            border-radius: 28px 46px 24px 24px;
+            background:
+                linear-gradient(90deg, #f8fafc 0 45%, #111827 45% 54%, #f8fafc 54% 100%);
+            border: 4px solid #e5e7eb;
+            box-shadow: 0 18px 42px rgba(0,0,0,0.36), inset 0 -18px 0 rgba(15,23,42,0.1);
+            animation: patrol 8s linear infinite;
+        }
+        .police-car::before {
+            content: "";
+            position: absolute;
+            left: 58px;
+            top: -38px;
+            width: 116px;
+            height: 48px;
+            border-radius: 36px 36px 8px 8px;
+            background:
+                linear-gradient(90deg, #7dd3fc 0 46%, #dbeafe 46% 54%, #7dd3fc 54% 100%);
+            border: 4px solid #e5e7eb;
+            box-shadow: inset 0 -10px 0 rgba(15,23,42,0.12);
+        }
+        .wheel {
+            position: absolute;
+            bottom: -18px;
+            width: 46px;
+            height: 46px;
+            border-radius: 50%;
+            background:
+                radial-gradient(circle, #cbd5e1 0 18%, #64748b 20% 32%, #020617 34% 67%, #111827 69%);
+            border: 5px solid #0f172a;
+            box-shadow: inset 0 0 0 3px rgba(255,255,255,0.06), 0 8px 14px rgba(0,0,0,0.32);
+        }
+        .wheel-left { left: 34px; }
+        .wheel-right { right: 34px; }
+        .siren-light {
+            position: absolute;
+            left: 50%;
+            top: -58px;
+            width: 84px;
+            height: 18px;
+            z-index: 8;
+            display: block;
+            border-radius: 999px;
+            background: linear-gradient(90deg, #ef4444 0 50%, #3b82f6 50% 100%);
+            box-shadow: -22px 0 34px rgba(239,68,68,0.72), 22px 0 34px rgba(59,130,246,0.72);
+            transform: translateX(-50%);
+            animation: beacon 0.55s steps(2, end) infinite;
+        }
+        .headlight {
+            position: absolute;
+            left: -62px;
+            bottom: calc(11.6vh + 38px);
+            width: 150px;
+            height: 52px;
+            z-index: 2;
+            clip-path: polygon(0 38%, 100% 0, 100% 100%, 0 62%);
+            background: linear-gradient(90deg, rgba(255,238,160,0), rgba(255,238,160,0.32));
+            filter: blur(2px);
+            animation: patrolBeam 8s linear infinite;
+        }
+        .light {
+            position: absolute;
+            inset: 0;
+            z-index: 0;
+            pointer-events: none;
+            mix-blend-mode: screen;
+            opacity: 0.22;
+            background: linear-gradient(90deg, rgba(231,76,60,0.5), transparent 46%, rgba(52,152,219,0.48));
+            animation: siren 1.1s steps(2, end) infinite;
+        }
+        @keyframes patrol {
+            0% { transform: translateX(0); }
+            48% { transform: translateX(calc(100vw + 290px)); }
+            49% { transform: translateX(calc(100vw + 290px)) rotateY(180deg); }
+            100% { transform: translateX(0) rotateY(180deg); }
+        }
+        @keyframes patrolBeam {
+            0% { transform: translateX(0); opacity: 0.88; }
+            48% { transform: translateX(calc(100vw + 290px)); opacity: 0.88; }
+            49% { transform: translateX(calc(100vw + 290px)) rotateY(180deg); opacity: 0.88; }
+            100% { transform: translateX(0) rotateY(180deg); opacity: 0.88; }
+        }
+        @keyframes beacon {
+            0%, 100% { filter: brightness(1.35); }
+            50% { filter: brightness(0.8); }
+        }
+        @keyframes roadMove {
+            to { transform: translateX(-170px); }
+        }
+        @keyframes siren {
+            0%, 100% { filter: hue-rotate(0deg); }
+            50% { filter: hue-rotate(150deg); }
+        }
+        @media (max-width: 900px) {
+            .score-card { width: min(96vw, 720px); }
+            .meta-row { grid-template-columns: 1fr; }
+            .score-wrap { padding-bottom: 18vh; }
+        }
+    </style>
+</head>
+<body>
+    <div class="light"></div>
+    <div class="stage">
+        <div class="topbar">
+            <div class="brand">Hirsiz Oyunu</div>
+            <div class="status" id="status">Beklemede</div>
+        </div>
+        <main class="score-wrap">
+            <div class="score-card">
+                <div class="label">Toplam Skor</div>
+                <div class="score" id="score">0</div>
+                <div class="target">Hedef: <span id="target">-</span></div>
+                <div class="progress"><div class="bar" id="bar"></div></div>
+                <div class="meta-row">
+                    <div class="meta"><span>Faz</span><strong id="phase">-</strong></div>
+                    <div class="meta"><span>Son vurus</span><strong id="last">-</strong></div>
+                </div>
+            </div>
+        </main>
+    </div>
+    <div class="city"></div>
+    <div class="road"><div class="dash"></div></div>
+    <div class="headlight"></div>
+    <div class="police-shadow"></div>
+    <div class="police-car">
+        <div class="siren-light"></div>
+        <div class="wheel wheel-left"></div>
+        <div class="wheel wheel-right"></div>
+    </div>
+    <script>
+        let lastScore = null;
+        async function refreshScreen() {
+            try {
+                const [scoreRes, statusRes, historyRes] = await Promise.all([
+                    fetch('/score'),
+                    fetch('/api/game/status'),
+                    fetch('/history'),
+                ]);
+                const scoreData = await scoreRes.json();
+                const statusData = await statusRes.json();
+                const historyData = await historyRes.json();
+
+                const scoreEl = document.getElementById('score');
+                if (lastScore !== null && scoreData.total_score !== lastScore) {
+                    scoreEl.classList.remove('bump');
+                    void scoreEl.offsetWidth;
+                    scoreEl.classList.add('bump');
+                }
+                lastScore = scoreData.total_score;
+                scoreEl.textContent = scoreData.total_score;
+
+                const active = Boolean(statusData.is_active);
+                document.getElementById('status').textContent = active ? 'Oyun Aktif' : 'Beklemede';
+                document.getElementById('phase').textContent = statusData.phase || '-';
+
+                const target = statusData.target_score || statusData.score_data?.target_score || '-';
+                document.getElementById('target').textContent = target;
+
+                const pct = statusData.progress_percent || 0;
+                document.getElementById('bar').style.width = `${Math.min(100, pct)}%`;
+
+                const latest = (historyData.events || []).slice(-1)[0];
+                document.getElementById('last').textContent = latest
+                    ? `Ekran ${latest.screen_id} +${latest.points}`
+                    : '-';
+            } catch (err) {
+                document.getElementById('status').textContent = 'Baglanti yok';
+            }
+        }
+        refreshScreen();
+        setInterval(refreshScreen, 700);
+    </script>
+</body>
+</html>
+"""
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
     """Ana sayfa - Dashboard"""
     return DASHBOARD_HTML
+
+
+@app.get("/screen", response_class=HTMLResponse)
+async def screen():
+    """Seyir ekrani - animasyonlu skor gorunumu"""
+    return SCREEN_HTML
 
 
 # ============== Main ==============
@@ -1084,6 +1757,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "main:app",
         host=CONFIG.get("host", "0.0.0.0"),
-        port=CONFIG.get("port", 8000),
+        port=CONFIG.get("port", 8078),
         reload=CONFIG.get("debug", False),
+        access_log=CONFIG.get("access_log", False),
     )

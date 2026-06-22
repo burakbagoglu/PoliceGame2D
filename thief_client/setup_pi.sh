@@ -13,7 +13,7 @@ sudo apt install -y python3-pip python3-pygame python3-serial
 
 # Python paketleri
 echo "[3/6] Python paketleri yükleniyor..."
-pip3 install --user requests
+pip3 install --user -r requirements.txt
 
 # Kullanıcıyı dialout grubuna ekle (serial port erişimi için)
 echo "[4/6] Kullanıcı ayarları..."
@@ -33,9 +33,10 @@ echo ""
 echo "=== Kurulum Tamamlandı ==="
 echo ""
 echo "Önemli notlar:"
-echo "1. config.json dosyasında screen_id değerini ayarlayın (1-5)"
-echo "2. Arduino'yu USB'ye bağlayın"
-echo "3. 'sudo reboot' ile yeniden başlatın"
+echo "1. config.json dosyasında screen_id değerini ayarlayın (1-12)"
+echo "2. config.json içinde server_base_url değerini Pi 5 IP adresine göre ayarlayın"
+echo "3. Arduino'yu USB'ye bağlayın"
+echo "4. 'sudo reboot' ile yeniden başlatın"
 echo ""
 echo "Manuel başlatma: python3 main.py"
 echo "Service başlatma: sudo systemctl start thief-game"

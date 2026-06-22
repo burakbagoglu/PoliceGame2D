@@ -1,14 +1,17 @@
 [Unit]
 Description=Thief Game Server
-After=network.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
 User=pi
 WorkingDirectory=/home/pi/thief_server
-ExecStart=/usr/bin/python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
-Restart=always
-RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+Environment=THIEF_SERVER_CONFIG=/home/pi/thief_server/config.json
+ExecStart=/usr/bin/python3 /home/pi/thief_server/main.py
+Restart=on-failure
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target

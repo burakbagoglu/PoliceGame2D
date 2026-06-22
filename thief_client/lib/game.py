@@ -123,6 +123,11 @@ class GameLogic:
         # Fall animasyonu süresi (saniye) — 10 frame @ 12fps = 0.83s + yerde kalma
         self.fall_duration = 1.5
 
+    def reset_score(self):
+        """Yerel skor ve komboyu sifirla."""
+        self.score = 0
+        self.combo = 0
+
     def trigger_spawn(self):
         """
         Server'dan spawn komutu geldiğinde çağrılır.

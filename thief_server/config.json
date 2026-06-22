@@ -1,6 +1,6 @@
 {
   "host": "0.0.0.0",
-  "port": 8000,
+  "port": 8078,
   "num_screens": 12,
   "game_duration_minutes": 20,
   "base_score_per_child": 15,
@@ -10,5 +10,6 @@
   "max_concurrent_spawns": 3,
   "default_piezo_threshold": 100,
   "default_piezo_refractory_ms": 200,
-  "debug": true
+  "debug": false,
+  "access_log": false
 }

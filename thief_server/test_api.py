@@ -154,6 +154,19 @@ class TestScoreAPI:
         client.post("/reset")
         res = client.get("/score")
         assert res.json()['total_score'] == 0
+        assert res.json()['score_version'] > 0
+
+    def test_reset_updates_scheduler_score(self):
+        client.post("/api/game/start", json={"child_count": 3, "screen_count": 5})
+        client.post("/event", json={
+            "event_id": "reset-scheduler-001",
+            "screen_id": 1,
+            "points": 5,
+            "ts_ms": int(time.time() * 1000),
+        })
+        client.post("/reset")
+        res = client.get("/api/game/status")
+        assert res.json()['current_score'] == 0
 
     def test_history(self):
         client.post("/event", json={
@@ -225,3 +238,13 @@ class TestHealth:
         res = client.get("/")
         assert res.status_code == 200
         assert 'Hırsız Oyunu' in res.text
+
+    def test_dashboard_route(self):
+        res = client.get("/dashboard")
+        assert res.status_code == 200
+        assert 'Kontrol Paneli' in res.text
+
+    def test_screen_route(self):
+        res = client.get("/screen")
+        assert res.status_code == 200
+        assert 'Toplam Skor' in res.text
