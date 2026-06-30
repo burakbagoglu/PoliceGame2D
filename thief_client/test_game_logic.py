@@ -147,7 +147,8 @@ class TestHitProcessing:
 
     def test_score_callback(self):
         scores = []
-        game = make_game(on_score=lambda p: scores.append(p))
+        # on_score artık (points, combo) imzasıyla çağrılır
+        game = make_game(on_score=lambda p, combo=1: scores.append(p))
         game.process_hit()
         assert scores == [1]
 
@@ -166,15 +167,15 @@ class TestFallCooldown:
         game = make_game()
         game.process_hit()
         assert game.thief.state == GameState.FALL
-        # Fall süresini simüle et
-        game.thief.fall_start = time.time() - 1.0  # 1 saniye önce
+        # Fall süresini simüle et (fall_duration=1.5s'den fazla geçmiş olmalı)
+        game.thief.fall_start = time.time() - 2.0
         game.update(0.01)
         assert game.thief.state == GameState.COOLDOWN
 
     def test_cooldown_to_reset(self):
         game = make_game()
         game.process_hit()
-        game.thief.fall_start = time.time() - 1.0
+        game.thief.fall_start = time.time() - 2.0
         game.update(0.01)  # → COOLDOWN
         game.thief.cooldown_end = time.time() - 0.1
         game.update(0.01)  # → RESET

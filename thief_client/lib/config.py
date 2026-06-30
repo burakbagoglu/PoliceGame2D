@@ -3,8 +3,10 @@ Config modülü - JSON dosyasından ayarları okur
 """
 import json
 import os
-from dataclasses import dataclass
-from typing import Tuple, Optional
+from dataclasses import dataclass, field
+from typing import Tuple
+
+from lib.playarea import PlayAreaConfig
 
 
 @dataclass
@@ -40,14 +42,32 @@ class GameConfig:
     shadow_offset_y: int
     debug: bool
 
+    # --- Yeni alanlar (kurulum sihirbazı + pleksi/oynanabilir alan) ---
+    # Bunlar çözünürlükten bağımsız çalışsın diye yüzde/oran olarak tutulur;
+    # runtime'da oynanabilir alan boyutuna göre piksele çevrilir.
+    installed: bool = False
+    playarea: PlayAreaConfig = field(default_factory=PlayAreaConfig)
+    thief_ground_pct: float = 95.0   # Zemin çizgisi (oynanabilir alan yüksekliğinin %'si)
+    band_center_pct: float = 50.0    # Band merkezi (oynanabilir alan genişliğinin %'si)
+    band_width_px: int = 120         # Band genişliği (piksel)
+    spawn_margin_px: int = 0         # 0 = otomatik (sprite boyutuna göre)
+
+    @staticmethod
+    def read_raw(filepath: str) -> dict:
+        """JSON dosyasını ham sözlük olarak oku (sihirbaz/kaydetme için)."""
+        if not os.path.exists(filepath):
+            raise FileNotFoundError(f"Config dosyası bulunamadı: {filepath}")
+        with open(filepath, "r", encoding="utf-8") as f:
+            return json.load(f)
+
     @classmethod
     def from_file(cls, filepath: str) -> "GameConfig":
         """JSON dosyasından config oku"""
-        if not os.path.exists(filepath):
-            raise FileNotFoundError(f"Config dosyası bulunamadı: {filepath}")
+        return cls.from_dict(cls.read_raw(filepath))
 
-        with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
+    @classmethod
+    def from_dict(cls, data: dict) -> "GameConfig":
+        """Ham sözlükten config oluştur (env override'ları uygulanır)."""
 
         def env_bool(name: str, default: bool) -> bool:
             value = os.environ.get(name)
@@ -69,6 +89,19 @@ class GameConfig:
         elif "THIEF_SERVER_URL" not in os.environ:
             server_url = f"{server_base_url.rstrip('/')}/event"
 
+        # Çözünürlükten bağımsız varsayılanlar (eski configlerden türet)
+        screen_w = data.get("screen_width", 1920)
+        screen_h = data.get("screen_height", 1080)
+        thief_y = data.get("thief_y", 980)
+        band_x_min = data.get("band_x_min", 900)
+        band_x_max = data.get("band_x_max", 1020)
+
+        default_ground_pct = min(100.0, round(thief_y / screen_h * 100, 1)) if screen_h else 95.0
+        default_band_center = (
+            round((band_x_min + band_x_max) / 2 / screen_w * 100, 1) if screen_w else 50.0
+        )
+        default_band_width = max(10, band_x_max - band_x_min)
+
         return cls(
             screen_id=int(os.environ.get("THIEF_SCREEN_ID", data.get("screen_id", 1))),
             server_url=server_url,
@@ -81,16 +114,16 @@ class GameConfig:
             reset_x=data.get("reset_x", -200),
             random_direction=data.get("random_direction", False),
             band_enabled=data.get("band_enabled", True),
-            band_x_min=data.get("band_x_min", 900),
-            band_x_max=data.get("band_x_max", 1020),
+            band_x_min=band_x_min,
+            band_x_max=band_x_max,
             hit_cooldown_ms=data.get("hit_cooldown_ms", 200),
             fullscreen=env_bool("THIEF_FULLSCREEN", data.get("fullscreen", True)),
             serial_port=os.environ.get("THIEF_SERIAL_PORT", data.get("serial_port", "/dev/ttyUSB0")),
             serial_baud=data.get("serial_baud", 9600),
-            screen_width=data.get("screen_width", 1920),
-            screen_height=data.get("screen_height", 1080),
+            screen_width=screen_w,
+            screen_height=screen_h,
             thief_scale=data.get("thief_scale", 4),
-            thief_y=data.get("thief_y", 980),
+            thief_y=thief_y,
             anim_fps=data.get("anim_fps", 12),
             band_color=tuple(data.get("band_color", [255, 255, 0, 80])),
             shadow_enabled=data.get("shadow_enabled", True),
@@ -99,6 +132,12 @@ class GameConfig:
             shadow_scale_y=data.get("shadow_scale_y", 0.3),
             shadow_offset_y=data.get("shadow_offset_y", 5),
             debug=env_bool("THIEF_DEBUG", data.get("debug", False)),
+            installed=bool(data.get("installed", False)),
+            playarea=PlayAreaConfig.from_dict(data.get("playarea")),
+            thief_ground_pct=float(data.get("thief_ground_pct", default_ground_pct)),
+            band_center_pct=float(data.get("band_center_pct", default_band_center)),
+            band_width_px=int(data.get("band_width_px", default_band_width)),
+            spawn_margin_px=int(data.get("spawn_margin_px", 0)),
         )
 
     @property

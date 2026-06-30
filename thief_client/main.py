@@ -2,9 +2,14 @@
 """
 Thief Client - Raspberry Pi Zero 2 W için interaktif hırsız oyunu
 Ana giriş noktası. Server kontrollü veya bağımsız çalışabilir.
+
+Oyun, "oynanabilir alan" (pleksi) boyutunda bir ara yüzeye (canvas) çizilir;
+bu yüzey ekranın doğru konumuna blit edilir, kalan her yer siyah bar kalır.
+Böylece pleksi dışındaki bölgede oyun görünmez ve daha az piksel render edilir.
 """
 import sys
 import os
+import json
 import pygame
 import time
 
@@ -17,6 +22,7 @@ from lib.hit_input import HitInput, KeyboardHitInput
 from lib.net_client import NetClient
 from lib.game import GameLogic, GameState
 from lib.effects import FloatingText, Particle
+from lib.setup_wizard import SetupWizard
 import random
 
 
@@ -28,74 +34,63 @@ class ThiefGame:
         Args:
             config_path: Konfigürasyon dosyası yolu
         """
-        # Config yükle
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        config_file = os.path.join(script_dir, config_path)
-        self.config = GameConfig.from_file(config_file)
+        self.script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.config_file = os.path.join(self.script_dir, config_path)
+
+        # Ham config (sihirbaz bunun üzerinde çalışır ve kaydeder)
+        self.raw = GameConfig.read_raw(self.config_file)
 
         # Pygame başlat
         pygame.init()
         pygame.mouse.set_visible(False)
 
-        # Ekran oluştur
-        if self.config.fullscreen:
+        # Ekran oluştur (fiziksel ekran boyutu)
+        fullscreen = self.raw.get("fullscreen", True)
+        if os.environ.get("THIEF_FULLSCREEN", "").lower() in ("0", "false", "no"):
+            fullscreen = False
+        if fullscreen:
             self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
             info = pygame.display.Info()
             self.screen_width = info.current_w
             self.screen_height = info.current_h
         else:
-            self.screen_width = self.config.screen_width
-            self.screen_height = self.config.screen_height
+            self.screen_width = self.raw.get("screen_width", 1920)
+            self.screen_height = self.raw.get("screen_height", 1080)
             self.screen = pygame.display.set_mode(
                 (self.screen_width, self.screen_height)
             )
 
-        pygame.display.set_caption(f"Hırsız Oyunu - Ekran {self.config.screen_id}")
+        pygame.display.set_caption(
+            f"Hırsız Oyunu - Ekran {self.raw.get('screen_id', 1)}"
+        )
+
+        # Sprite yolları
+        self.sprite_path, self.fall_sprite_path, self.death_sprite_path = (
+            self._resolve_sprite_paths()
+        )
+
+        # İlk açılış sihirbazı (config kurulu değilse)
+        if not self.raw.get("installed", False):
+            self._run_setup(force=False)
+
+        # Config nesnesi
+        self.config = GameConfig.from_dict(self.raw)
 
         # Saat
         self.clock = pygame.time.Clock()
 
-        # Sprite sheet yolu
-        sprite_path = os.path.join(
-            script_dir,
-            "..",
-            "thief-1.0",
-            "PNG",
-            "48x64_scale2x",
-            "thief.png",
+        # Fontlar (bir kez)
+        self.font = pygame.font.Font(None, 72)
+        self.small_font = pygame.font.Font(None, 36)
+        self.idle_font = pygame.font.Font(None, 48)
+
+        # Renkler
+        self.bg_color = (40, 44, 52)
+        self.text_color = (255, 255, 255)
+        self.idle_text_color = (150, 150, 150)
+        self.idle_surface = self.idle_font.render(
+            "Oyun bekleniyor...", True, self.idle_text_color
         )
-
-        if not os.path.exists(sprite_path):
-            sprite_path = os.path.join(script_dir, "assets", "thief.png")
-
-        if not os.path.exists(sprite_path):
-            print(f"[HATA] Sprite dosyası bulunamadı: {sprite_path}")
-            print("Lütfen thief.png dosyasını assets/ klasörüne kopyalayın")
-            sys.exit(1)
-
-        # Fall sprite yolu
-        fall_sprite_path = os.path.join(script_dir, "assets", "thief_with_fall.png")
-        if not os.path.exists(fall_sprite_path):
-            fall_sprite_path = os.path.join(script_dir, "..", "thief-1.0", "thief.png")
-        if not os.path.exists(fall_sprite_path):
-            fall_sprite_path = None
-
-        # Death sprite yolu (deadthief.png - ölüm animasyonu)
-        death_sprite_path = os.path.join(script_dir, "..", "thief-1.0", "deadthief.png")
-        if not os.path.exists(death_sprite_path):
-            death_sprite_path = os.path.join(script_dir, "assets", "deadthief.png")
-        if not os.path.exists(death_sprite_path):
-            death_sprite_path = None
-
-        # Animatör
-        self.animator = ThiefAnimator(
-            sprite_path,
-            scale=self.config.thief_scale,
-            anim_fps=self.config.anim_fps,
-            fall_sprite_path=fall_sprite_path,
-            death_sprite_path=death_sprite_path,
-        )
-        self.animator.set_state("run")
 
         # Hit input (debug modunda klavye kullan)
         if self.config.debug:
@@ -118,85 +113,183 @@ class ThiefGame:
         )
         self.net_client.start()
 
-        # Oyun mantığı
+        # Çalışma bayrakları
+        self.running = True
+        self.reopen_setup = False
+
+        # Config'e bağlı her şeyi kur (oynanabilir alan, animatör, oyun, yüzeyler)
+        self._apply_config()
+
+    # ---------------------------------------------------------------- setup
+    def _resolve_sprite_paths(self):
+        """Sprite dosya yollarını çöz."""
+        script_dir = self.script_dir
+
+        sprite_path = os.path.join(
+            script_dir, "..", "thief-1.0", "PNG", "48x64_scale2x", "thief.png"
+        )
+        if not os.path.exists(sprite_path):
+            sprite_path = os.path.join(script_dir, "assets", "thief.png")
+        if not os.path.exists(sprite_path):
+            print(f"[HATA] Sprite dosyası bulunamadı: {sprite_path}")
+            print("Lütfen thief.png dosyasını assets/ klasörüne kopyalayın")
+            sys.exit(1)
+
+        fall_sprite_path = os.path.join(script_dir, "assets", "thief_with_fall.png")
+        if not os.path.exists(fall_sprite_path):
+            fall_sprite_path = os.path.join(script_dir, "..", "thief-1.0", "thief.png")
+        if not os.path.exists(fall_sprite_path):
+            fall_sprite_path = None
+
+        death_sprite_path = os.path.join(script_dir, "..", "thief-1.0", "deadthief.png")
+        if not os.path.exists(death_sprite_path):
+            death_sprite_path = os.path.join(script_dir, "assets", "deadthief.png")
+        if not os.path.exists(death_sprite_path):
+            death_sprite_path = None
+
+        return sprite_path, fall_sprite_path, death_sprite_path
+
+    def _run_setup(self, force: bool):
+        """Kurulum sihirbazını çalıştır ve sonucu kaydet."""
+        wizard = SetupWizard(
+            self.screen,
+            self.raw,
+            self.screen_width,
+            self.screen_height,
+            sprite_path=self.sprite_path,
+        )
+        result = wizard.run()
+        if result is not None:
+            self.raw = result
+            self._save_config()
+            print("[Setup] Ayarlar kaydedildi.")
+            return True
+        if force:
+            print("[Setup] İptal edildi (değişiklik kaydedilmedi).")
+        return False
+
+    def _save_config(self):
+        """Ham config'i dosyaya atomik olarak yaz (güç kesintisinde bozulmasın)."""
+        import tempfile
+        try:
+            dir_ = os.path.dirname(self.config_file) or "."
+            fd, tmp = tempfile.mkstemp(dir=dir_, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(self.raw, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.config_file)
+            except BaseException:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+                raise
+        except OSError as e:
+            print(f"[HATA] Config kaydedilemedi: {e}")
+
+    def _apply_config(self):
+        """Config'e bağlı tüm runtime nesnelerini (yeniden) oluştur."""
+        cfg = self.config
+
+        # --- Oynanabilir alan (pleksi) ---
+        rect = cfg.playarea.compute(self.screen_width, self.screen_height)
+        self.view_x, self.view_y = rect.x, rect.y
+        self.view_w, self.view_h = rect.w, rect.h
+
+        # Çizim hedefi (canvas) — pleksi boyutunda
+        self.canvas = pygame.Surface((self.view_w, self.view_h))
+
+        # --- Oyun koordinatları (oynanabilir alan uzayında, çözünürlükten bağımsız) ---
+        self.thief_y = int(round(self.view_h * cfg.thief_ground_pct / 100))
+
+        if cfg.band_enabled:
+            bw = max(1, int(cfg.band_width_px))
+            cx = self.view_w * cfg.band_center_pct / 100
+            self.band_x_min = int(round(cx - bw / 2))
+            self.band_x_max = int(round(cx + bw / 2))
+        else:
+            bw = 0
+            self.band_x_min = 0
+            self.band_x_max = 0
+        self.band_width_px = bw
+
+        scale = int(cfg.thief_scale)
+        margin = cfg.spawn_margin_px or (48 * scale // 2 + 60)
+        spawn_x = self.view_w + margin
+        reset_x = -margin
+
+        # --- Animatör ---
+        self.animator = ThiefAnimator(
+            self.sprite_path,
+            scale=cfg.thief_scale,
+            anim_fps=cfg.anim_fps,
+            fall_sprite_path=self.fall_sprite_path,
+            death_sprite_path=self.death_sprite_path,
+        )
+        self.animator.set_state("run")
+
+        # --- Oyun mantığı ---
         self.game = GameLogic(
-            spawn_x=self.config.spawn_x,
-            reset_x=self.config.reset_x,
-            thief_y=self.config.thief_y,
-            speed_px_s=self.config.thief_speed_px_s,
-            random_direction=self.config.random_direction,
-            band_enabled=self.config.band_enabled,
-            band_x_min=self.config.band_x_min,
-            band_x_max=self.config.band_x_max,
-            hit_cooldown_ms=self.config.hit_cooldown_ms,
-            screen_width=self.screen_width,
-            server_controlled=self.config.server_controlled,
+            spawn_x=spawn_x,
+            reset_x=reset_x,
+            thief_y=self.thief_y,
+            speed_px_s=cfg.thief_speed_px_s,
+            random_direction=cfg.random_direction,
+            band_enabled=cfg.band_enabled,
+            band_x_min=self.band_x_min,
+            band_x_max=self.band_x_max,
+            hit_cooldown_ms=cfg.hit_cooldown_ms,
+            screen_width=self.view_w,
+            server_controlled=cfg.server_controlled,
             on_score=self._on_score,
             on_direction_change=self._on_direction_change,
-            debug=self.config.debug,
+            debug=cfg.debug,
         )
-
-        # Başlangıç yönünü animatöre bildir
         self.animator.set_direction(self.game.get_direction())
 
-        # Çalışıyor mu?
-        self.running = True
-
-        # Font
-        self.font = pygame.font.Font(None, 72)
-        self.small_font = pygame.font.Font(None, 36)
-        self.idle_font = pygame.font.Font(None, 48)
-        self.score_surface = None
-        self._score_surface_value = None
-
-        # Renkler
-        self.bg_color = (40, 44, 52)
-        self.band_color = self.config.band_color
-        self.text_color = (255, 255, 255)
-        self.hit_flash_color = (255, 255, 0)
-        self.idle_text_color = (150, 150, 150)
-
-        # Frame icinde tekrar olusturulmeyen render yuzeyleri
-        self.idle_surface = self.idle_font.render("Oyun bekleniyor...", True, self.idle_text_color)
+        # --- Önceden hazırlanan render yüzeyleri (view boyutunda) ---
+        self.band_color = cfg.band_color
         self.band_surface = None
-        if self.config.band_enabled:
-            self.band_surface = pygame.Surface(
-                (self.config.band_width, self.screen_height),
-                pygame.SRCALPHA,
-            )
+        if cfg.band_enabled:
+            self.band_surface = pygame.Surface((bw, self.view_h), pygame.SRCALPHA)
             self.band_surface.fill(self.band_color)
 
-        self.flash_red_surface = pygame.Surface((self.screen_width // 2, self.screen_height))
+        self.flash_red_surface = pygame.Surface((self.view_w // 2, self.view_h))
         self.flash_red_surface.fill((255, 0, 0))
         self.flash_red_surface.set_alpha(60)
-        self.flash_blue_surface = pygame.Surface((self.screen_width // 2, self.screen_height))
+        self.flash_blue_surface = pygame.Surface((self.view_w // 2, self.view_h))
         self.flash_blue_surface.fill((0, 0, 255))
         self.flash_blue_surface.set_alpha(60)
 
+        # Skor yüzeyi cache
+        self.score_surface = None
+        self._score_surface_value = None
+
+        # Gölge cache
         self.shadow_cache = {}
 
-        # Hit flash efekti
+        # Efekt durumları
         self.hit_flash = False
         self.hit_flash_end = 0
-
-        # Efektler (Juice)
         self.floating_texts = []
         self.particles = []
         self.shake_timer = 0.0
         self.shake_magnitude = 0.0
         self.thief_alpha = 255
-        self.hit_stop_timer = 0.0  # Zaman donması efekti
+        self.hit_stop_timer = 0.0
 
-        # Arka plan yükle (varsa)
+        # Arka plan (view boyutuna ölçeklenir)
         self.background = None
-        bg_path = os.path.join(script_dir, "assets", "bg", "bg.png")
+        bg_path = os.path.join(self.script_dir, "assets", "bg", "bg.png")
         if os.path.exists(bg_path):
-            self.background = pygame.image.load(bg_path).convert()
-            self.background = pygame.transform.scale(
-                self.background,
-                (self.screen_width, self.screen_height),
-            )
+            bg = pygame.image.load(bg_path).convert()
+            self.background = pygame.transform.scale(bg, (self.view_w, self.view_h))
 
+        # Ekranı siyaha boya (bar bölgeleri sabit kalır)
+        self.screen.fill((0, 0, 0))
+        pygame.display.flip()
+
+    # ---------------------------------------------------------------- events
     def _on_score(self, points: int, combo: int = 1):
         """Skor arttığında çağrılır"""
         self.net_client.send_score(points)
@@ -205,36 +298,54 @@ class ThiefGame:
         self._score_surface_value = None
 
         # Hit Stop (Zamanı dondur)
-        self.hit_stop_timer = 0.15  # 150ms boyunca oyun dursun, sadece sarsılsın
+        self.hit_stop_timer = 0.15
 
         # Sarsıntı tetikle
-        self.shake_timer = 0.2  # 0.2 saniye sarsıntı
-        self.shake_magnitude = 15.0  # 15 piksel şiddetinde
+        self.shake_timer = 0.2
+        self.shake_magnitude = 15.0
 
         # Yüzen metin (Floating Text) ekle
         thief_x = self.game.get_thief_center_x()
         self.floating_texts.append(
-            FloatingText(thief_x, self.config.thief_y - 150, "YAKALANDI!", self.font, (255, 100, 100))
+            FloatingText(thief_x, self.thief_y - 150, "YAKALANDI!", self.font, (255, 100, 100))
         )
         self.floating_texts.append(
-            FloatingText(thief_x, self.config.thief_y - 100, f"+{points}", self.idle_font, (255, 255, 0))
+            FloatingText(thief_x, self.thief_y - 100, f"+{points}", self.idle_font, (255, 255, 0))
         )
-        
+
         if combo > 1:
             self.floating_texts.append(
-                FloatingText(thief_x, self.config.thief_y - 200, f"{combo}x KOMBO!", self.font, (255, 150, 0))
+                FloatingText(thief_x, self.thief_y - 200, f"{combo}x KOMBO!", self.font, (255, 150, 0))
             )
 
         # Para/Altın parçacıkları fırlat
         for _ in range(15):
-            self.particles.append(Particle(thief_x, self.config.thief_y - 80))
+            self.particles.append(Particle(thief_x, self.thief_y - 80))
 
     def _on_direction_change(self, direction: int):
         """Yön değiştiğinde çağrılır"""
         self.animator.set_direction(direction)
 
+    # ---------------------------------------------------------------- loop
+    def start(self):
+        """Dış döngü: oyun + (gerekirse) sihirbazı yeniden açma."""
+        try:
+            while True:
+                self.running = True
+                self.run()
+
+                if self.reopen_setup:
+                    self.reopen_setup = False
+                    self._run_setup(force=True)
+                    self.config = GameConfig.from_dict(self.raw)
+                    self._apply_config()
+                    continue
+                break
+        finally:
+            self._cleanup()
+
     def run(self):
-        """Ana oyun döngüsü"""
+        """Ana oyun döngüsü (tek oturum)"""
         while self.running:
             dt = self.clock.tick(self.config.fps) / 1000.0
 
@@ -242,10 +353,12 @@ class ThiefGame:
             game_dt = dt
             if self.hit_stop_timer > 0:
                 self.hit_stop_timer -= dt
-                game_dt = 0.0  # Oyun mantığı ve animasyon ilerlemesin!
+                game_dt = 0.0
 
             # Event'leri işle
             self._handle_events()
+            if not self.running:
+                break
 
             # Hit kontrolü
             if self.hit_input.get_hit():
@@ -268,23 +381,19 @@ class ThiefGame:
                     piezo_config.get("refractory_ms", 200),
                 )
 
-            # Oyun güncelle (Donmuş zaman ile)
+            # Güncelle
             self.game.update(game_dt)
-
-            # Animasyonu güncelle (Donmuş zaman ile)
             self._update_animation(game_dt)
-
-            # Efektleri güncelle (Gerçek zaman ile, sarsıntı devam etsin)
             self._update_effects(dt)
 
-            # Çiz
+            # Çiz (canvas'a) ve ekrana sun
             self._draw()
+            self._present()
 
-            # Ekranı güncelle
-            pygame.display.flip()
-
-        # Temizlik
-        self._cleanup()
+    def _present(self):
+        """Canvas'ı ekrana (oynanabilir alana) blit et."""
+        self.screen.blit(self.canvas, (self.view_x, self.view_y))
+        pygame.display.flip()
 
     def _handle_events(self):
         """Pygame event'lerini işle"""
@@ -297,6 +406,10 @@ class ThiefGame:
                     self.running = False
                 elif event.key == pygame.K_F11:
                     pygame.display.toggle_fullscreen()
+                elif event.key == pygame.K_s:
+                    # Kurulum sihirbazını yeniden aç
+                    self.reopen_setup = True
+                    self.running = False
 
             # Klavye hit input için
             if isinstance(self.hit_input, KeyboardHitInput):
@@ -315,18 +428,15 @@ class ThiefGame:
 
     def _update_effects(self, dt: float):
         """Sarsıntı, yazı ve parçacıkları güncelle"""
-        # Ekran sarsıntısı
         if self.shake_timer > 0:
             self.shake_timer -= dt
 
-        # Parçacıklar
         alive_particles = []
         for p in self.particles:
-            if p.update(dt, self.config.thief_y):
+            if p.update(dt, self.thief_y):
                 alive_particles.append(p)
         self.particles = alive_particles
 
-        # Yazılar
         alive_texts = []
         for t in self.floating_texts:
             if t.update(dt):
@@ -338,18 +448,19 @@ class ThiefGame:
         if self.game.thief.state in [GameState.FALL, GameState.COOLDOWN, GameState.IDLE]:
             if hasattr(self.game.thief, "fall_start") and self.game.thief.fall_start > 0:
                 elapsed = time.time() - self.game.thief.fall_start
-                fade_start = 2.0     # 2 saniye yerde kalsın
-                fade_duration = 1.0  # 1 saniyede yavaşça kaybolsun
-                
+                fade_start = 2.0
+                fade_duration = 1.0
+
                 if elapsed > fade_start + fade_duration:
                     self.thief_alpha = 0
                 elif elapsed > fade_start:
                     progress = (elapsed - fade_start) / fade_duration
                     self.thief_alpha = int(255 * (1.0 - progress))
 
+    # ---------------------------------------------------------------- draw
     def _draw(self):
-        """Ekranı çiz"""
-        # Sarsıntı ofsetini hesapla
+        """Oynanabilir alanı (canvas) çiz"""
+        # Sarsıntı ofseti
         shake_x = 0
         shake_y = 0
         if self.shake_timer > 0:
@@ -358,54 +469,47 @@ class ThiefGame:
 
         # Arka plan
         if self.background:
-            self.screen.blit(self.background, (shake_x, shake_y))
+            if shake_x or shake_y:
+                self.canvas.fill((0, 0, 0))
+            self.canvas.blit(self.background, (shake_x, shake_y))
         else:
-            self.screen.fill(self.bg_color)
+            self.canvas.fill(self.bg_color)
 
         # IDLE durumunda ve oyun aktif değilse bekleme mesajı göster
         if self.game.is_idle() and not self.net_client.server_game_active:
             self._draw_idle(shake_x, shake_y)
         else:
-            # Hedef bandı çiz
             if self.config.band_enabled:
                 self._draw_band(shake_x, shake_y)
 
-            # Gölgeyi çiz
             if self.config.shadow_enabled and not self.game.is_idle():
                 self._draw_shadow(shake_x, shake_y)
 
-            # Hırsızı çiz
             self._draw_thief(shake_x, shake_y)
-            
-            # Parçacıkları çiz
+
             for p in self.particles:
-                p.draw(self.screen, shake_x, shake_y)
-                
-            # Yüzen yazıları çiz
+                p.draw(self.canvas, shake_x, shake_y)
+
             for t in self.floating_texts:
-                t.draw(self.screen, shake_x, shake_y)
+                t.draw(self.canvas, shake_x, shake_y)
 
-        # Skoru çiz
         self._draw_score(shake_x, shake_y)
-
-        # Hit flash efekti
         self._draw_hit_flash(shake_x, shake_y)
 
-        # Debug bilgisi
         if self.config.debug:
             self._draw_debug(shake_x, shake_y)
 
     def _draw_idle(self, offset_x=0, offset_y=0):
         """IDLE durumunda bekleme mesajı"""
         text = self.idle_surface
-        x = (self.screen_width - text.get_width()) // 2 + offset_x
-        y = (self.screen_height - text.get_height()) // 2 + offset_y
-        self.screen.blit(text, (x, y))
+        x = (self.view_w - text.get_width()) // 2 + offset_x
+        y = (self.view_h - text.get_height()) // 2 + offset_y
+        self.canvas.blit(text, (x, y))
 
     def _draw_band(self, offset_x=0, offset_y=0):
         """Hedef bandını çiz"""
         if self.band_surface:
-            self.screen.blit(self.band_surface, (self.config.band_x_min + offset_x, offset_y))
+            self.canvas.blit(self.band_surface, (self.band_x_min + offset_x, offset_y))
 
     def _get_shadow_surface(self, frame):
         """Mevcut sprite frame'i icin cache'lenmis golge yuzeyi dondur."""
@@ -439,11 +543,10 @@ class ThiefGame:
         """Hırsızın gölgesini çiz"""
         if self.thief_alpha <= 0:
             return
-            
+
         frame = self.animator.get_current_frame()
 
         if frame:
-            # Gölge boyutunu mevcut frame'e göre ayarla
             shadow = self._get_shadow_surface(frame)
             shadow_width = shadow.get_width()
             shadow_height = shadow.get_height()
@@ -451,40 +554,35 @@ class ThiefGame:
             x = self.game.thief.x - shadow_width // 2 + offset_x
             y = self.game.thief.y - shadow_height // 2 + self.config.shadow_offset_y + offset_y
 
-            # Yere düşme animasyonunda biraz aşağı kaydır (yere daha iyi oturması için)
             if self.animator.current_state == "fall":
                 y += 15 * self.config.thief_scale
 
-            # Saydamlık uygula
             draw_shadow = shadow
             if self.thief_alpha < 255:
                 draw_shadow = shadow.copy()
                 draw_shadow.set_alpha(self.thief_alpha)
 
-            self.screen.blit(draw_shadow, (x, y))
+            self.canvas.blit(draw_shadow, (x, y))
 
     def _draw_thief(self, offset_x=0, offset_y=0):
         """Hırsızı çiz"""
         if self.thief_alpha <= 0:
             return
-            
+
         frame = self.animator.get_current_frame()
 
         if frame:
-            # Frame'in alt orta noktasını thief.x, thief.y'ye hizala
             x = self.game.thief.x - frame.get_width() // 2 + offset_x
             y = self.game.thief.y - frame.get_height() + offset_y
 
-            # Yere düşme animasyonunda biraz aşağı kaydır
             if self.animator.current_state == "fall":
                 y += 15 * self.config.thief_scale
 
-            # Saydamlık (Fade out)
             if self.thief_alpha < 255:
                 frame = frame.copy()
                 frame.set_alpha(self.thief_alpha)
 
-            self.screen.blit(frame, (x, y))
+            self.canvas.blit(frame, (x, y))
 
     def _draw_score(self, offset_x=0, offset_y=0):
         """Skoru çiz"""
@@ -493,73 +591,59 @@ class ThiefGame:
             self._score_surface_value = self.game.score
 
         score_text = self.score_surface
-        x = self.screen_width - score_text.get_width() - 20 + offset_x
+        x = self.view_w - score_text.get_width() - 20 + offset_x
         y = 20 + offset_y
-        self.screen.blit(score_text, (x, y))
+        self.canvas.blit(score_text, (x, y))
 
     def _draw_hit_flash(self, offset_x=0, offset_y=0):
         """Hit flash (Polis Sireni) efekti çiz"""
         if self.hit_flash:
             if pygame.time.get_ticks() < self.hit_flash_end:
-                # Sol Kırmızı, Sağ Mavi Çakar efekti
-                self.screen.blit(self.flash_red_surface, (offset_x, offset_y))
-                self.screen.blit(self.flash_blue_surface, (self.screen_width // 2 + offset_x, offset_y))
+                self.canvas.blit(self.flash_red_surface, (offset_x, offset_y))
+                self.canvas.blit(self.flash_blue_surface, (self.view_w // 2 + offset_x, offset_y))
             else:
                 self.hit_flash = False
 
     def _draw_debug(self, offset_x=0, offset_y=0):
         """Debug bilgilerini çiz"""
-        # Durum ve Yön
         state_text = self.small_font.render(
             f"State: {self.game.get_state_name()} | Yön: {self.game.get_direction_name()}",
-            True,
-            self.text_color,
+            True, self.text_color,
         )
-        self.screen.blit(state_text, (20 + offset_x, 20 + offset_y))
+        self.canvas.blit(state_text, (20 + offset_x, 20 + offset_y))
 
-        # Pozisyon
         pos_text = self.small_font.render(
-            f"X: {int(self.game.thief.x)}",
-            True,
-            self.text_color,
+            f"X: {int(self.game.thief.x)}", True, self.text_color,
         )
-        self.screen.blit(pos_text, (20 + offset_x, 50 + offset_y))
+        self.canvas.blit(pos_text, (20 + offset_x, 50 + offset_y))
 
-        # FPS
         fps_text = self.small_font.render(
-            f"FPS: {int(self.clock.get_fps())}",
-            True,
-            self.text_color,
+            f"FPS: {int(self.clock.get_fps())}", True, self.text_color,
         )
-        self.screen.blit(fps_text, (20 + offset_x, 80 + offset_y))
+        self.canvas.blit(fps_text, (20 + offset_x, 80 + offset_y))
 
-        # Network durumu
         net_status = self.net_client.get_status()
         net_text = self.small_font.render(
             f"Net: {'OK' if net_status['connected'] else 'OFFLINE'} | "
             f"Sent: {net_status['events_sent']} | "
             f"Spawns: {net_status['spawns_received']}",
-            True,
-            self.text_color,
+            True, self.text_color,
         )
-        self.screen.blit(net_text, (20 + offset_x, 110 + offset_y))
+        self.canvas.blit(net_text, (20 + offset_x, 110 + offset_y))
 
-        # Ekran ID + Mod
         mode = "SERVER" if self.config.server_controlled else "LOCAL"
-        id_text = self.small_font.render(
-            f"Ekran: {self.config.screen_id} | Mod: {mode}",
-            True,
-            self.text_color,
+        view_text = self.small_font.render(
+            f"Ekran: {self.config.screen_id} | Mod: {mode} | "
+            f"View: {self.view_w}x{self.view_h} @({self.view_x},{self.view_y})",
+            True, self.text_color,
         )
-        self.screen.blit(id_text, (20 + offset_x, 140 + offset_y))
+        self.canvas.blit(view_text, (20 + offset_x, 140 + offset_y))
 
-        # Hit input durumu
         hit_text = self.small_font.render(
-            f"Hit Input: {'SPACE tuşu' if isinstance(self.hit_input, KeyboardHitInput) else 'Serial'}",
-            True,
-            self.text_color,
+            f"Hit Input: {'SPACE tuşu' if isinstance(self.hit_input, KeyboardHitInput) else 'Serial'} | S: Kurulum",
+            True, self.text_color,
         )
-        self.screen.blit(hit_text, (20 + offset_x, 170 + offset_y))
+        self.canvas.blit(hit_text, (20 + offset_x, 170 + offset_y))
 
     def _cleanup(self):
         """Kaynakları temizle"""
@@ -577,7 +661,7 @@ def main():
 
     try:
         game = ThiefGame(config_path)
-        game.run()
+        game.start()
     except FileNotFoundError as e:
         print(f"[HATA] {e}")
         sys.exit(1)
