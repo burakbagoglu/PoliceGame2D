@@ -1,0 +1,19 @@
+[Unit]
+Description=Thief Spectator (Seyir Ekrani)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/thief_spectator
+ExecStart=/usr/bin/python3 /home/pi/thief_spectator/screen.py
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+Environment=DISPLAY=:0
+Environment=SDL_VIDEODRIVER=kmsdrm
+
+[Install]
+WantedBy=multi-user.target

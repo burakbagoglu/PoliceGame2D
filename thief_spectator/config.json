@@ -1,0 +1,8 @@
+{
+  "server_base_url": "http://192.168.1.10:8078",
+  "fullscreen": true,
+  "fps": 30,
+  "poll_interval_ms": 700,
+  "screen_width": 1280,
+  "screen_height": 720
+}
