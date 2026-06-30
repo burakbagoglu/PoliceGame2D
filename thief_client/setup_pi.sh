@@ -29,6 +29,9 @@ sudo systemctl enable thief-game.service
 echo "[6/6] Otomatik başlatma ayarlanıyor..."
 sudo raspi-config nonint do_boot_behaviour B2
 
+# Ekran kararmasını engelle (kiosk - etkinlik boyunca ekran sönmesin)
+sudo raspi-config nonint do_blanking 1 || true
+
 echo ""
 echo "=== Kurulum Tamamlandı ==="
 echo ""

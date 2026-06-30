@@ -2,14 +2,16 @@
 Description=Thief Game Client
 Wants=network-online.target
 After=network-online.target
+# Cok sayida crash olsa bile yeniden baslatmayi birakma
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 User=pi
 WorkingDirectory=/home/pi/thief_client
 ExecStart=/usr/bin/python3 /home/pi/thief_client/main.py
-Restart=on-failure
-RestartSec=2
+Restart=always
+RestartSec=3
 Environment=PYTHONUNBUFFERED=1
 Environment=DISPLAY=:0
 Environment=SDL_VIDEODRIVER=kmsdrm
