@@ -87,6 +87,15 @@ class TestScreenSelector:
         result = selector.select_screens(2, active_screens=[1, 2, 3])
         assert all(s in [1, 2, 3] for s in result)
 
+    def test_ignores_active_screens_outside_session(self):
+        selector = ScreenSelector(screen_count=5)
+        result = selector.select_screens(
+            3,
+            active_screens=list(range(1, 13)),
+        )
+        assert len(result) == 3
+        assert all(1 <= screen_id <= 5 for screen_id in result)
+
     def test_empty_active_screens(self):
         selector = ScreenSelector(screen_count=12)
         result = selector.select_screens(2, active_screens=[])
@@ -357,6 +366,8 @@ class TestSpawnScheduler:
         scheduler = self._make_scheduler(screen_count=4)
         result = scheduler.poll_spawn(99)
         assert result['spawn'] is False
+        assert 99 not in scheduler.spawn_queues
+        assert 99 not in scheduler._active_screens
 
     def test_start_stop(self):
         scheduler = self._make_scheduler()
@@ -365,3 +376,14 @@ class TestSpawnScheduler:
         time.sleep(0.2)
         scheduler.stop()
         assert scheduler.session.is_active is False
+
+    def test_session_end_callback_runs_once(self):
+        reasons = []
+        scheduler = self._make_scheduler()
+        scheduler.on_session_end = reasons.append
+        scheduler.session.is_active = True
+
+        scheduler._finish_session("target")
+        scheduler._finish_session("timeout")
+
+        assert reasons == ["target"]

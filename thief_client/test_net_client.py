@@ -6,6 +6,7 @@ import time
 import json
 import os
 import pytest
+import threading
 
 try:
     import responses
@@ -134,10 +135,93 @@ class TestNetClientUnit:
             queue_file=queue_file,
         )
         assert client2.send_queue.qsize() == 2
+        # Dosya, eventler başarıyla gönderilene kadar silinmemeli.
+        assert os.path.exists(queue_file)
 
         # Temizle
         if os.path.exists(queue_file):
             os.remove(queue_file)
+
+    def test_offline_queue_merge_does_not_lose_failed_events(self, tmp_path):
+        queue_file = str(tmp_path / "event_queue.json")
+        client = NetClient(
+            server_url="http://test:8000/event",
+            server_base_url="http://test:8000",
+            screen_id=1,
+            queue_file=queue_file,
+        )
+        failed_event = ScoreEvent.create(1, 1)
+        client._add_to_offline_queue(failed_event)
+        client.send_score(2)
+        client._save_offline_queue()
+
+        with open(queue_file, "r", encoding="utf-8") as f:
+            events = json.load(f)
+        event_ids = {event["event_id"] for event in events}
+        assert len(event_ids) == 2
+        assert failed_event.event_id in event_ids
+        assert sorted(event["points"] for event in events) == [1, 2]
+
+    def test_successful_retry_removes_persisted_event(self, tmp_path, monkeypatch):
+        queue_file = str(tmp_path / "event_queue.json")
+        client = NetClient(
+            server_url="http://test:8000/event",
+            server_base_url="http://test:8000",
+            screen_id=1,
+            queue_file=queue_file,
+        )
+        event = ScoreEvent.create(1, 1)
+        client._add_to_offline_queue(event)
+        client.send_queue.put(event)
+        monkeypatch.setattr(client, "_send_event", lambda _event: True)
+
+        client.running = True
+        client._stop_event.clear()
+        worker = threading.Thread(target=client._send_loop)
+        worker.start()
+
+        deadline = time.time() + 2
+        while client.events_sent == 0 and time.time() < deadline:
+            time.sleep(0.01)
+        client.running = False
+        client._stop_event.set()
+        worker.join(timeout=2)
+
+        assert client.events_sent == 1
+        assert not os.path.exists(queue_file)
+
+    def test_failed_event_is_retried_during_runtime(self, tmp_path, monkeypatch):
+        queue_file = str(tmp_path / "event_queue.json")
+        client = NetClient(
+            server_url="http://test:8000/event",
+            server_base_url="http://test:8000",
+            screen_id=1,
+            queue_file=queue_file,
+        )
+        attempts = []
+
+        def send_with_recovery(event):
+            attempts.append(event.event_id)
+            return len(attempts) >= 2
+
+        monkeypatch.setattr(client, "_send_event", send_with_recovery)
+        client.send_score(1)
+        client.running = True
+        client._stop_event.clear()
+        worker = threading.Thread(target=client._send_loop)
+        worker.start()
+
+        deadline = time.time() + 3
+        while client.events_sent == 0 and time.time() < deadline:
+            time.sleep(0.01)
+        client.running = False
+        client._stop_event.set()
+        worker.join(timeout=2)
+
+        assert len(attempts) >= 2
+        assert len(set(attempts)) == 1
+        assert client.events_sent == 1
+        assert not os.path.exists(queue_file)
 
 
 # ============== Polling with Mocked HTTP ==============

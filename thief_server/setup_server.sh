@@ -8,7 +8,8 @@ echo "[1/4] Sistem güncelleniyor..."
 sudo apt update && sudo apt upgrade -y
 
 # Gerekli paketler
-echo "[2/4] Python paketleri yükleniyor..."
+echo "[2/4] Ses ve Python paketleri yükleniyor..."
+sudo apt install -y python3-pip python3-pygame alsa-utils
 pip3 install --user -r requirements.txt
 
 # Service dosyasını kopyala
@@ -36,3 +37,6 @@ echo "Logları görme: journalctl -u thief-server -f"
 echo ""
 echo "Dashboard: http://$IP_ADDR:8078/dashboard"
 echo "Ekran: http://$IP_ADDR:8078/screen"
+echo ""
+echo "USB ses kartı kontrolü: aplay -l"
+echo "Ses testi: speaker-test -c 2 -t wav"

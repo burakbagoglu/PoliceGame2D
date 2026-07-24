@@ -10,7 +10,7 @@ import threading
 import queue
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 
 # ============== Target Calculator ==============
@@ -72,6 +72,14 @@ class ScreenSelector:
         """
         if active_screens is None:
             active_screens = list(range(1, self.screen_count + 1))
+        else:
+            # Polling yapan ancak bu oyun oturumuna dahil olmayan ekranları
+            # dağıtım hesabına sokma. Aksi halde temp_counts[s] KeyError üretir.
+            active_screens = [
+                screen_id
+                for screen_id in active_screens
+                if 1 <= screen_id <= self.screen_count
+            ]
 
         if not active_screens:
             return []
@@ -330,12 +338,14 @@ class SpawnScheduler:
         adaptive_controller: AdaptiveSpawnController,
         phase_spawner: PhaseBasedSpawner,
         debug: bool = False,
+        on_session_end: Optional[Callable[[str], None]] = None,
     ):
         self.session = session
         self.screen_selector = screen_selector
         self.adaptive = adaptive_controller
         self.phase = phase_spawner
         self.debug = debug
+        self.on_session_end = on_session_end
 
         # Ekran başına spawn kuyruğu
         self.spawn_queues: Dict[int, queue.Queue] = {
@@ -351,6 +361,7 @@ class SpawnScheduler:
         self._thread: Optional[threading.Thread] = None
         self._last_spawn_time = 0.0
         self._lock = threading.RLock()
+        self._end_notified = False
 
     def start(self):
         """Spawn loop thread'ini başlat"""
@@ -359,6 +370,7 @@ class SpawnScheduler:
             self.session.is_active = True
             self._running = True
             self._last_spawn_time = 0  # İlk spawn hemen olsun
+            self._end_notified = False
         self._thread = threading.Thread(target=self._spawn_loop, daemon=True)
         self._thread.start()
 
@@ -389,13 +401,11 @@ class SpawnScheduler:
             {"spawn": True/False}
         """
         with self._lock:
+            if screen_id < 1 or screen_id > self.session.screen_count:
+                return {"spawn": False}
+
             # Ekranı aktif olarak işaretle
             self._active_screens[screen_id] = time.time()
-
-            if screen_id not in self.spawn_queues:
-                # Dinamik kuyruk oluştur (beklenmeyen screen_id için)
-                self.spawn_queues[screen_id] = queue.Queue()
-                return {"spawn": False}
 
             try:
                 self.spawn_queues[screen_id].get_nowait()
@@ -441,14 +451,14 @@ class SpawnScheduler:
                     target_done = self.session.current_score >= self.session.target_score
 
                 if elapsed_done:
-                    self.stop()
+                    self._finish_session("timeout")
                     break
 
                 # Hedef tamamlandı mı?
                 if target_done:
                     if self.debug:
                         print("[SpawnScheduler] Hedef tamamlandı!")
-                    self.stop()
+                    self._finish_session("target")
                     break
 
                 # Adaptive parametreleri hesapla
@@ -471,6 +481,21 @@ class SpawnScheduler:
                 if self.debug:
                     print(f"[SpawnScheduler] Hata: {e}")
                 time.sleep(1)
+
+    def _finish_session(self, reason: str):
+        """Oturumu bir kez bitir ve merkezi callback'i çağır."""
+        with self._lock:
+            if self._end_notified:
+                return
+            self._end_notified = True
+
+        self.stop()
+        if self.on_session_end:
+            try:
+                self.on_session_end(reason)
+            except Exception as e:
+                if self.debug:
+                    print(f"[SpawnScheduler] Bitiş callback hatası: {e}")
 
     def _get_active_screen_ids(self) -> List[int]:
         """Aktif (poll yapan) ekranları döndür"""

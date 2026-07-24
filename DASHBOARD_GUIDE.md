@@ -191,6 +191,32 @@ Bu ekranda:
 
 görünür.
 
+## Server Ses Kontrolü
+
+Ses, Pi 5'e USB ses kartı üzerinden bağlanan 3.5 mm aktif hoparlörden çıkar.
+Client cihazlarında hoparlör bulunması gerekmez.
+
+Dashboard içindeki **Server Sesi** kartında:
+
+- USB ses kartı ve mixer durumu görüntülenir.
+- Genel, müzik ve efekt seviyeleri ayarlanır.
+- Vuruş efekti test edilir.
+- Müzik test amaçlı açılıp kapatılır.
+
+Yeni ve geçerli bir skor eventi geldiğinde vuruş sesi çalar. Aynı `event_id`
+tekrar gönderildiğinde ses ikinci kez çalmaz. Oyun başlayınca müzik başlar;
+oyun manuel, süre dolarak veya hedef tamamlanarak bittiğinde müzik durur.
+
+USB kart görünmüyorsa Pi 5 üzerinde:
+
+```bash
+aplay -l
+speaker-test -c 2 -t wav
+journalctl -u thief-server -f
+```
+
+komutlarıyla cihaz ve server logları kontrol edilmelidir.
+
 ## Sahada Hızlı Debug
 
 Server durumunu kontrol etmek için Pi 5 üzerinde:

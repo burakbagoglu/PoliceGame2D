@@ -9,7 +9,7 @@ Kullanım:
 
 Her client ayrı bir Pygame penceresi açar ve farklı screen_id ile çalışır.
 Server otomatik olarak arka planda başlar.
-Dashboard: http://localhost:8000
+Dashboard: http://localhost:8078
 """
 import subprocess
 import sys
@@ -28,6 +28,7 @@ CLIENT_DIR = os.path.join(ROOT_DIR, "thief_client")
 
 # Her client kendi config dosyasını alır
 TEMP_CONFIG_DIR = os.path.join(ROOT_DIR, "_sim_configs")
+SIM_SERVER_PORT = 8078
 
 
 def load_base_client_config() -> dict:
@@ -46,8 +47,8 @@ def create_client_config(screen_id: int, num_clients: int, windowed: bool = True
 
     # Client-özel ayarlar
     config["screen_id"] = screen_id
-    config["server_url"] = "http://localhost:8000/event"
-    config["server_base_url"] = "http://localhost:8000"
+    config["server_url"] = f"http://localhost:{SIM_SERVER_PORT}/event"
+    config["server_base_url"] = f"http://localhost:{SIM_SERVER_PORT}"
     config["server_controlled"] = True
     config["debug"] = True
 
@@ -112,7 +113,7 @@ def start_server():
         sys.exit(1)
 
     print(f"✅ Server başlatıldı (PID: {process.pid})")
-    print(f"📊 Dashboard: http://localhost:8000")
+    print(f"📊 Dashboard: http://localhost:{SIM_SERVER_PORT}")
     return process
 
 
@@ -209,7 +210,7 @@ def main():
 
     print("=" * 50)
     print("🎮 Hırsız Oyunu — Simülasyon Modu")
-    print(f"   Server: localhost:8000")
+    print(f"   Server: localhost:{SIM_SERVER_PORT}")
     print(f"   Client sayısı: {num_clients}")
     print(f"   Mod: {'Pencere' if windowed else 'Tam ekran'}")
     print("=" * 50)
@@ -231,7 +232,7 @@ def main():
         print("✅ Simülasyon çalışıyor!")
         print()
         print("📋 Kullanım:")
-        print("   1. Dashboard'u aç: http://localhost:8000")
+        print(f"   1. Dashboard'u aç: http://localhost:{SIM_SERVER_PORT}")
         print("   2. Çocuk sayısı + süre gir → ▶ Oyunu Başlat")
         print("   3. Her client penceresinde SPACE ile hit")
         print("   4. Dashboard'dan skorları ve spawn'ları izle")

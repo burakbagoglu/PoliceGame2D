@@ -130,3 +130,33 @@ Sahada kesintisiz calismak icin yapilan sertlestirmeler:
 6. Dashboarddan skor sifirla:
    - Dashboard skoru 0 olmali.
    - Client ekrandaki lokal skor bir sonraki poll sonrasi 0 olmali.
+
+## Server USB Ses Karti
+
+Ses Pi Zero client'lardan degil, Pi 5 server'a bagli USB ses kartindan cikar:
+
+```text
+Pi 5 USB -> USB ses karti -> 3.5 mm -> aktif hoparlor
+```
+
+Kontrol:
+
+```bash
+aplay -l
+speaker-test -c 2 -t wav
+```
+
+`thief_server/config.json` icindeki `audio.device_name` varsayilan olarak
+`auto-usb` degerindedir. SDL cihaz listesi kullanilamiyorsa server
+`/proc/asound/cards` uzerinden USB karti bulup `plughw:N,0` secmeye calisir.
+Gerekirse systemd servisine su override eklenebilir:
+
+```ini
+Environment=THIEF_AUDIO_DEVICE=plughw:1,0
+```
+
+Harici dosya verilmezse server sentetik muzik ve efektlerle calisir. Kendi
+dosyalarini kullanmak icin `music_file`, `hit_sound_file`,
+`start_sound_file`, `success_sound_file` ve `end_sound_file` alanlari
+server klasorune gore bagil dosya yolu olarak ayarlanabilir. Kisa efektler
+icin WAV, muzik icin OGG onerilir.

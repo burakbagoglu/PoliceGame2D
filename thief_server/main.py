@@ -8,13 +8,14 @@ import os
 import time
 import threading
 from datetime import datetime
-from typing import Dict, Set, Optional
+from typing import Dict, Set, Optional, Literal
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
+from audio_manager import AudioManager
 from spawn_engine import (
     TargetCalculator,
     ScreenSelector,
@@ -49,6 +50,22 @@ def load_config(filepath: str = "config.json") -> dict:
             "max_concurrent_spawns": 3,
             "default_piezo_threshold": 100,
             "default_piezo_refractory_ms": 200,
+            "audio": {
+                "enabled": True,
+                "device_name": "auto-usb",
+                "frequency": 44100,
+                "output_channels": 2,
+                "buffer": 512,
+                "mixer_channels": 8,
+                "master_volume": 0.8,
+                "music_volume": 0.35,
+                "sfx_volume": 0.9,
+                "music_file": "",
+                "hit_sound_file": "",
+                "start_sound_file": "",
+                "success_sound_file": "",
+                "end_sound_file": ""
+            },
             "debug": False,
             "access_log": False,
         }
@@ -67,10 +84,10 @@ CONFIG = load_config()
 
 class ScoreEvent(BaseModel):
     """Client'tan gelen skor eventi"""
-    event_id: str
-    screen_id: int
-    points: int
-    ts_ms: int
+    event_id: str = Field(min_length=1, max_length=128)
+    screen_id: int = Field(ge=1, le=CONFIG.get("num_screens", 12))
+    points: int = Field(ge=1, le=100)
+    ts_ms: int = Field(gt=0)
 
 
 class ScoreResponse(BaseModel):
@@ -84,16 +101,33 @@ class ScoreResponse(BaseModel):
 
 class StartGameRequest(BaseModel):
     """Oyun başlatma isteği"""
-    child_count: int
-    screen_count: int = 12
-    difficulty: str = "normal"
-    duration_minutes: int = 20
+    child_count: int = Field(ge=1, le=100)
+    screen_count: int = Field(
+        default=12,
+        ge=1,
+        le=CONFIG.get("num_screens", 12),
+    )
+    difficulty: Literal["easy", "normal", "hard"] = "normal"
+    duration_minutes: int = Field(default=20, ge=1, le=120)
 
 
 class PiezoConfigRequest(BaseModel):
     """Piezo ayar isteği"""
     threshold: int
     refractory_ms: int
+
+
+class AudioConfigRequest(BaseModel):
+    """Server hoparlör ses ayarları."""
+    enabled: bool = True
+    master_volume: float = Field(ge=0.0, le=1.0)
+    music_volume: float = Field(ge=0.0, le=1.0)
+    sfx_volume: float = Field(ge=0.0, le=1.0)
+
+
+class AudioTestRequest(BaseModel):
+    """Dashboard ses test komutu."""
+    sound_type: Literal["hit", "start", "success", "end", "music"]
 
 
 # ============== Score Manager ==============
@@ -119,12 +153,14 @@ class ScoreManager:
             if event.event_id in self.processed_events:
                 return False
 
+            if not 1 <= event.screen_id <= self.num_screens:
+                raise ValueError(f"Geçersiz ekran kimliği: {event.screen_id}")
+
             self.processed_events.add(event.event_id)
 
             screen_id = event.screen_id
-            if 1 <= screen_id <= self.num_screens:
-                self.screen_scores[screen_id] = self.screen_scores.get(screen_id, 0) + event.points
-                self.total_score += event.points
+            self.screen_scores[screen_id] = self.screen_scores.get(screen_id, 0) + event.points
+            self.total_score += event.points
 
             self.event_count += 1
             self.last_event_time = datetime.now()
@@ -183,6 +219,10 @@ piezo_config = PiezoConfigManager(
     threshold=CONFIG.get("default_piezo_threshold", 100),
     refractory_ms=CONFIG.get("default_piezo_refractory_ms", 200),
 )
+audio_manager = AudioManager(
+    config=CONFIG.get("audio", {}),
+    base_dir=os.path.dirname(os.path.abspath(__file__)),
+)
 
 # Spawn scheduler (oyun başlatılınca oluşturulur)
 spawn_scheduler: Optional[SpawnScheduler] = None
@@ -197,15 +237,22 @@ active_polling_lock = threading.RLock()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    audio_ready = audio_manager.initialize()
     print("=" * 50)
     print("🎮 Thief Server Başlatıldı!")
     print(f"📍 http://{CONFIG['host']}:{CONFIG['port']}")
     print(f"📺 Ekran sayısı: {CONFIG['num_screens']}")
+    audio_status = audio_manager.get_status()
+    if audio_ready:
+        print(f"🔊 Ses cihazı: {audio_status['device_active']}")
+    else:
+        print(f"🔇 Ses devre dışı: {audio_status['last_error'] or 'kapalı'}")
     print("=" * 50)
     yield
     global spawn_scheduler
     if spawn_scheduler:
         spawn_scheduler.stop()
+    audio_manager.shutdown()
     print("\n🛑 Thief Server Kapatıldı")
 
 
@@ -218,6 +265,11 @@ app = FastAPI(
 
 
 # ============== Game API Endpoints ==============
+
+def _on_session_end(reason: str):
+    """Süre/hedef nedeniyle otomatik biten oyunun sesini yönet."""
+    audio_manager.end_game(completed=(reason == "target"))
+
 
 @app.post("/api/game/start")
 async def start_game(req: StartGameRequest):
@@ -259,22 +311,25 @@ async def start_game(req: StartGameRequest):
         adaptive_controller=adaptive,
         phase_spawner=phase_spawner,
         debug=CONFIG.get("debug", False),
+        on_session_end=_on_session_end,
     )
 
     # Oyun başlamadan önce poll yapan ekranları hemen kaydet
+    active_cutoff = _time.time() - 10.0
     with active_polling_lock:
-        active_snapshot = list(active_polling_screens.items())
+        active_snapshot = [
+            (sid, last_t)
+            for sid, last_t in active_polling_screens.items()
+            if 1 <= sid <= req.screen_count and last_t >= active_cutoff
+        ]
     for sid, last_t in active_snapshot:
         spawn_scheduler._active_screens[sid] = last_t
-        # Dinamik kuyruk oluştur
-        if sid not in spawn_scheduler.spawn_queues:
-            import queue
-            spawn_scheduler.spawn_queues[sid] = queue.Queue()
 
     if CONFIG.get("debug"):
         print(f"[Game] Kayıtlı aktif ekranlar: {[sid for sid, _ in active_snapshot]}")
 
     spawn_scheduler.start()
+    audio_manager.start_game()
 
     # Skorları sıfırla
     score_manager.reset()
@@ -315,6 +370,8 @@ async def end_game():
         final_score = status["current_score"]
         target = status["target_score"]
         spawn_scheduler.stop()
+        completed = final_score >= target
+        audio_manager.end_game(completed=completed)
 
         if CONFIG.get("debug"):
             print(f"[Game] Oyun bitti! Skor: {final_score}/{target}")
@@ -323,7 +380,7 @@ async def end_game():
             "success": True,
             "final_score": final_score,
             "target_score": target,
-            "completed": final_score >= target,
+            "completed": completed,
         }
 
     return {"success": False, "message": "Aktif oyun yok"}
@@ -332,7 +389,9 @@ async def end_game():
 # ============== Spawn Polling ==============
 
 @app.get("/spawn/poll")
-async def spawn_poll(screen_id: int = Query(...)):
+async def spawn_poll(
+    screen_id: int = Query(..., ge=1, le=CONFIG.get("num_screens", 12))
+):
     """Client spawn kontrolü"""
     # Ekranı GLOBAL olarak kaydet (oyun başlamadan önce de)
     with active_polling_lock:
@@ -353,8 +412,17 @@ async def spawn_poll(screen_id: int = Query(...)):
             "score_version": score_manager.get_scores().score_version,
         }
 
+    if screen_id > spawn_scheduler.session.screen_count:
+        return {
+            "spawn": False,
+            "game_active": True,
+            "participating": False,
+            "score_version": score_manager.get_scores().score_version,
+        }
+
     result = spawn_scheduler.poll_spawn(screen_id)
     result["game_active"] = True
+    result["participating"] = True
     result["score_version"] = score_manager.get_scores().score_version
     return result
 
@@ -364,11 +432,23 @@ async def spawn_poll(screen_id: int = Query(...)):
 @app.post("/event")
 async def receive_event(event: ScoreEvent):
     """Client'tan skor eventi al"""
+    if (
+        spawn_scheduler
+        and spawn_scheduler.session.is_active
+        and event.screen_id > spawn_scheduler.session.screen_count
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Ekran {event.screen_id} aktif oyun oturumuna dahil değil",
+        )
+
     is_new = score_manager.process_event(event)
 
     # Spawn scheduler'a da bildir
     if is_new and spawn_scheduler and spawn_scheduler.session.is_active:
         spawn_scheduler.update_score(event.points)
+    if is_new:
+        audio_manager.play_hit()
 
     if CONFIG.get("debug"):
         status = "✅ YENİ" if is_new else "⏭️ DUPLICATE"
@@ -430,6 +510,7 @@ async def health_check():
         "uptime": "ok",
         "total_score": scores.total_score,
         "game_active": game_active,
+        "audio": audio_manager.get_status(),
     }
 
 
@@ -458,12 +539,45 @@ async def get_piezo_config():
 
 
 @app.get("/api/piezo/config/poll")
-async def poll_piezo_config(screen_id: int = Query(...)):
+async def poll_piezo_config(
+    screen_id: int = Query(..., ge=1, le=CONFIG.get("num_screens", 12))
+):
     """Client piezo config polling"""
     result = piezo_config.poll(screen_id)
     if result:
         return {"changed": True, **result}
     return {"changed": False}
+
+
+# ============== Server Audio Endpoints ==============
+
+@app.get("/api/audio/status")
+async def get_audio_status():
+    """USB ses kartı ve mixer durumunu getir."""
+    return audio_manager.get_status()
+
+
+@app.post("/api/audio/config")
+async def set_audio_config(req: AudioConfigRequest):
+    """Çalışma zamanı ses seviyelerini uygula."""
+    status = audio_manager.configure(
+        enabled=req.enabled,
+        master_volume=req.master_volume,
+        music_volume=req.music_volume,
+        sfx_volume=req.sfx_volume,
+    )
+    return {"success": True, **status}
+
+
+@app.post("/api/audio/test")
+async def test_audio(req: AudioTestRequest):
+    """Dashboard'dan efekt veya müzik testi yap."""
+    played = audio_manager.test_sound(req.sound_type)
+    return {
+        "success": played,
+        "sound_type": req.sound_type,
+        **audio_manager.get_status(),
+    }
 
 
 # ============== Dashboard ==============
@@ -1098,6 +1212,54 @@ DASHBOARD_HTML = """
                 </div>
             </div>
 
+            <!-- Server Ses Ayarları -->
+            <div class="card">
+                <h3>🔊 Server Sesi</h3>
+                <div class="stat-row">
+                    <span class="stat-label">USB Ses Kartı</span>
+                    <span class="stat-value" id="audio-device">Kontrol ediliyor…</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Mixer</span>
+                    <span class="stat-value" id="audio-status">—</span>
+                </div>
+                <div class="stat-row">
+                    <span class="stat-label">Müzik</span>
+                    <span class="stat-value" id="audio-music-status">Durdu</span>
+                </div>
+                <label style="display: block; margin: 12px 0;">
+                    <input type="checkbox" id="audio-enabled" checked>
+                    Sesi etkinleştir
+                </label>
+                <div class="slider-group">
+                    <label>Genel Ses</label>
+                    <div class="slider-row">
+                        <input type="range" id="audio-master" min="0" max="100" value="80">
+                        <span class="slider-value" id="audio-master-value">80%</span>
+                    </div>
+                </div>
+                <div class="slider-group">
+                    <label>Müzik</label>
+                    <div class="slider-row">
+                        <input type="range" id="audio-music" min="0" max="100" value="35">
+                        <span class="slider-value" id="audio-music-value">35%</span>
+                    </div>
+                </div>
+                <div class="slider-group">
+                    <label>Efekt</label>
+                    <div class="slider-row">
+                        <input type="range" id="audio-sfx" min="0" max="100" value="90">
+                        <span class="slider-value" id="audio-sfx-value">90%</span>
+                    </div>
+                </div>
+                <div class="controls" style="margin-top: 10px;">
+                    <button class="btn btn-blue" onclick="applyAudioConfig()">✅ Uygula</button>
+                    <button class="btn btn-orange" onclick="testAudio('hit')">🥁 Vuruş Testi</button>
+                    <button class="btn btn-green" onclick="testAudio('music')">🎵 Müzik Aç/Kapat</button>
+                </div>
+                <div id="audio-error" style="color: #f87171; margin-top: 10px;"></div>
+            </div>
+
             <!-- İstatistikler -->
             <div class="card">
                 <h3>📊 İstatistikler</h3>
@@ -1156,6 +1318,15 @@ DASHBOARD_HTML = """
         document.getElementById('piezo-refractory').addEventListener('input', function() {
             document.getElementById('refractory-value').textContent = this.value + 'ms';
         });
+        for (const [sliderId, valueId] of [
+            ['audio-master', 'audio-master-value'],
+            ['audio-music', 'audio-music-value'],
+            ['audio-sfx', 'audio-sfx-value'],
+        ]) {
+            document.getElementById(sliderId).addEventListener('input', function() {
+                document.getElementById(valueId).textContent = this.value + '%';
+            });
+        }
 
         function quickStart(childCount, screenCount, durationMinutes, difficulty) {
             document.getElementById('child-count').value = childCount;
@@ -1227,6 +1398,74 @@ DASHBOARD_HTML = """
                 }
             } catch (err) {
                 console.error('Piezo ayar hatası:', err);
+            }
+        }
+
+        // === Server sesi ===
+        function renderAudioStatus(data, syncControls = false) {
+            const device = data.device_active || data.device_requested || 'Bulunamadı';
+            document.getElementById('audio-device').textContent = device;
+            document.getElementById('audio-status').textContent =
+                !data.enabled ? 'Kapalı' : (data.available ? 'Hazır' : 'Kullanılamıyor');
+            document.getElementById('audio-music-status').textContent =
+                data.music_playing ? 'Çalıyor' : 'Durdu';
+            document.getElementById('audio-error').textContent = data.last_error || '';
+
+            if (syncControls) {
+                document.getElementById('audio-enabled').checked = data.enabled;
+                document.getElementById('audio-master').value = Math.round(data.master_volume * 100);
+                document.getElementById('audio-music').value = Math.round(data.music_volume * 100);
+                document.getElementById('audio-sfx').value = Math.round(data.sfx_volume * 100);
+                document.getElementById('audio-master-value').textContent =
+                    Math.round(data.master_volume * 100) + '%';
+                document.getElementById('audio-music-value').textContent =
+                    Math.round(data.music_volume * 100) + '%';
+                document.getElementById('audio-sfx-value').textContent =
+                    Math.round(data.sfx_volume * 100) + '%';
+            }
+        }
+
+        async function loadAudioStatus(syncControls = true) {
+            try {
+                const res = await fetch('/api/audio/status');
+                renderAudioStatus(await res.json(), syncControls);
+            } catch (err) {
+                document.getElementById('audio-error').textContent =
+                    'Ses durumu alınamadı';
+            }
+        }
+
+        async function applyAudioConfig() {
+            const payload = {
+                enabled: document.getElementById('audio-enabled').checked,
+                master_volume: parseInt(document.getElementById('audio-master').value) / 100,
+                music_volume: parseInt(document.getElementById('audio-music').value) / 100,
+                sfx_volume: parseInt(document.getElementById('audio-sfx').value) / 100,
+            };
+            try {
+                const res = await fetch('/api/audio/config', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload),
+                });
+                renderAudioStatus(await res.json(), true);
+            } catch (err) {
+                document.getElementById('audio-error').textContent =
+                    'Ses ayarları uygulanamadı';
+            }
+        }
+
+        async function testAudio(soundType) {
+            try {
+                const res = await fetch('/api/audio/test', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({sound_type: soundType}),
+                });
+                renderAudioStatus(await res.json(), false);
+            } catch (err) {
+                document.getElementById('audio-error').textContent =
+                    'Ses testi çalıştırılamadı';
             }
         }
 
@@ -1342,8 +1581,10 @@ DASHBOARD_HTML = """
         initScreenCards(numScreens);
         updateStatus();
         loadPiezoConfig();
+        loadAudioStatus(true);
 
         setInterval(updateStatus, 1000);
+        setInterval(() => loadAudioStatus(false), 3000);
     </script>
 </body>
 </html>

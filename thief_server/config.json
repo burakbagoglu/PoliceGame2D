@@ -10,6 +10,22 @@
   "max_concurrent_spawns": 3,
   "default_piezo_threshold": 100,
   "default_piezo_refractory_ms": 200,
+  "audio": {
+    "enabled": true,
+    "device_name": "auto-usb",
+    "frequency": 44100,
+    "output_channels": 2,
+    "buffer": 512,
+    "mixer_channels": 8,
+    "master_volume": 0.8,
+    "music_volume": 0.35,
+    "sfx_volume": 0.9,
+    "music_file": "",
+    "hit_sound_file": "",
+    "start_sound_file": "",
+    "success_sound_file": "",
+    "end_sound_file": ""
+  },
   "debug": false,
   "access_log": false
 }

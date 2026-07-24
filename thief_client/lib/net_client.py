@@ -8,6 +8,7 @@ import json
 import time
 import uuid
 import os
+import tempfile
 from typing import Optional, Dict, Any
 from dataclasses import dataclass, asdict
 
@@ -67,6 +68,9 @@ class NetClient:
         self.poll_interval_s = poll_interval_ms / 1000.0
         self.queue_file = queue_file
         self.debug = debug
+        self._offline_lock = threading.RLock()
+        self._offline_event_ids = set()
+        self._stop_event = threading.Event()
 
         # Gönderim kuyruğu
         self.send_queue: queue.Queue = queue.Queue()
@@ -104,6 +108,7 @@ class NetClient:
             return
 
         self.running = True
+        self._stop_event.clear()
 
         # Skor gönderim thread'i
         self.send_thread = threading.Thread(target=self._send_loop, daemon=True)
@@ -119,9 +124,10 @@ class NetClient:
     def stop(self):
         """Thread'leri durdur ve offline queue'yu kaydet"""
         self.running = False
+        self._stop_event.set()
 
         if self.send_thread and self.send_thread.is_alive():
-            self.send_thread.join(timeout=2.0)
+            self.send_thread.join(timeout=6.0)
         if self.poll_thread and self.poll_thread.is_alive():
             self.poll_thread.join(timeout=2.0)
 
@@ -190,13 +196,20 @@ class NetClient:
             if success:
                 self.events_sent += 1
                 self.connected = True
+                self._remove_from_offline_queue(event.event_id)
                 retry_delay = 1.0
             else:
                 self.events_failed += 1
                 self.connected = False
                 self._add_to_offline_queue(event)
-                time.sleep(min(retry_delay, max_retry_delay))
-                retry_delay *= 2
+                interrupted = self._stop_event.wait(
+                    min(retry_delay, max_retry_delay)
+                )
+                if not interrupted:
+                    # Aynı event_id ile çalışma sırasında yeniden dene.
+                    # Server tarafındaki idempotency olası tekrarları güvenli kılar.
+                    self.send_queue.put(event)
+                retry_delay = min(retry_delay * 2, max_retry_delay)
 
     def _send_event(self, event: ScoreEvent) -> bool:
         """Tek bir event'i gönder"""
@@ -240,7 +253,8 @@ class NetClient:
                 if self.debug:
                     print(f"[NetClient] Poll hatası: {e}")
 
-            time.sleep(self.poll_interval_s)
+            if self._stop_event.wait(self.poll_interval_s):
+                break
 
     def _poll_spawn(self):
         """Server'dan spawn komutu sorgula"""
@@ -252,6 +266,8 @@ class NetClient:
                 data = response.json()
                 self.connected = True
                 self.server_game_active = data.get("game_active", False)
+                if not self.server_game_active:
+                    self._clear_queue(self.spawn_queue)
                 score_version = data.get("score_version")
                 if score_version is not None:
                     if self.last_score_version is None:
@@ -292,69 +308,124 @@ class NetClient:
 
     # ============== Offline Queue ==============
 
-    def _load_offline_queue(self):
-        if not os.path.exists(self.queue_file):
-            return
-
-        try:
-            with open(self.queue_file, "r", encoding="utf-8") as f:
-                events_data = json.load(f)
-
-            for data in events_data:
-                event = ScoreEvent(**data)
-                self.send_queue.put(event)
-
-            os.remove(self.queue_file)
-
-            if self.debug:
-                print(f"[NetClient] {len(events_data)} offline event yüklendi")
-
-        except Exception as e:
-            if self.debug:
-                print(f"[NetClient] Offline queue yükleme hatası: {e}")
-
-    def _save_offline_queue(self):
-        events = []
-
-        while not self.send_queue.empty():
+    @staticmethod
+    def _clear_queue(target_queue: queue.Queue):
+        while True:
             try:
-                event = self.send_queue.get_nowait()
-                events.append(event.to_dict())
+                target_queue.get_nowait()
             except queue.Empty:
-                break
+                return
+
+    def _read_offline_events_unlocked(self) -> list:
+        if not os.path.exists(self.queue_file):
+            return []
+
+        with open(self.queue_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, list):
+            raise ValueError("Offline queue JSON list olmalı")
+        return data
+
+    def _write_offline_events_unlocked(self, events: list):
+        # event_id bazında sıralamayı koruyarak duplicate kayıtları temizle.
+        unique_events = {}
+        for event in events:
+            event_id = event.get("event_id")
+            if event_id:
+                unique_events[event_id] = event
+        events = list(unique_events.values())
 
         if not events:
+            if os.path.exists(self.queue_file):
+                os.remove(self.queue_file)
+            self._offline_event_ids.clear()
             return
 
+        directory = os.path.dirname(os.path.abspath(self.queue_file))
+        os.makedirs(directory, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            dir=directory,
+            prefix=".event_queue_",
+            suffix=".tmp",
+        )
         try:
-            with open(self.queue_file, "w", encoding="utf-8") as f:
-                json.dump(events, f, indent=2)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(events, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, self.queue_file)
+        except BaseException:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise
 
-            if self.debug:
-                print(f"[NetClient] {len(events)} event dosyaya kaydedildi")
+        self._offline_event_ids = set(unique_events)
 
-        except Exception as e:
-            if self.debug:
-                print(f"[NetClient] Offline queue kaydetme hatası: {e}")
+    def _load_offline_queue(self):
+        with self._offline_lock:
+            try:
+                events_data = self._read_offline_events_unlocked()
+                for data in events_data:
+                    event = ScoreEvent(**data)
+                    if event.event_id in self._offline_event_ids:
+                        continue
+                    self._offline_event_ids.add(event.event_id)
+                    self.send_queue.put(event)
+
+                if self.debug and events_data:
+                    print(f"[NetClient] {len(events_data)} offline event yüklendi")
+
+            except Exception as e:
+                if self.debug:
+                    print(f"[NetClient] Offline queue yükleme hatası: {e}")
+
+    def _save_offline_queue(self):
+        with self._offline_lock:
+            try:
+                events = self._read_offline_events_unlocked()
+                while True:
+                    try:
+                        event = self.send_queue.get_nowait()
+                        events.append(event.to_dict())
+                    except queue.Empty:
+                        break
+
+                self._write_offline_events_unlocked(events)
+
+                if self.debug and events:
+                    print(f"[NetClient] {len(events)} event dosyaya kaydedildi")
+
+            except Exception as e:
+                if self.debug:
+                    print(f"[NetClient] Offline queue kaydetme hatası: {e}")
 
     def _add_to_offline_queue(self, event: ScoreEvent):
-        events = []
-
-        if os.path.exists(self.queue_file):
+        with self._offline_lock:
+            if event.event_id in self._offline_event_ids:
+                return
             try:
-                with open(self.queue_file, "r", encoding="utf-8") as f:
-                    events = json.load(f)
-            except:
-                pass
+                events = self._read_offline_events_unlocked()
+                events.append(event.to_dict())
+                self._write_offline_events_unlocked(events)
+            except Exception as e:
+                if self.debug:
+                    print(f"[NetClient] Offline queue ekleme hatası: {e}")
 
-        events.append(event.to_dict())
-
-        try:
-            with open(self.queue_file, "w", encoding="utf-8") as f:
-                json.dump(events, f, indent=2)
-        except Exception as e:
-            if self.debug:
-                print(f"[NetClient] Offline queue ekleme hatası: {e}")
+    def _remove_from_offline_queue(self, event_id: str):
+        with self._offline_lock:
+            if event_id not in self._offline_event_ids:
+                return
+            try:
+                events = [
+                    event
+                    for event in self._read_offline_events_unlocked()
+                    if event.get("event_id") != event_id
+                ]
+                self._write_offline_events_unlocked(events)
+            except Exception as e:
+                if self.debug:
+                    print(f"[NetClient] Offline queue temizleme hatası: {e}")
 
     # ============== Status ==============
 

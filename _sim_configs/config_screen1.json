@@ -1,7 +1,7 @@
 {
   "screen_id": 1,
-  "server_url": "http://localhost:8000/event",
-  "server_base_url": "http://localhost:8000",
+  "server_url": "http://localhost:8078/event",
+  "server_base_url": "http://localhost:8078",
   "server_controlled": true,
   "poll_interval_ms": 500,
   "fps": 30,
