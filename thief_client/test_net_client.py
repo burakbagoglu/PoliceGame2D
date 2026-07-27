@@ -7,6 +7,8 @@ import json
 import os
 import pytest
 import threading
+import hashlib
+import base64
 
 try:
     import responses
@@ -261,6 +263,182 @@ class TestNetClientPolling:
         assert client.get_spawn() is False
 
     @responses.activate
+    @responses.activate
+    def test_poll_spawn_jail_state_clears_pending_spawn(self):
+        responses.get(
+            "http://test:8000/spawn/poll",
+            json={
+                "spawn": True,
+                "game_active": True,
+                "active_scene": "jail",
+                "screen_score": 12,
+                "screen_target": 12,
+                "screen_remaining": 0,
+                "screen_complete": True,
+            },
+            status=200,
+        )
+        client = NetClient(
+            server_url="http://test:8000/event",
+            server_base_url="http://test:8000",
+            screen_id=1,
+        )
+        client.spawn_queue.put({"spawn": True})
+        client._poll_spawn()
+
+        assert client.server_scene == "jail"
+        assert client.server_screen_score == 12
+        assert client.server_screen_target == 12
+        assert client.server_screen_complete is True
+        assert client.get_spawn() is False
+
+    @responses.activate
+    def test_poll_spawn_updates_countdown_status(self):
+        responses.get(
+            "http://test:8000/spawn/poll",
+            json={
+                "spawn": False,
+                "game_active": True,
+                "countdown_active": True,
+                "countdown_message": "3",
+                "countdown_remaining_ms": 2750,
+            },
+            status=200,
+        )
+
+        client = NetClient(
+            server_url="http://test:8000/event",
+            server_base_url="http://test:8000",
+            screen_id=1,
+        )
+        client._poll_spawn()
+
+        assert client.get_countdown_status() == {
+            "active": True,
+            "message": "3",
+            "remaining_ms": 2750,
+        }
+
+    @responses.activate
+    def test_poll_scene_config_queues_new_document(self, tmp_path):
+        responses.get(
+            "http://test:8000/api/scenes/client",
+            json={
+                "changed": True,
+                "version": "published-2",
+                "preview": False,
+                "preview_scene": None,
+                "document": {
+                    "canvas": {"width": 1920, "height": 1080},
+                    "scenes": {"waiting": {"elements": []}},
+                },
+                "assets": [],
+            },
+            status=200,
+        )
+        client = NetClient(
+            server_url="http://test:8000/event",
+            server_base_url="http://test:8000",
+            screen_id=1,
+            scene_cache_dir=str(tmp_path),
+        )
+
+        client._poll_scene_config()
+        payload = client.consume_scene_config()
+
+        assert payload["version"] == "published-2"
+        assert payload["preview"] is False
+        assert client.scene_version == "published-2"
+
+    @responses.activate
+    def test_poll_scene_config_downloads_checksum_asset(self, tmp_path):
+        content = b"fake-image-bytes"
+        digest = hashlib.sha256(content).hexdigest()
+        responses.get(
+            "http://test:8000/api/scenes/client",
+            json={
+                "changed": True,
+                "version": "draft-4-win",
+                "preview": True,
+                "preview_scene": "win",
+                "document": {
+                    "canvas": {"width": 1920, "height": 1080},
+                    "scenes": {"win": {"elements": []}},
+                },
+                "assets": [{
+                    "name": "hero.png",
+                    "sha256": digest,
+                    "url": "/api/scene-assets/hero.png",
+                }],
+            },
+            status=200,
+        )
+        responses.get(
+            "http://test:8000/api/scene-assets/hero.png",
+            body=content,
+            status=200,
+        )
+        client = NetClient(
+            server_url="http://test:8000/event",
+            server_base_url="http://test:8000",
+            screen_id=4,
+            scene_cache_dir=str(tmp_path),
+        )
+
+        client._poll_scene_config()
+        payload = client.consume_scene_config()
+
+        assert payload["preview_scene"] == "win"
+        assert open(payload["asset_paths"]["hero.png"], "rb").read() == content
+
+    @responses.activate
+    def test_poll_scene_config_queues_screenshot_request_when_unchanged(self, tmp_path):
+        responses.get(
+            "http://test:8000/api/scenes/client",
+            json={
+                "changed": False,
+                "version": "published-1",
+                "preview": False,
+                "preview_scene": None,
+                "screenshot_request": "request-token-123",
+            },
+            status=200,
+        )
+        client = NetClient(
+            server_url="http://test:8000/event",
+            server_base_url="http://test:8000",
+            screen_id=2,
+            scene_cache_dir=str(tmp_path),
+        )
+
+        client._poll_scene_config()
+
+        assert client.consume_scene_screenshot_request() == "request-token-123"
+        assert client.consume_scene_config() is None
+
+    @responses.activate
+    def test_upload_scene_screenshot_uses_network_queue(self, tmp_path):
+        responses.post(
+            "http://test:8000/api/scenes/screenshot/upload",
+            json={"success": True},
+            status=200,
+        )
+        client = NetClient(
+            server_url="http://test:8000/event",
+            server_base_url="http://test:8000",
+            screen_id=2,
+            scene_cache_dir=str(tmp_path),
+        )
+        content = b"\x89PNG\r\n\x1a\nclient-preview"
+
+        assert client.submit_scene_screenshot("request-token-123", content) is True
+        client._upload_scene_screenshot()
+
+        body = json.loads(responses.calls[0].request.body)
+        assert body["screen_id"] == 2
+        assert body["request_token"] == "request-token-123"
+        assert base64.b64decode(body["data_base64"]) == content
+    @responses.activate
     def test_poll_spawn_score_version_change_queues_reset(self):
         responses.get(
             "http://test:8000/spawn/poll",
@@ -333,3 +511,27 @@ class TestNetClientPolling:
         event = ScoreEvent.create(1, 1)
         result = client._send_event(event)
         assert result is True
+    @responses.activate
+    def test_send_heartbeat_merges_provider_payload(self):
+        responses.post(
+            "http://test:8000/api/clients/heartbeat",
+            json={"success": True},
+            status=200,
+        )
+        client = NetClient(
+            server_url="http://test:8000/event",
+            server_base_url="http://test:8000",
+            screen_id=3,
+            telemetry_provider=lambda: {
+                "fps": 29.5,
+                "serial_connected": True,
+                "piezo": {"latest": 100},
+            },
+        )
+
+        client._send_heartbeat()
+
+        payload = json.loads(responses.calls[0].request.body)
+        assert payload["screen_id"] == 3
+        assert payload["fps"] == 29.5
+        assert payload["piezo"]["latest"] == 100

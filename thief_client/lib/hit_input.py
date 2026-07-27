@@ -6,6 +6,7 @@ Arduino'ya piezo threshold/refractory ayarları gönderebilir.
 import threading
 import queue
 import time
+from collections import deque
 from typing import Optional
 
 try:
@@ -39,6 +40,12 @@ class HitInput:
         # Bağlantı durumu
         self.connected = False
         self.last_error: Optional[str] = None
+        self._telemetry_lock = threading.RLock()
+        self._piezo_samples = deque(maxlen=60)
+        self._piezo_latest = 0
+        self._piezo_peak = 0
+        self._piezo_sample_count = 0
+        self._hit_count = 0
 
     def start(self):
         """Serial okuma thread'ini başlat"""
@@ -114,8 +121,17 @@ class HitInput:
 
                     if text == "HIT":
                         self.hit_queue.put("HIT")
+                        with self._telemetry_lock:
+                            self._hit_count += 1
                         if self.debug:
                             print("[HitInput] HIT algılandı!")
+
+                    elif text.startswith(("PIEZO:", "RAW:")):
+                        try:
+                            self._record_piezo_sample(int(text.split(":", 1)[1]))
+                        except ValueError:
+                            if self.debug:
+                                print(f"[HitInput] Geçersiz piezo örneği: {text}")
 
                     elif text.startswith("OK:"):
                         self.config_ack_queue.put(text)
@@ -147,6 +163,26 @@ class HitInput:
                 if self.debug:
                     print(f"[HitInput] Beklenmeyen hata: {e}")
 
+    def _record_piezo_sample(self, value: int):
+        value = max(0, min(4095, int(value)))
+        with self._telemetry_lock:
+            self._piezo_latest = value
+            self._piezo_peak = max(self._piezo_peak, value)
+            self._piezo_sample_count += 1
+            self._piezo_samples.append(value)
+
+    def get_telemetry(self) -> dict:
+        """Dashboard kalibrasyonu için son sensör örneklerinin küçük bir özetini döndür."""
+        with self._telemetry_lock:
+            result = {
+                "latest": self._piezo_latest,
+                "peak": self._piezo_peak,
+                "sample_count": self._piezo_sample_count,
+                "hit_count": self._hit_count,
+                "samples": list(self._piezo_samples),
+            }
+            self._piezo_peak = self._piezo_latest
+            return result
     def get_hit(self) -> bool:
         """
         Queue'dan hit var mı kontrol et (non-blocking)
@@ -172,6 +208,8 @@ class HitInput:
     def simulate_hit(self):
         """Test için hit simüle et"""
         self.hit_queue.put("HIT")
+        with self._telemetry_lock:
+            self._hit_count += 1
         if self.debug:
             print("[HitInput] Simüle hit eklendi")
 
@@ -225,6 +263,7 @@ class KeyboardHitInput:
         self.debug = debug
         self.hit_queue: queue.Queue = queue.Queue()
         self.connected = True  # Her zaman "bağlı"
+        self._hit_count = 0
 
     def start(self):
         if self.debug:
@@ -240,6 +279,7 @@ class KeyboardHitInput:
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_SPACE:
                 self.hit_queue.put("HIT")
+                self._hit_count += 1
                 if self.debug:
                     print("[KeyboardHitInput] SPACE - HIT!")
 
@@ -259,6 +299,13 @@ class KeyboardHitInput:
 
     def simulate_hit(self):
         self.hit_queue.put("HIT")
+        self._hit_count += 1
+
+    def get_telemetry(self) -> dict:
+        return {
+            "latest": 0, "peak": 0, "sample_count": 0,
+            "hit_count": self._hit_count, "samples": [],
+        }
 
     def send_config(self, threshold: int, refractory_ms: int) -> bool:
         """Klavye modunda config gönderimi simülasyonu"""

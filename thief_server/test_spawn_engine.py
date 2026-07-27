@@ -51,6 +51,21 @@ class TestTargetCalculator:
         assert result['total_target'] == 60
 
 
+    def test_screen_quotas_cover_all_eight_screens(self):
+        result = TargetCalculator().calculate_screen_quotas(
+            child_count=5, difficulty="normal", duration_minutes=35
+        )
+        assert result["per_screen_target"] == 30
+        assert result["total_target"] == 240
+        assert result["screen_targets"] == {screen_id: 30 for screen_id in range(1, 9)}
+
+    def test_screen_quota_uses_minimum_for_small_groups(self):
+        result = TargetCalculator().calculate_screen_quotas(
+            child_count=1, difficulty="easy", duration_minutes=30
+        )
+        assert result["per_screen_target"] == 12
+        assert result["total_target"] == 96
+
 # ============== ScreenSelector ==============
 
 class TestScreenSelector:
@@ -160,6 +175,44 @@ class TestGameSession:
         assert d['current_score'] == 10
         assert 'progress_percent' in d
 
+    @pytest.mark.parametrize(
+        ("remaining", "message"),
+        [(3.8, "HIRSIZLARI VUR"), (2.8, "3"), (1.8, "2"), (0.8, "1")],
+    )
+    def test_countdown_message(self, monkeypatch, remaining, message):
+        now = 1000.0
+        session = GameSession(
+            child_count=3,
+            target_score=45,
+            start_time=now + remaining,
+            is_active=True,
+            countdown_seconds=4,
+        )
+        monkeypatch.setattr("spawn_engine.time.time", lambda: now)
+
+        assert session.countdown_active is True
+        assert session.countdown_message == message
+        assert session.elapsed_seconds == 0
+
+
+    def test_independent_screen_quota_completion(self):
+        session = GameSession(
+            child_count=2,
+            target_score=0,
+            screen_count=8,
+            screen_targets={screen_id: 2 for screen_id in range(1, 9)},
+        )
+        first = session.record_screen_score(1, 2)
+        assert first["screen_complete"] is True
+        assert session.is_screen_complete(1) is True
+        assert session.is_screen_complete(2) is False
+        assert session.all_screens_complete is False
+        assert session.current_score == 2
+
+        for screen_id in range(2, 9):
+            session.record_screen_score(screen_id, 2)
+        assert session.all_screens_complete is True
+        assert session.current_score == 16
 
 # ============== AdaptiveSpawnController ==============
 
@@ -350,7 +403,7 @@ class TestSpawnScheduler:
 
     def test_update_score(self):
         scheduler = self._make_scheduler()
-        scheduler.update_score(5)
+        scheduler.update_score(1, 5)
         assert scheduler.session.current_score == 5
 
     def test_get_status(self):
@@ -361,6 +414,17 @@ class TestSpawnScheduler:
         assert 'phase' in status
         assert 'urgency' in status
         assert 'spawn_interval' in status
+
+    def test_countdown_status_does_not_emit_spawn(self):
+        scheduler = self._make_scheduler()
+        scheduler.session.start_time = time.time() + 4
+        scheduler.session.countdown_seconds = 4
+        scheduler.session.is_active = True
+
+        status = scheduler.get_status()
+        assert status["phase"] == "COUNTDOWN"
+        assert status["countdown_active"] is True
+        assert scheduler.poll_spawn(1)["spawn"] is False
 
     def test_invalid_screen_poll(self):
         scheduler = self._make_scheduler(screen_count=4)

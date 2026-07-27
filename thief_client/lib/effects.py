@@ -1,4 +1,5 @@
 import random
+import math
 import pygame
 from typing import Tuple, List
 
@@ -114,3 +115,52 @@ class Particle:
         draw_y = int(self.y) - self.size + offset_y
         
         screen.blit(surf, (draw_x, draw_y))
+
+
+class Confetti:
+    """Başlangıç sayımında kullanılan hafif, yüzeysiz konfeti parçacığı."""
+
+    COLORS = (
+        (255, 224, 56),
+        (255, 58, 94),
+        (121, 45, 193),
+        (255, 112, 180),
+        (255, 255, 255),
+        (56, 205, 255),
+    )
+
+    def __init__(self, x: int, y: int, spread: float = 1.0):
+        self.x = float(x)
+        self.y = float(y)
+        self.width = random.randint(5, 11)
+        self.height = random.randint(10, 20)
+        self.color = random.choice(self.COLORS)
+        self.vx = random.uniform(-420, 420) * spread
+        self.vy = random.uniform(-620, -180)
+        self.gravity = random.uniform(650, 900)
+        self.spin = random.uniform(8, 18)
+        self.angle = random.uniform(0, math.tau)
+        self.life = random.uniform(1.2, 2.0)
+        self.max_life = self.life
+
+    def update(self, dt: float) -> bool:
+        self.vy += self.gravity * dt
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+        self.angle += self.spin * dt
+        self.life -= dt
+        return self.life > 0
+
+    def draw(self, screen: pygame.Surface, offset_x: int = 0, offset_y: int = 0):
+        if self.life <= 0:
+            return
+        visible_width = max(2, int(abs(math.cos(self.angle)) * self.width))
+        alpha = min(255, int(255 * self.life / min(0.35, self.max_life)))
+        color = (*self.color, alpha)
+        rect = pygame.Rect(
+            int(self.x) - visible_width // 2 + offset_x,
+            int(self.y) - self.height // 2 + offset_y,
+            visible_width,
+            self.height,
+        )
+        pygame.draw.rect(screen, color, rect, border_radius=2)

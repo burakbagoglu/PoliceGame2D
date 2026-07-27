@@ -201,3 +201,24 @@ class TestMovement:
         game = make_game()
         assert game.get_direction_name() == "SOLA"
         assert game.get_direction() == -1
+
+
+def test_runtime_hit_zone_overrides_band_and_can_be_cleared():
+    game = make_game(band_enabled=False)
+    game.configure_runtime_layout([{"x": 400, "y": 400, "width": 300, "height": 300}], [])
+    game.thief.x, game.thief.y = 500, 500
+    assert game.process_hit() is True
+
+    cleared = make_game(band_enabled=False)
+    cleared.configure_runtime_layout([], [])
+    assert cleared.band_enabled is False
+
+
+def test_runtime_path_moves_thief_and_resets_at_end():
+    game = make_game(server_controlled=True, speed_px_s=100)
+    game.configure_runtime_layout([], [(100, 500), (200, 450), (300, 500)])
+    game.trigger_spawn()
+
+    assert (game.thief.x, game.thief.y) == (300, 500)
+    game.update(3.0)
+    assert game.thief.state == GameState.RESET

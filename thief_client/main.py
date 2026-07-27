@@ -10,6 +10,8 @@ Böylece pleksi dışındaki bölgede oyun görünmez ve daha az piksel render e
 import sys
 import os
 import json
+import math
+import io
 import pygame
 import time
 
@@ -21,7 +23,8 @@ from lib.animation import ThiefAnimator
 from lib.hit_input import HitInput, KeyboardHitInput
 from lib.net_client import NetClient
 from lib.game import GameLogic, GameState
-from lib.effects import FloatingText, Particle
+from lib.effects import FloatingText, Particle, Confetti
+from lib.scene_renderer import SceneRenderer
 from lib.setup_wizard import SetupWizard
 import random
 
@@ -109,9 +112,12 @@ class ThiefGame:
             server_base_url=self.config.server_base_url,
             screen_id=self.config.screen_id,
             poll_interval_ms=self.config.poll_interval_ms,
+            scene_cache_dir=os.path.join(self.script_dir, "scene_cache"),
             debug=self.config.debug,
+            telemetry_provider=self._build_telemetry,
         )
         self.net_client.start()
+        self._last_scene_payload = None
 
         # Çalışma bayrakları
         self.running = True
@@ -121,6 +127,38 @@ class ThiefGame:
         self._apply_config()
 
     # ---------------------------------------------------------------- setup
+    @staticmethod
+    def _read_process_memory_mb() -> float:
+        """Linux /proc üzerinden ek bağımlılık olmadan RSS ölç."""
+        try:
+            with open("/proc/self/status", "r", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1]) / 1024.0
+        except (OSError, ValueError, IndexError):
+            pass
+        return 0.0
+
+    @staticmethod
+    def _read_cpu_temperature():
+        try:
+            with open(
+                "/sys/class/thermal/thermal_zone0/temp", "r", encoding="ascii"
+            ) as handle:
+                value = float(handle.read().strip())
+            return value / 1000.0 if value > 200 else value
+        except (OSError, ValueError):
+            return None
+
+    def _build_telemetry(self) -> dict:
+        return {
+            "fps": float(self.clock.get_fps()),
+            "memory_mb": self._read_process_memory_mb(),
+            "cpu_temp_c": self._read_cpu_temperature(),
+            "serial_connected": bool(getattr(self.hit_input, "connected", False)),
+            "piezo": self.hit_input.get_telemetry(),
+            "app_version": "scene-engine-v5",
+        }
     def _resolve_sprite_paths(self):
         """Sprite dosya yollarını çöz."""
         script_dir = self.script_dir
@@ -265,6 +303,53 @@ class ThiefGame:
         self.score_surface = None
         self._score_surface_value = None
 
+        # Tema fontları ve renkleri
+        self.theme_yellow = (255, 224, 56)
+        self.theme_yellow_light = (255, 242, 145)
+        self.theme_red = (236, 45, 76)
+        self.theme_purple = (105, 35, 165)
+        self.theme_purple_dark = (53, 20, 88)
+        self.theme_white = (255, 255, 247)
+        self.idle_title_font = self._theme_font(
+            max(30, min(76, self.view_w // 16)), bold=True
+        )
+        self.idle_subtitle_font = self._theme_font(
+            max(18, min(34, self.view_w // 34)), bold=True
+        )
+        self.score_label_font = self._theme_font(
+            max(15, min(25, self.view_w // 55)), bold=True
+        )
+        self.score_number_font = self._theme_font(
+            max(34, min(72, self.view_w // 20)), bold=True
+        )
+        self.countdown_title_font = self._theme_font(
+            max(46, min(112, self.view_w // 10)), bold=True
+        )
+        self.countdown_number_font = self._theme_font(
+            max(110, min(270, self.view_h // 3)), bold=True
+        )
+        self.countdown_go_font = self._theme_font(
+            max(60, min(150, self.view_w // 8)), bold=True
+        )
+        self.idle_card_surface = self._build_idle_card()
+        self.countdown_card_cache = {}
+        self.countdown_dim_surface = pygame.Surface(
+            (self.view_w, self.view_h),
+            pygame.SRCALPHA,
+        )
+        self.countdown_dim_surface.fill((30, 8, 51, 145))
+
+        # Sunucuyla senkron başlangıç gösterisi
+        self.countdown_display_message = None
+        self.countdown_stage_start = 0
+        self.countdown_display_until = 0
+        self.countdown_was_active = False
+        self.countdown_confetti = []
+        self.scene_renderer = SceneRenderer(self.view_w, self.view_h)
+        if self._last_scene_payload:
+            self.scene_renderer.apply(**self._last_scene_payload)
+            self._apply_scene_runtime_layout(self._last_scene_payload.get("document"))
+
         # Gölge cache
         self.shadow_cache = {}
 
@@ -326,6 +411,35 @@ class ThiefGame:
         """Yön değiştiğinde çağrılır"""
         self.animator.set_direction(direction)
 
+    def _apply_scene_runtime_layout(self, document):
+        """Editördeki hit-zone ve path öğelerini oyun koordinatlarına dönüştür."""
+        if not isinstance(document, dict):
+            return
+        canvas = document.get("canvas", {})
+        source_w = max(1.0, float(canvas.get("width", 1920)))
+        source_h = max(1.0, float(canvas.get("height", 1080)))
+        scale_x, scale_y = self.view_w / source_w, self.view_h / source_h
+        scene = document.get("scenes", {}).get("gameplay", {})
+        zones, path_points = [], []
+        for element in scene.get("elements", []):
+            if not isinstance(element, dict) or element.get("hidden"):
+                continue
+            if element.get("type") == "hit_zone":
+                zones.append({
+                    "x": float(element.get("x", 0)) * scale_x,
+                    "y": float(element.get("y", 0)) * scale_y,
+                    "width": float(element.get("width", 1)) * scale_x,
+                    "height": float(element.get("height", 1)) * scale_y,
+                })
+            elif element.get("type") == "path" and not path_points:
+                origin_x, origin_y = float(element.get("x", 0)), float(element.get("y", 0))
+                path_points = [
+                    ((origin_x + float(point.get("x", 0))) * scale_x,
+                     (origin_y + float(point.get("y", 0))) * scale_y)
+                    for point in element.get("points", [])
+                    if isinstance(point, dict)
+                ]
+        self.game.configure_runtime_layout(zones, path_points)
     # ---------------------------------------------------------------- loop
     def start(self):
         """Dış döngü: oyun + (gerekirse) sihirbazı yeniden açma."""
@@ -361,15 +475,29 @@ class ThiefGame:
                 break
 
             # Hit kontrolü
-            if self.hit_input.get_hit():
+            if self.hit_input.get_hit() and not self.net_client.server_screen_complete:
                 self.game.process_hit()
 
             if self.net_client.consume_score_reset():
                 self.game.reset_score()
                 self._score_surface_value = None
 
+            scene_payload = self.net_client.consume_scene_config()
+            if scene_payload:
+                self._last_scene_payload = {
+                    "version": scene_payload["version"],
+                    "document": scene_payload["document"],
+                    "asset_paths": scene_payload.get("asset_paths", {}),
+                    "preview_scene": scene_payload.get("preview_scene"),
+                }
+                self.scene_renderer.apply(**self._last_scene_payload)
+                self._apply_scene_runtime_layout(scene_payload.get("document"))
             # Server spawn kontrolü
-            if self.config.server_controlled and self.game.is_idle():
+            if (
+                self.config.server_controlled
+                and not self.net_client.server_screen_complete
+                and self.game.is_idle()
+            ):
                 if self.net_client.get_spawn():
                     self.game.trigger_spawn()
 
@@ -385,16 +513,43 @@ class ThiefGame:
             self.game.update(game_dt)
             self._update_animation(game_dt)
             self._update_effects(dt)
+            self._update_countdown(dt)
 
             # Çiz (canvas'a) ve ekrana sun
             self._draw()
             self._present()
+            self._capture_requested_scene_preview()
 
     def _present(self):
         """Canvas'ı ekrana (oynanabilir alana) blit et."""
         self.screen.blit(self.canvas, (self.view_x, self.view_y))
         pygame.display.flip()
 
+    def _capture_requested_scene_preview(self):
+        """Server isterse güncel canvası bir kez küçültüp ağ threadine teslim et."""
+        request_token = self.net_client.consume_scene_screenshot_request()
+        if not request_token:
+            return
+        try:
+            source = self.canvas
+            max_width, max_height = 960, 540
+            ratio = min(
+                1.0,
+                max_width / max(1, source.get_width()),
+                max_height / max(1, source.get_height()),
+            )
+            if ratio < 0.999:
+                size = (
+                    max(1, round(source.get_width() * ratio)),
+                    max(1, round(source.get_height() * ratio)),
+                )
+                source = pygame.transform.scale(source, size)
+            buffer = io.BytesIO()
+            pygame.image.save(source, buffer, "client-preview.png")
+            self.net_client.submit_scene_screenshot(request_token, buffer.getvalue())
+        except (pygame.error, OSError, ValueError) as exc:
+            if self.config.debug:
+                print(f"[Client] Önizleme görüntüsü alınamadı: {exc}")
     def _handle_events(self):
         """Pygame event'lerini işle"""
         for event in pygame.event.get():
@@ -457,6 +612,56 @@ class ThiefGame:
                     progress = (elapsed - fade_start) / fade_duration
                     self.thief_alpha = int(255 * (1.0 - progress))
 
+    def _update_countdown(self, dt: float):
+        """Sunucudan gelen sahne değişimini gösteriye dönüştür."""
+        status = self.net_client.get_countdown_status()
+        active = status["active"]
+        message = status["message"]
+        now = pygame.time.get_ticks()
+
+        if active and message and message != self.countdown_display_message:
+            self._start_countdown_stage(message, now)
+        elif (
+            self.countdown_was_active
+            and not active
+            and self.net_client.server_game_active
+        ):
+            self._start_countdown_stage("BAŞLA!", now, duration_ms=750)
+        elif not active and not self.net_client.server_game_active:
+            self.countdown_display_message = None
+            self.countdown_confetti.clear()
+
+        self.countdown_was_active = active
+        self.countdown_confetti = [
+            piece for piece in self.countdown_confetti if piece.update(dt)
+        ]
+
+        if (
+            not active
+            and self.countdown_display_message != "BAŞLA!"
+            and now >= self.countdown_display_until
+        ):
+            self.countdown_display_message = None
+
+    def _start_countdown_stage(
+        self,
+        message: str,
+        now: int,
+        duration_ms: int = 1150,
+    ):
+        self.countdown_display_message = message
+        self.countdown_stage_start = now
+        self.countdown_display_until = now + duration_ms
+
+        count = 82 if message == "HIRSIZLARI VUR" else 58
+        if self.scene_renderer.ready:
+            return
+        origin_y = int(self.view_h * (0.58 if message == "HIRSIZLARI VUR" else 0.52))
+        for _ in range(count):
+            self.countdown_confetti.append(
+                Confetti(self.view_w // 2, origin_y, spread=1.15)
+            )
+
     # ---------------------------------------------------------------- draw
     def _draw(self):
         """Oynanabilir alanı (canvas) çiz"""
@@ -475,9 +680,55 @@ class ThiefGame:
         else:
             self.canvas.fill(self.bg_color)
 
+        if self.scene_renderer.ready and self.scene_renderer.preview_scene:
+            self.scene_renderer.draw(
+                self.canvas,
+                self.scene_renderer.preview_scene,
+                self._scene_context(),
+                restart_token=self.scene_renderer.version or "",
+                resolve_rules=False,
+            )
+            if self.config.debug:
+                self._draw_debug(shake_x, shake_y)
+            return
+
+        jail_scene_active = (
+            self.net_client.server_game_active
+            and self.net_client.server_screen_complete
+            and self.net_client.server_scene == "jail"
+        )
+        if jail_scene_active:
+            if not self.scene_renderer.draw(
+                self.canvas,
+                "jail",
+                self._scene_context(),
+            ):
+                self._draw_idle(shake_x, shake_y)
+            if self.config.debug:
+                self._draw_debug(shake_x, shake_y)
+            return
+
+        result_scene_active = (
+            not self.net_client.server_game_active
+            and self.net_client.server_scene in ("win", "lose")
+        )
+
+        # Sonuç sahnesi lokal hırsız animasyonunu beklemeden hemen görünür.
+        if result_scene_active:
+            if not self.scene_renderer.draw(
+                self.canvas,
+                self.net_client.server_scene,
+                self._scene_context(),
+            ):
+                self._draw_idle(shake_x, shake_y)
         # IDLE durumunda ve oyun aktif değilse bekleme mesajı göster
-        if self.game.is_idle() and not self.net_client.server_game_active:
-            self._draw_idle(shake_x, shake_y)
+        elif self.game.is_idle() and not self.net_client.server_game_active:
+            if not self.scene_renderer.draw(
+                self.canvas,
+                "waiting",
+                self._scene_context(),
+            ):
+                self._draw_idle(shake_x, shake_y)
         else:
             if self.config.band_enabled:
                 self._draw_band(shake_x, shake_y)
@@ -493,18 +744,45 @@ class ThiefGame:
             for t in self.floating_texts:
                 t.draw(self.canvas, shake_x, shake_y)
 
-        self._draw_score(shake_x, shake_y)
+        if self.net_client.server_game_active and self.scene_renderer.ready:
+            self.scene_renderer.draw(
+                self.canvas,
+                "gameplay",
+                self._scene_context(),
+            )
+        elif not self.scene_renderer.ready:
+            self._draw_score(shake_x, shake_y)
         self._draw_hit_flash(shake_x, shake_y)
+        self._draw_countdown()
 
         if self.config.debug:
             self._draw_debug(shake_x, shake_y)
 
     def _draw_idle(self, offset_x=0, offset_y=0):
-        """IDLE durumunda bekleme mesajı"""
-        text = self.idle_surface
-        x = (self.view_w - text.get_width()) // 2 + offset_x
-        y = (self.view_h - text.get_height()) // 2 + offset_y
-        self.canvas.blit(text, (x, y))
+        """IDLE durumunda temalı, canlı bekleme kartı."""
+        card = self.idle_card_surface
+        x = (self.view_w - card.get_width()) // 2 + offset_x
+        y = (self.view_h - card.get_height()) // 2 + offset_y
+        pulse = (math.sin(pygame.time.get_ticks() * 0.004) + 1.0) * 0.5
+        glow = tuple(
+            int(self.theme_red[i] * (1.0 - pulse) + self.theme_purple[i] * pulse)
+            for i in range(3)
+        )
+        border_rect = pygame.Rect(x - 8, y - 8, card.get_width() + 16, card.get_height() + 16)
+        pygame.draw.rect(self.canvas, glow, border_rect, width=6, border_radius=28)
+        self.canvas.blit(card, (x, y))
+
+        dot_y = y + card.get_height() - 34
+        active_dot = (pygame.time.get_ticks() // 380) % 3
+        for index in range(3):
+            radius = 9 if index == active_dot else 6
+            color = self.theme_red if index == active_dot else self.theme_purple
+            pygame.draw.circle(
+                self.canvas,
+                color,
+                (self.view_w // 2 + (index - 1) * 30 + offset_x, dot_y),
+                radius,
+            )
 
     def _draw_band(self, offset_x=0, offset_y=0):
         """Hedef bandını çiz"""
@@ -585,15 +863,270 @@ class ThiefGame:
             self.canvas.blit(frame, (x, y))
 
     def _draw_score(self, offset_x=0, offset_y=0):
-        """Skoru çiz"""
-        if self._score_surface_value != self.game.score:
-            self.score_surface = self.font.render(f"Skor: {self.game.score}", True, self.text_color)
-            self._score_surface_value = self.game.score
+        """Skoru temalı kart içinde çiz."""
+        score_key = (self.game.score, self.game.combo)
+        if self._score_surface_value != score_key:
+            self.score_surface = self._build_score_card(
+                self.game.score,
+                self.game.combo,
+            )
+            self._score_surface_value = score_key
 
-        score_text = self.score_surface
-        x = self.view_w - score_text.get_width() - 20 + offset_x
-        y = 20 + offset_y
-        self.canvas.blit(score_text, (x, y))
+        x = self.view_w - self.score_surface.get_width() - 24 + offset_x
+        y = 24 + offset_y
+        shadow_rect = pygame.Rect(
+            x + 7,
+            y + 8,
+            self.score_surface.get_width(),
+            self.score_surface.get_height(),
+        )
+        pygame.draw.rect(
+            self.canvas,
+            self.theme_purple_dark,
+            shadow_rect,
+            border_radius=18,
+        )
+        self.canvas.blit(self.score_surface, (x, y))
+
+    def _theme_font(self, size: int, bold: bool = False):
+        return pygame.font.SysFont(
+            "dejavusans,arial,freesans",
+            int(size),
+            bold=bold,
+        )
+
+    @staticmethod
+    def _outlined_text(font, text, fill, outline, width=4):
+        base = font.render(text, True, fill)
+        surface = pygame.Surface(
+            (base.get_width() + width * 2, base.get_height() + width * 2),
+            pygame.SRCALPHA,
+        )
+        edge = font.render(text, True, outline)
+        for dx, dy in (
+            (-width, 0),
+            (width, 0),
+            (0, -width),
+            (0, width),
+            (-width, -width),
+            (-width, width),
+            (width, -width),
+            (width, width),
+        ):
+            surface.blit(edge, (width + dx, width + dy))
+        surface.blit(base, (width, width))
+        return surface
+
+    def _build_idle_card(self):
+        width = min(int(self.view_w * 0.78), 920)
+        height = max(190, min(int(self.view_h * 0.34), 320))
+        card = pygame.Surface((width, height), pygame.SRCALPHA)
+        pygame.draw.rect(
+            card,
+            self.theme_yellow,
+            card.get_rect(),
+            border_radius=24,
+        )
+        pygame.draw.rect(
+            card,
+            self.theme_purple,
+            card.get_rect(),
+            width=7,
+            border_radius=24,
+        )
+        pygame.draw.rect(
+            card,
+            self.theme_red,
+            (12, 12, width - 24, height - 24),
+            width=3,
+            border_radius=17,
+        )
+
+        title = self._outlined_text(
+            self.idle_title_font,
+            "OYUN BEKLENİYOR",
+            self.theme_red,
+            self.theme_purple,
+            width=3,
+        )
+        subtitle = self.idle_subtitle_font.render(
+            "HAZIR OL  •  HIRSIZLAR YAKINDA",
+            True,
+            self.theme_purple,
+        )
+        card.blit(title, ((width - title.get_width()) // 2, 34))
+        card.blit(
+            subtitle,
+            ((width - subtitle.get_width()) // 2, 50 + title.get_height()),
+        )
+        return card
+
+    def _build_score_card(self, score: int, combo: int):
+        width = max(190, min(310, self.view_w // 4))
+        height = max(105, min(150, self.view_h // 6))
+        card = pygame.Surface((width, height), pygame.SRCALPHA)
+        pygame.draw.rect(
+            card,
+            self.theme_yellow,
+            card.get_rect(),
+            border_radius=18,
+        )
+        pygame.draw.rect(
+            card,
+            self.theme_purple,
+            card.get_rect(),
+            width=5,
+            border_radius=18,
+        )
+        label = self.score_label_font.render(
+            "YAKALANAN",
+            True,
+            self.theme_purple,
+        )
+        number = self._outlined_text(
+            self.score_number_font,
+            str(score),
+            self.theme_red,
+            self.theme_white,
+            width=2,
+        )
+        card.blit(label, (18, 12))
+        card.blit(number, (18, height - number.get_height() - 10))
+
+        if combo > 1:
+            combo_text = self.score_label_font.render(
+                f"{combo}x KOMBO",
+                True,
+                self.theme_white,
+            )
+            badge = pygame.Rect(
+                width - combo_text.get_width() - 24,
+                height - combo_text.get_height() - 22,
+                combo_text.get_width() + 14,
+                combo_text.get_height() + 8,
+            )
+            pygame.draw.rect(card, self.theme_red, badge, border_radius=10)
+            card.blit(combo_text, (badge.x + 7, badge.y + 4))
+        return card
+
+    def _build_countdown_card(self, message: str):
+        width = min(int(self.view_w * 0.72), 980)
+        height = min(int(self.view_h * 0.55), 560)
+        card = pygame.Surface((width, height), pygame.SRCALPHA)
+        pygame.draw.rect(
+            card,
+            self.theme_yellow,
+            card.get_rect(),
+            border_radius=34,
+        )
+        pygame.draw.rect(
+            card,
+            self.theme_purple,
+            card.get_rect(),
+            width=12,
+            border_radius=34,
+        )
+        pygame.draw.rect(
+            card,
+            self.theme_red,
+            (18, 18, width - 36, height - 36),
+            width=5,
+            border_radius=23,
+        )
+
+        if message == "HIRSIZLARI VUR":
+            lines = ("HIRSIZLARI", "VUR")
+            font = self.countdown_title_font
+            gap = 0
+        else:
+            lines = (message,)
+            font = (
+                self.countdown_go_font
+                if message == "BAŞLA!"
+                else self.countdown_number_font
+            )
+            gap = 0
+
+        rendered = [
+            self._outlined_text(
+                font,
+                line,
+                self.theme_red,
+                self.theme_purple,
+                width=max(4, font.get_height() // 25),
+            )
+            for line in lines
+        ]
+        total_height = sum(item.get_height() for item in rendered) + gap
+        y = (height - total_height) // 2
+        for item in rendered:
+            card.blit(item, ((width - item.get_width()) // 2, y))
+            y += item.get_height() + gap
+        return card
+
+    def _draw_countdown(self):
+        message = self.countdown_display_message
+        now = pygame.time.get_ticks()
+        if not message or now >= self.countdown_display_until:
+            return
+
+        scene_id = "intro" if message == "HIRSIZLARI VUR" else "countdown"
+        if self.scene_renderer.draw(
+            self.canvas,
+            scene_id,
+            self._scene_context(countdown=message),
+            restart_token=message,
+        ):
+            return
+
+        self.canvas.blit(self.countdown_dim_surface, (0, 0))
+
+        for piece in self.countdown_confetti:
+            piece.draw(self.canvas)
+
+        card = self.countdown_card_cache.get(message)
+        if card is None:
+            card = self._build_countdown_card(message)
+            self.countdown_card_cache[message] = card
+
+        elapsed = max(0, now - self.countdown_stage_start)
+        progress = min(1.0, elapsed / 920.0)
+        eased = 1.0 - pow(1.0 - progress, 3)
+        scale = 0.62 + eased * 0.5 + math.sin(progress * math.pi * 4) * 0.025
+        scaled_size = (
+            max(1, int(card.get_width() * scale)),
+            max(1, int(card.get_height() * scale)),
+        )
+        # Kısa introda her kare ölçeklenir; normal scale Pi Zero'da smoothscale'den
+        # belirgin biçimde daha ucuzdur ve çizgi roman görünümüne de uyar.
+        scaled = pygame.transform.scale(card, scaled_size)
+        self.canvas.blit(
+            scaled,
+            (
+                (self.view_w - scaled.get_width()) // 2,
+                (self.view_h - scaled.get_height()) // 2,
+            ),
+        )
+
+    def _scene_context(self, countdown=None):
+        """Sahne metinlerindeki dinamik değişkenlerin anlık değerleri."""
+        remaining = max(0, self.net_client.server_remaining_seconds)
+        return {
+            "score": self.net_client.server_total_score,
+            "combo": self.game.combo,
+            "countdown": countdown or self.countdown_display_message or "3",
+"target_score": self.net_client.server_target_score,
+            "screen_score": self.net_client.server_screen_score,
+            "screen_target": self.net_client.server_screen_target,
+            "screen_remaining": self.net_client.server_screen_remaining,
+            "screen_complete": self.net_client.server_screen_complete,
+            "remaining_time": f"{remaining // 60:02d}:{remaining % 60:02d}",
+            "remaining_seconds": remaining,
+            "hit_count": self.game.score,
+            "game_active": self.net_client.server_game_active,
+            "active_scene": self.net_client.server_scene,
+            "screen_id": self.config.screen_id,
+        }
 
     def _draw_hit_flash(self, offset_x=0, offset_y=0):
         """Hit flash (Polis Sireni) efekti çiz"""

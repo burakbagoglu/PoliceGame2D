@@ -7,15 +7,22 @@ import json
 import os
 import time
 import threading
+import base64
+import binascii
 from datetime import datetime
-from typing import Dict, Set, Optional, Literal
+from typing import Any, Dict, Set, Optional, Literal
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 from audio_manager import AudioManager
+from scene_manager import (
+    SceneManager, SceneRevisionConflict, SceneValidationError,
+)
+from scene_audio_runtime import SceneAudioRuntime
+from client_telemetry import ClientTelemetryStore
 from spawn_engine import (
     TargetCalculator,
     ScreenSelector,
@@ -41,13 +48,18 @@ def load_config(filepath: str = "config.json") -> dict:
         config = {
             "host": "0.0.0.0",
             "port": 8078,
-            "num_screens": 12,
-            "game_duration_minutes": 45,
+            "num_screens": 8,
+            "game_duration_minutes": 35,
             "base_score_per_child": 15,
+            "hits_per_child_per_screen": 6,
+            "minimum_hits_per_screen": 12,
             "base_spawn_interval": 3.0,
             "min_spawn_interval": 0.5,
             "max_spawn_interval": 8.0,
             "max_concurrent_spawns": 3,
+            "countdown_seconds": 4,
+            "result_scene_seconds": 8,
+            "client_offline_after_seconds": 15,
             "default_piezo_threshold": 100,
             "default_piezo_refractory_ms": 200,
             "audio": {
@@ -64,7 +76,9 @@ def load_config(filepath: str = "config.json") -> dict:
                 "hit_sound_file": "",
                 "start_sound_file": "",
                 "success_sound_file": "",
-                "end_sound_file": ""
+                "end_sound_file": "",
+                "countdown_sound_file": "",
+                "go_sound_file": "",
             },
             "debug": False,
             "access_log": False,
@@ -78,6 +92,8 @@ def load_config(filepath: str = "config.json") -> dict:
 
 
 CONFIG = load_config()
+GAME_SCREEN_COUNT = 8
+CONFIG["num_screens"] = GAME_SCREEN_COUNT
 
 
 # ============== Models ==============
@@ -85,7 +101,7 @@ CONFIG = load_config()
 class ScoreEvent(BaseModel):
     """Client'tan gelen skor eventi"""
     event_id: str = Field(min_length=1, max_length=128)
-    screen_id: int = Field(ge=1, le=CONFIG.get("num_screens", 12))
+    screen_id: int = Field(ge=1, le=GAME_SCREEN_COUNT)
     points: int = Field(ge=1, le=100)
     ts_ms: int = Field(gt=0)
 
@@ -100,15 +116,16 @@ class ScoreResponse(BaseModel):
 
 
 class StartGameRequest(BaseModel):
-    """Oyun başlatma isteği"""
-    child_count: int = Field(ge=1, le=100)
-    screen_count: int = Field(
-        default=12,
+    """Oyun başlatma isteği; alanlar seçilen profilin üzerine yazabilir."""
+    profile_id: Optional[str] = Field(default=None, min_length=1, max_length=40)
+    child_count: Optional[int] = Field(default=None, ge=1, le=100)
+    screen_count: Optional[int] = Field(
+        default=None,
         ge=1,
-        le=CONFIG.get("num_screens", 12),
+        le=GAME_SCREEN_COUNT,
     )
-    difficulty: Literal["easy", "normal", "hard"] = "normal"
-    duration_minutes: int = Field(default=20, ge=1, le=120)
+    difficulty: Optional[Literal["easy", "normal", "hard"]] = None
+    duration_minutes: Optional[int] = Field(default=None, ge=1, le=120)
 
 
 class PiezoConfigRequest(BaseModel):
@@ -127,7 +144,49 @@ class AudioConfigRequest(BaseModel):
 
 class AudioTestRequest(BaseModel):
     """Dashboard ses test komutu."""
-    sound_type: Literal["hit", "start", "success", "end", "music"]
+    sound_type: Literal["hit", "start", "success", "end", "go", "music"]
+
+
+class SceneDraftRequest(BaseModel):
+    document: Dict[str, Any]
+    base_revision: Optional[int] = Field(default=None, ge=1)
+
+
+class ScenePreviewRequest(BaseModel):
+    screen_id: int = Field(ge=1, le=GAME_SCREEN_COUNT)
+    scene_id: str = Field(min_length=1, max_length=40)
+
+
+class SceneAssetRequest(BaseModel):
+    filename: str = Field(min_length=1, max_length=180)
+    data_base64: str = Field(min_length=1, max_length=22_000_000)
+    optimize: bool = True
+
+
+class ClientTelemetryRequest(BaseModel):
+    screen_id: int = Field(ge=1, le=GAME_SCREEN_COUNT)
+    fps: float = Field(default=0, ge=0, le=240)
+    memory_mb: float = Field(default=0, ge=0)
+    cpu_temp_c: Optional[float] = None
+    uptime_seconds: int = Field(default=0, ge=0)
+    scene_version: str = Field(default="", max_length=80)
+    active_scene: str = Field(default="", max_length=40)
+    network_connected: bool = False
+    serial_connected: bool = False
+    events_failed: int = Field(default=0, ge=0)
+    queue_depth: int = Field(default=0, ge=0)
+    app_version: str = Field(default="", max_length=40)
+    piezo: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SceneScreenshotRequest(BaseModel):
+    screen_id: int = Field(ge=1, le=GAME_SCREEN_COUNT)
+
+
+class SceneScreenshotUpload(BaseModel):
+    screen_id: int = Field(ge=1, le=GAME_SCREEN_COUNT)
+    request_token: str = Field(min_length=8, max_length=128)
+    data_base64: str = Field(min_length=1, max_length=6_000_000)
 
 
 # ============== Score Manager ==============
@@ -211,7 +270,7 @@ class ScoreManager:
 
 # ============== Global Instances ==============
 
-score_manager = ScoreManager(num_screens=CONFIG.get("num_screens", 12))
+score_manager = ScoreManager(num_screens=GAME_SCREEN_COUNT)
 target_calculator = TargetCalculator(
     base_score_per_child=CONFIG.get("base_score_per_child", 15)
 )
@@ -223,9 +282,20 @@ audio_manager = AudioManager(
     config=CONFIG.get("audio", {}),
     base_dir=os.path.dirname(os.path.abspath(__file__)),
 )
+scene_manager = SceneManager(
+    os.environ.get(
+        "THIEF_SCENE_DATA_DIR",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "scene_data"),
+    )
+)
+client_telemetry = ClientTelemetryStore(
+    offline_after_seconds=CONFIG.get("client_offline_after_seconds", 15)
+)
 
 # Spawn scheduler (oyun başlatılınca oluşturulur)
 spawn_scheduler: Optional[SpawnScheduler] = None
+result_scene: Optional[str] = None
+result_scene_until = 0.0
 
 # Global aktif ekran takibi (oyun başlamadan ÖNCE de kaydeder)
 import time as _time
@@ -239,21 +309,21 @@ active_polling_lock = threading.RLock()
 async def lifespan(app: FastAPI):
     audio_ready = audio_manager.initialize()
     print("=" * 50)
-    print("🎮 Thief Server Başlatıldı!")
-    print(f"📍 http://{CONFIG['host']}:{CONFIG['port']}")
-    print(f"📺 Ekran sayısı: {CONFIG['num_screens']}")
+    print("Thief Server başlatıldı")
+    print(f"Adres: http://{CONFIG['host']}:{CONFIG['port']}")
+    print(f"Ekran sayısı: {CONFIG['num_screens']}")
     audio_status = audio_manager.get_status()
     if audio_ready:
-        print(f"🔊 Ses cihazı: {audio_status['device_active']}")
+        print(f"Ses cihazı: {audio_status['device_active']}")
     else:
-        print(f"🔇 Ses devre dışı: {audio_status['last_error'] or 'kapalı'}")
+        print(f"Ses devre dışı: {audio_status['last_error'] or 'kapalı'}")
     print("=" * 50)
     yield
     global spawn_scheduler
     if spawn_scheduler:
         spawn_scheduler.stop()
     audio_manager.shutdown()
-    print("\n🛑 Thief Server Kapatıldı")
+    print("\nThief Server kapatıldı")
 
 
 app = FastAPI(
@@ -268,34 +338,141 @@ app = FastAPI(
 
 def _on_session_end(reason: str):
     """Süre/hedef nedeniyle otomatik biten oyunun sesini yönet."""
+    _show_result_scene("win" if reason == "target" else "lose")
     audio_manager.end_game(completed=(reason == "target"))
 
+
+def _show_result_scene(scene_id: Optional[str]):
+    """Oyun sonucu sahnesini ayarlanan süre boyunca görünür tut."""
+    global result_scene, result_scene_until
+    result_scene = scene_id
+    result_scene_until = (
+        _time.time() + float(CONFIG.get("result_scene_seconds", 8))
+        if scene_id
+        else 0.0
+    )
+
+
+def _runtime_scene() -> str:
+    if result_scene and _time.time() < result_scene_until:
+        return result_scene
+    return "waiting"
+
+
+def _play_scene_audio_cue(cue: dict) -> bool:
+    asset_name = str(cue.get("asset", ""))
+    asset_path = scene_manager.resolve_asset(asset_name) if asset_name else None
+    return audio_manager.play_scene_cue(
+        sound_name=str(cue.get("sound", "")),
+        asset_path=str(asset_path) if asset_path else None,
+        volume=float(cue.get("volume", 1.0)),
+        loop=bool(cue.get("loop", False)),
+        fade_in_ms=int(cue.get("fade_in_ms", 0) or 0),
+        fade_out_ms=int(cue.get("fade_out_ms", 0) or 0),
+        max_duration_ms=int(cue.get("max_duration_ms", 0) or 0),
+        pan=float(cue.get("pan", 0) or 0),
+    )
+
+
+scene_audio_runtime = SceneAudioRuntime(
+    play_cue=_play_scene_audio_cue,
+    stop_loops=audio_manager.stop_scene_audio,
+)
+
+
+def _resolve_server_rule_scene(base_scene: str, document: dict, remaining_seconds: int, game_active: bool) -> str:
+    scores = score_manager.get_scores()
+    rules = sorted(document.get("rules", []), key=lambda item: float(item.get("priority", 0)), reverse=True)
+    for rule in rules:
+        scene_id = str(rule.get("scene_id", ""))
+        if not rule.get("enabled", True) or scene_id not in document.get("scenes", {}):
+            continue
+        event = str(rule.get("event", "always"))
+        value = float(rule.get("value", 0) or 0)
+        matched = (
+            event == "always"
+            or (event == "win" and base_scene == "win")
+            or (event == "lose" and base_scene == "lose")
+            or (event == "game_active" and game_active == bool(rule.get("boolean", True)))
+            or (event == "score_gte" and scores.total_score >= value)
+            or (event == "score_lte" and scores.total_score <= value)
+            or (event == "time_lte" and remaining_seconds <= value)
+            or (event == "time_gte" and remaining_seconds >= value)
+            or (event == "hit_gte" and scores.event_count >= value)
+        )
+        if matched:
+            return scene_id
+    return base_scene
+
+
+def _tick_scene_audio(scene_id: str, remaining_seconds: int = 0, game_active: bool = False):
+    document = scene_manager.get_published_document()
+    resolved_scene = _resolve_server_rule_scene(scene_id, document, remaining_seconds, game_active)
+    scene_audio_runtime.tick(resolved_scene, document)
+
+def _on_countdown_tick(message: str):
+    """Merkezi hoparlörde intro ve 3-2-1 seslerini çal."""
+    if message == "HIRSIZLARI VUR":
+        audio_manager.begin_countdown()
+        return
+    try:
+        audio_manager.play_countdown(int(message))
+    except ValueError:
+        pass
+
+
+def _on_gameplay_start():
+    """Sayım tamamlanınca müziği ve başlangıç efektini aç."""
+    audio_manager.begin_gameplay()
+
+
+@app.get("/api/game/profiles")
+async def game_profiles():
+    """Yayınlanmış, sahada güvenle kullanılabilecek oyun profilleri."""
+    return {"profiles": scene_manager.get_published_document().get("game_profiles", {})}
 
 @app.post("/api/game/start")
 async def start_game(req: StartGameRequest):
     """Yeni oyun başlat"""
     global spawn_scheduler
+    _show_result_scene(None)
+    scene_audio_runtime.reset()
 
     # Önceki oyunu durdur
     if spawn_scheduler:
         spawn_scheduler.stop()
 
-    # Hedef hesapla
-    duration = req.duration_minutes or CONFIG.get("game_duration_minutes", 20)
-    target_info = target_calculator.calculate(req.child_count, req.difficulty, duration)
-    target_score = target_info['total_target']
+    # Profil varsayılanlarını çöz; istekte verilen alanlar profili ezer.
+    profiles = scene_manager.get_published_document().get("game_profiles", {})
+    profile = profiles.get(req.profile_id, {}) if req.profile_id else {}
+    if req.profile_id and not profile:
+        raise HTTPException(status_code=404, detail="Oyun profili bulunamadı")
+    child_count = req.child_count or int(profile.get("child_count", 3))
+    screen_count = GAME_SCREEN_COUNT
+    difficulty = req.difficulty or profile.get("difficulty", "normal")
+    duration = req.duration_minutes or int(profile.get("duration_minutes", CONFIG.get("game_duration_minutes", 35)))
+    target_info = target_calculator.calculate_screen_quotas(
+        child_count=child_count,
+        difficulty=difficulty,
+        duration_minutes=duration,
+        screen_count=screen_count,
+        hits_per_child_per_screen=float(CONFIG.get("hits_per_child_per_screen", 6)),
+        minimum_per_screen=int(CONFIG.get("minimum_hits_per_screen", 12)),
+    )
+    target_score = target_info["total_target"]
 
     # Oturum oluştur
     total_secs = duration * 60
     session = GameSession(
-        child_count=req.child_count,
+        child_count=child_count,
         target_score=target_score,
-        screen_count=req.screen_count,
+        screen_count=screen_count,
         total_seconds=total_secs,
+        screen_targets=target_info["screen_targets"],
     )
 
     # Kontrolcüleri oluştur
-    screen_selector = ScreenSelector(req.screen_count)
+    screen_selector = ScreenSelector(screen_count)
     adaptive = AdaptiveSpawnController(
         base_spawn_interval=CONFIG.get("base_spawn_interval", 3.0),
         min_spawn_interval=CONFIG.get("min_spawn_interval", 0.5),
@@ -312,6 +489,8 @@ async def start_game(req: StartGameRequest):
         phase_spawner=phase_spawner,
         debug=CONFIG.get("debug", False),
         on_session_end=_on_session_end,
+        on_countdown_tick=_on_countdown_tick,
+        on_gameplay_start=_on_gameplay_start,
     )
 
     # Oyun başlamadan önce poll yapan ekranları hemen kaydet
@@ -320,7 +499,7 @@ async def start_game(req: StartGameRequest):
         active_snapshot = [
             (sid, last_t)
             for sid, last_t in active_polling_screens.items()
-            if 1 <= sid <= req.screen_count and last_t >= active_cutoff
+            if 1 <= sid <= screen_count and last_t >= active_cutoff
         ]
     for sid, last_t in active_snapshot:
         spawn_scheduler._active_screens[sid] = last_t
@@ -328,24 +507,28 @@ async def start_game(req: StartGameRequest):
     if CONFIG.get("debug"):
         print(f"[Game] Kayıtlı aktif ekranlar: {[sid for sid, _ in active_snapshot]}")
 
-    spawn_scheduler.start()
-    audio_manager.start_game()
-
     # Skorları sıfırla
     score_manager.reset()
     if spawn_scheduler:
         spawn_scheduler.reset_score()
 
+    countdown_seconds = CONFIG.get("countdown_seconds", 4)
+    spawn_scheduler.start(countdown_seconds=countdown_seconds)
+
     if CONFIG.get("debug"):
-        print(f"[Game] Oyun başlatıldı! Çocuk: {req.child_count}, Hedef: {target_score}")
+        print(f"[Game] Oyun başlatıldı! Çocuk: {child_count}, Hedef: {target_score}")
 
     return {
         "success": True,
         "target_score": target_score,
-        "child_count": req.child_count,
-        "screen_count": req.screen_count,
-        "difficulty": req.difficulty,
+        "per_screen_target": target_info["per_screen_target"],
+        "screen_targets": target_info["screen_targets"],
+        "profile_id": req.profile_id,
+        "child_count": child_count,
+        "screen_count": screen_count,
+        "difficulty": difficulty,
         "game_duration_minutes": duration,
+        "countdown_seconds": countdown_seconds,
     }
 
 
@@ -370,7 +553,8 @@ async def end_game():
         final_score = status["current_score"]
         target = status["target_score"]
         spawn_scheduler.stop()
-        completed = final_score >= target
+        completed = bool(status.get("all_screens_complete"))
+        _show_result_scene("win" if completed else "lose")
         audio_manager.end_game(completed=completed)
 
         if CONFIG.get("debug"):
@@ -390,7 +574,7 @@ async def end_game():
 
 @app.get("/spawn/poll")
 async def spawn_poll(
-    screen_id: int = Query(..., ge=1, le=CONFIG.get("num_screens", 12))
+    screen_id: int = Query(..., ge=1, le=GAME_SCREEN_COUNT)
 ):
     """Client spawn kontrolü"""
     # Ekranı GLOBAL olarak kaydet (oyun başlamadan önce de)
@@ -398,68 +582,100 @@ async def spawn_poll(
         active_polling_screens[screen_id] = _time.time()
 
     if not spawn_scheduler:
+        active_scene = _runtime_scene()
+        _tick_scene_audio(active_scene, 0, False)
         return {
             "spawn": False,
             "game_active": False,
+            "active_scene": active_scene,
+            "total_score": score_manager.get_scores().total_score,
+            "target_score": 0,
+            "remaining_seconds": 0,
             "score_version": score_manager.get_scores().score_version,
         }
 
     scheduler_status = spawn_scheduler.get_status()
     if not scheduler_status["is_active"]:
+        active_scene = _runtime_scene()
+        remaining_seconds = max(
+            0,
+            scheduler_status["total_seconds"] - scheduler_status["elapsed_seconds"],
+        )
+        _tick_scene_audio(active_scene, remaining_seconds, False)
         return {
             "spawn": False,
             "game_active": False,
+            "active_scene": active_scene,
+            "total_score": score_manager.get_scores().total_score,
+            "target_score": scheduler_status["target_score"],
+            "remaining_seconds": max(
+                0,
+                scheduler_status["total_seconds"] - scheduler_status["elapsed_seconds"],
+            ),
             "score_version": score_manager.get_scores().score_version,
         }
 
-    if screen_id > spawn_scheduler.session.screen_count:
-        return {
-            "spawn": False,
-            "game_active": True,
-            "participating": False,
-            "score_version": score_manager.get_scores().score_version,
-        }
-
+    remaining_seconds = max(0, scheduler_status["total_seconds"] - scheduler_status["elapsed_seconds"])
     result = spawn_scheduler.poll_spawn(screen_id)
-    result["game_active"] = True
-    result["participating"] = True
-    result["score_version"] = score_manager.get_scores().score_version
-    return result
+    if result.get("screen_complete"):
+        active_scene = "jail"
+    elif scheduler_status["countdown_message"] == "HIRSIZLARI VUR":
+        active_scene = "intro"
+    elif scheduler_status["countdown_active"]:
+        active_scene = "countdown"
+    else:
+        active_scene = "gameplay"
 
+    # Jail ekranı clienta özeldir; merkezi ses diğer ekranlar için gameplay akışında kalır.
+    audio_scene = active_scene if active_scene in {"intro", "countdown", "gameplay"} else "gameplay"
+    _tick_scene_audio(audio_scene, remaining_seconds, True)
+    result.update({
+        "game_active": True,
+        "participating": True,
+        "active_scene": active_scene,
+        "phase": scheduler_status["phase"],
+        "countdown_active": scheduler_status["countdown_active"],
+        "countdown_message": scheduler_status["countdown_message"],
+        "countdown_remaining_ms": scheduler_status["countdown_remaining_ms"],
+        "total_score": scheduler_status["current_score"],
+        "target_score": scheduler_status["target_score"],
+        "remaining_seconds": remaining_seconds,
+        "score_version": score_manager.get_scores().score_version,
+    })
+    return result
 
 # ============== Score Endpoints ==============
 
 @app.post("/event")
 async def receive_event(event: ScoreEvent):
-    """Client'tan skor eventi al"""
-    if (
-        spawn_scheduler
-        and spawn_scheduler.session.is_active
-        and event.screen_id > spawn_scheduler.session.screen_count
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Ekran {event.screen_id} aktif oyun oturumuna dahil değil",
-        )
+    """Client vuruşunu yalnızca o ekranın kalan kotası kadar işle."""
+    if spawn_scheduler and spawn_scheduler.session.is_active:
+        if event.screen_id > spawn_scheduler.session.screen_count:
+            raise HTTPException(status_code=409, detail=f"Ekran {event.screen_id} aktif oyun oturumuna dahil değil")
+        before = spawn_scheduler.session.screen_status(event.screen_id)
+        if before["screen_complete"]:
+            return {"success": True, "is_new": False, "accepted_points": 0,
+                    "total_score": spawn_scheduler.session.current_score, **before}
+        accepted_points = min(event.points, before["screen_remaining"])
+        scored_event = event.model_copy(update={"points": accepted_points})
+    else:
+        accepted_points = event.points
+        scored_event = event
 
-    is_new = score_manager.process_event(event)
-
-    # Spawn scheduler'a da bildir
+    is_new = score_manager.process_event(scored_event)
+    quota_result = {}
     if is_new and spawn_scheduler and spawn_scheduler.session.is_active:
-        spawn_scheduler.update_score(event.points)
+        quota_result = spawn_scheduler.update_score(event.screen_id, accepted_points)
     if is_new:
         audio_manager.play_hit()
 
     if CONFIG.get("debug"):
         status = "✅ YENİ" if is_new else "⏭️ DUPLICATE"
-        print(f"[Event] {status} | Ekran {event.screen_id} | +{event.points} puan")
+        print(f"[Event] {status} | Ekran {event.screen_id} | +{accepted_points} puan")
 
-    return {
-        "success": True,
-        "is_new": is_new,
-        "total_score": score_manager.get_scores().total_score,
-    }
-
+    return {"success": True, "is_new": is_new, "accepted_points": accepted_points if is_new else 0,
+            "total_score": spawn_scheduler.session.current_score if spawn_scheduler else score_manager.get_scores().total_score,
+            **quota_result}
 
 @app.get("/score", response_model=ScoreResponse)
 async def get_score():
@@ -473,6 +689,7 @@ async def get_screen_score(screen_id: int):
     return {
         "screen_id": screen_id,
         "score": score_manager.get_screen_score(screen_id),
+        "quota": spawn_scheduler.session.screen_status(screen_id) if spawn_scheduler else None,
     }
 
 
@@ -540,7 +757,7 @@ async def get_piezo_config():
 
 @app.get("/api/piezo/config/poll")
 async def poll_piezo_config(
-    screen_id: int = Query(..., ge=1, le=CONFIG.get("num_screens", 12))
+    screen_id: int = Query(..., ge=1, le=GAME_SCREEN_COUNT)
 ):
     """Client piezo config polling"""
     result = piezo_config.poll(screen_id)
@@ -548,6 +765,19 @@ async def poll_piezo_config(
         return {"changed": True, **result}
     return {"changed": False}
 
+
+# ============== Client Telemetry Endpoints ==============
+
+@app.post("/api/clients/heartbeat")
+async def client_heartbeat(req: ClientTelemetryRequest):
+    """İstemci sağlık verisini RAM üzerinde güncelle; kalıcı disk yazımı yapma."""
+    return {"success": True, **client_telemetry.update(req.screen_id, req.model_dump())}
+
+
+@app.get("/api/clients/status")
+async def get_client_status():
+    """Dashboard için çevrimiçi istemci, FPS, sıcaklık ve piezo özetini getir."""
+    return client_telemetry.list(GAME_SCREEN_COUNT)
 
 # ============== Server Audio Endpoints ==============
 
@@ -578,6 +808,162 @@ async def test_audio(req: AudioTestRequest):
         "sound_type": req.sound_type,
         **audio_manager.get_status(),
     }
+
+
+# ============== Scene Editor API ==============
+
+@app.get("/api/scenes/editor")
+async def get_scene_editor_state():
+    """Editör için taslak, asset ve sürüm bilgisini döndür."""
+    return scene_manager.get_editor_state()
+
+
+@app.put("/api/scenes/draft")
+async def save_scene_draft(req: SceneDraftRequest):
+    """Sahne belgesini yayınlamadan, revizyon çakışmalarını önleyerek kaydet."""
+    try:
+        return scene_manager.save_draft(req.document, req.base_revision)
+    except SceneRevisionConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": str(exc), "server_revision": exc.actual},
+        ) from exc
+    except SceneValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/scenes/diff")
+async def diff_scene_draft():
+    """Taslak ile son yayın arasındaki güvenli yayın özetini döndür."""
+    return scene_manager.diff_summary()
+
+
+@app.get("/api/scenes/audit")
+async def audit_scene_draft():
+    """Yayın öncesi eksik asset ve performans uyarılarını döndür."""
+    return scene_manager.audit_document()
+
+
+@app.post("/api/scenes/publish")
+async def publish_scene_draft():
+    """Geçerli taslağı atomik olarak bütün clientlara yayınla."""
+    try:
+        return scene_manager.publish()
+    except SceneValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/api/scenes/rollback/{version}")
+async def rollback_scene_version(version: int):
+    """Eski yayın sürümünü güvenli biçimde taslağa geri yükle."""
+    try:
+        return scene_manager.rollback(version)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SceneValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/api/scenes/preview")
+async def set_scene_preview(req: ScenePreviewRequest):
+    """Bir taslak sahneyi yalnızca seçilen client ekranında göster."""
+    try:
+        scene_manager.set_preview(req.screen_id, req.scene_id)
+    except SceneValidationError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {
+        "success": True,
+        "screen_id": req.screen_id,
+        "scene_id": req.scene_id,
+    }
+
+
+@app.delete("/api/scenes/preview/{screen_id}")
+async def clear_scene_preview(screen_id: int):
+    """Seçilen ekranı taslak önizlemeden normal yayın akışına döndür."""
+    if screen_id < 1 or screen_id > GAME_SCREEN_COUNT:
+        raise HTTPException(status_code=422, detail="Geçersiz ekran ID")
+    scene_manager.clear_preview(screen_id)
+    return {"success": True, "screen_id": screen_id}
+
+
+@app.get("/api/scenes/client")
+async def get_client_scenes(
+    screen_id: int = Query(..., ge=1, le=GAME_SCREEN_COUNT),
+    known_version: str = Query("", max_length=80),
+):
+    """Clienta yalnızca sürüm değiştiğinde sahne belgesini ve asset manifestini ver."""
+    return scene_manager.get_client_payload(screen_id, known_version)
+
+
+@app.post("/api/scenes/screenshot/request")
+async def request_scene_screenshot(req: SceneScreenshotRequest):
+    """Seçilen clienttan tek seferlik gerçek Pygame görüntüsü iste."""
+    return scene_manager.request_client_screenshot(req.screen_id)
+
+
+@app.get("/api/scenes/screenshot/{screen_id}/status")
+async def get_scene_screenshot_status(
+    screen_id: int,
+):
+    if screen_id < 1 or screen_id > GAME_SCREEN_COUNT:
+        raise HTTPException(status_code=422, detail="Geçersiz ekran ID")
+    return scene_manager.get_client_screenshot_status(screen_id)
+
+
+@app.post("/api/scenes/screenshot/upload")
+async def upload_scene_screenshot(req: SceneScreenshotUpload):
+    """Clientın talep üzerine yakaladığı PNG/JPEG görüntüsünü al."""
+    try:
+        content = base64.b64decode(req.data_base64, validate=True)
+        return scene_manager.save_client_screenshot(
+            req.screen_id,
+            req.request_token,
+            content,
+        )
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/scenes/screenshot/{screen_id}")
+async def get_scene_screenshot(screen_id: int):
+    if screen_id < 1 or screen_id > GAME_SCREEN_COUNT:
+        raise HTTPException(status_code=422, detail="Geçersiz ekran ID")
+    screenshot_path = scene_manager.resolve_client_screenshot(screen_id)
+    if not screenshot_path:
+        raise HTTPException(status_code=404, detail="Client görüntüsü henüz yok")
+    media_type = "image/png" if screenshot_path.suffix.lower() == ".png" else "image/jpeg"
+    return FileResponse(screenshot_path, media_type=media_type)
+
+
+@app.post("/api/scenes/assets")
+async def upload_scene_asset(req: SceneAssetRequest):
+    """Editörden base64 kodlu görsel asset yükle."""
+    try:
+        content = base64.b64decode(req.data_base64, validate=True)
+        return scene_manager.save_asset(req.filename, content, optimize=req.optimize)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=f"Geçersiz asset: {exc}") from exc
+
+
+@app.get("/api/scene-assets/{filename}")
+async def get_scene_asset(filename: str):
+    """Yayınlanan/taslak sahnelerin görsel assetini sun."""
+    if filename == "__client_background__":
+        candidates = [
+            os.environ.get("THIEF_GAME_BACKGROUND", ""),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "thief_client", "assets", "bg", "bg.png"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "bg", "bg.png"),
+        ]
+        for candidate in candidates:
+            if candidate and os.path.isfile(candidate):
+                return FileResponse(os.path.abspath(candidate), media_type="image/png")
+        raise HTTPException(status_code=404, detail="Client background not found")
+
+    asset_path = scene_manager.resolve_asset(filename)
+    if not asset_path:
+        raise HTTPException(status_code=404, detail="Asset bulunamadı")
+    return FileResponse(asset_path)
 
 
 # ============== Dashboard ==============
@@ -704,8 +1090,16 @@ DASHBOARD_HTML = """
         }
 
         .phase-WARMUP { background: #3498db; }
+        .phase-COUNTDOWN {
+            background: #9b59b6;
+            animation: countdownPulse 0.7s infinite alternate;
+        }
         .phase-NORMAL { background: #2ecc71; }
         .phase-INTENSE { background: #e74c3c; }
+        @keyframes countdownPulse {
+            from { transform: scale(1); box-shadow: 0 0 0 rgba(255, 224, 56, 0); }
+            to { transform: scale(1.07); box-shadow: 0 0 16px rgba(255, 224, 56, 0.9); }
+        }
 
         /* === Screens Grid === */
         .screens {
@@ -1103,6 +1497,9 @@ DASHBOARD_HTML = """
 </head>
 <body>
     <div class="container">
+        <div style="display:flex;justify-content:flex-end;margin-bottom:10px;">
+            <a href="/scene-editor" style="background:#fbbf24;color:#111827;text-decoration:none;padding:10px 14px;border-radius:8px;font-weight:800;">🎨 Sahne Editörü</a>
+        </div>
         <h1>🎮 Hırsız Oyunu — Kontrol Paneli</h1>
 
         <div class="top-layout">
@@ -1120,17 +1517,17 @@ DASHBOARD_HTML = """
             <div class="card">
                 <h3>Hızlı Başlangıç</h3>
                 <div class="quick-starts">
-                    <button class="quick-card" onclick="quickStart(2, 5, 6, 'easy')">
+                    <button class="quick-card" onclick="quickStart(2, 8, 30, 'easy')">
                         <strong>Kısa Tur</strong>
-                        <span>2 çocuk · 5 ekran · 6 dk · Kolay</span>
+                        <span>2 çocuk · 8 ekran · 30 dk · Kolay</span>
                     </button>
-                    <button class="quick-card" onclick="quickStart(5, 12, 20, 'normal')">
+                    <button class="quick-card" onclick="quickStart(5, 8, 35, 'normal')">
                         <strong>Standart</strong>
-                        <span>5 çocuk · 12 ekran · 20 dk · Normal</span>
+                        <span>5 çocuk · 8 ekran · 35 dk · Normal</span>
                     </button>
-                    <button class="quick-card" onclick="quickStart(10, 12, 30, 'hard')">
+                    <button class="quick-card" onclick="quickStart(10, 8, 40, 'hard')">
                         <strong>Yoğun Mod</strong>
-                        <span>10 çocuk · 12 ekran · 30 dk · Zor</span>
+                        <span>10 çocuk · 8 ekran · 40 dk · Zor</span>
                     </button>
                 </div>
             </div>
@@ -1144,9 +1541,9 @@ DASHBOARD_HTML = """
                     <label>Çocuk:</label>
                     <input type="number" id="child-count" value="3" min="1" max="50">
                     <label>Ekran:</label>
-                    <input type="number" id="screen-count" value="12" min="1" max="20">
+                    <input type="number" id="screen-count" value="8" min="8" max="8" readonly title="Bu mimaride tüm 8 ekran daima aktiftir">
                     <label>Süre (dk):</label>
-                    <input type="number" id="duration-minutes" value="20" min="1" max="120">
+                    <input type="number" id="duration-minutes" value="35" min="1" max="120">
                     <label>Zorluk:</label>
                     <select id="difficulty">
                         <option value="easy">Kolay</option>
@@ -1283,6 +1680,19 @@ DASHBOARD_HTML = """
                 <div class="screens" id="screens"></div>
             </div>
 
+            <div class="card grid-full">
+                <h3>İstemci Sağlığı ve Piezo Kalibrasyonu</h3>
+                <div class="controls" style="margin-bottom:12px">
+                    <label>Ekran:</label>
+                    <select id="telemetry-screen" onchange="renderSelectedTelemetry()"></select>
+                    <button class="btn btn-blue" onclick="suggestPiezoThreshold()">Gürültüye göre eşik öner</button>
+                    <span id="telemetry-summary">İstemciler bekleniyor…</span>
+                </div>
+                <canvas id="piezo-chart" width="1000" height="150" style="width:100%;height:150px;background:#111827;border-radius:10px"></canvas>
+                <div class="screens" id="client-health" style="margin-top:12px"></div>
+                <p style="opacity:.72;margin-top:10px">Canlı grafik için Arduino seri hattından <code>PIEZO:123</code> veya <code>RAW:123</code> satırları gönderilmelidir. Öneri yalnızca sliderı değiştirir; Uygula düğmesine basılmadan cihazlara gönderilmez.</p>
+            </div>
+
             <!-- Son Olaylar -->
             <div class="card grid-full">
                 <h3>📜 Son Olaylar</h3>
@@ -1292,20 +1702,23 @@ DASHBOARD_HTML = """
     </div>
 
     <script>
-        let numScreens = 12;
+        const numScreens = 8;
         let lastEventCount = 0;
+        let gameProfiles = {};
 
         // === Ekran kartlarını oluştur ===
         function initScreenCards(count) {
-            numScreens = count || 12;
+            count = 8;
             const container = document.getElementById('screens');
             container.innerHTML = '';
             for (let i = 1; i <= numScreens; i++) {
                 container.innerHTML += `
-                    <div class="screen-card">
+                    <div class="screen-card" id="screen-${i}-card">
                         <h4>📺 Ekran ${i}</h4>
                         <div class="score" id="screen-${i}-score">0</div>
-                        <div class="spawn-pct" id="screen-${i}-pct">0%</div>
+                        <div class="spawn-pct" id="screen-${i}-quota">0 / — hırsız</div>
+                        <div class="spawn-pct" id="screen-${i}-state">Devam ediyor</div>
+                        <div class="spawn-pct" id="screen-${i}-pct">Spawn: 0%</div>
                     </div>
                 `;
             }
@@ -1328,9 +1741,21 @@ DASHBOARD_HTML = """
             });
         }
 
+        async function loadGameProfiles() {
+            try {
+                const response = await fetch('/api/game/profiles'); const data = await response.json(); gameProfiles = data.profiles || {};
+                const select = document.getElementById('game-profile');
+                select.innerHTML = '<option value="">Özel</option>' + Object.entries(gameProfiles).map(([id,p]) => `<option value="${id}">${p.name || id}</option>`).join('');
+            } catch (error) { console.error('Profiller yüklenemedi:', error); }
+        }
+        function applyGameProfile() {
+            const profile = gameProfiles[document.getElementById('game-profile').value]; if (!profile) return;
+            document.getElementById('child-count').value = profile.child_count; document.getElementById('screen-count').value = 8;
+            document.getElementById('duration-minutes').value = profile.duration_minutes; document.getElementById('difficulty').value = profile.difficulty;
+        }
         function quickStart(childCount, screenCount, durationMinutes, difficulty) {
             document.getElementById('child-count').value = childCount;
-            document.getElementById('screen-count').value = screenCount;
+            document.getElementById('screen-count').value = 8;
             document.getElementById('duration-minutes').value = durationMinutes;
             document.getElementById('difficulty').value = difficulty;
             startGame();
@@ -1339,15 +1764,17 @@ DASHBOARD_HTML = """
         // === Oyun başlat ===
         async function startGame() {
             const childCount = parseInt(document.getElementById('child-count').value) || 3;
-            const screenCount = parseInt(document.getElementById('screen-count').value) || 12;
-            const durationMinutes = parseInt(document.getElementById('duration-minutes').value) || 20;
+            const screenCount = 8;
+            const durationMinutes = parseInt(document.getElementById('duration-minutes').value) || 35;
             const difficulty = document.getElementById('difficulty').value;
+            const profileId = document.getElementById('game-profile').value || null;
 
             try {
                 const res = await fetch('/api/game/start', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({
+                        profile_id: profileId,
                         child_count: childCount,
                         screen_count: screenCount,
                         duration_minutes: durationMinutes,
@@ -1356,7 +1783,7 @@ DASHBOARD_HTML = """
                 });
                 const data = await res.json();
                 document.getElementById('target-score').textContent = data.target_score;
-                initScreenCards(screenCount);
+                initScreenCards(8);
             } catch (err) {
                 console.error('Oyun başlatma hatası:', err);
             }
@@ -1381,6 +1808,74 @@ DASHBOARD_HTML = """
             }
         }
 
+        let latestTelemetry = {clients: []};
+
+        function renderSelectedTelemetry() {
+            const screenId = parseInt(document.getElementById('telemetry-screen').value) || 1;
+            const client = latestTelemetry.clients.find(item => item.screen_id === screenId) || {piezo:{}};
+            const samples = client.piezo?.samples || [];
+            const canvas = document.getElementById('piezo-chart');
+            const chart = canvas.getContext('2d');
+            chart.clearRect(0, 0, canvas.width, canvas.height);
+            chart.fillStyle = '#111827'; chart.fillRect(0, 0, canvas.width, canvas.height);
+            const threshold = parseInt(document.getElementById('piezo-threshold').value) || 0;
+            const maxValue = Math.max(1023, threshold, ...samples, 1);
+            const thresholdY = canvas.height - threshold / maxValue * canvas.height;
+            chart.strokeStyle = '#ef4444'; chart.setLineDash([8, 6]); chart.beginPath();
+            chart.moveTo(0, thresholdY); chart.lineTo(canvas.width, thresholdY); chart.stroke(); chart.setLineDash([]);
+            if (samples.length) {
+                chart.strokeStyle = '#60a5fa'; chart.lineWidth = 3; chart.beginPath();
+                samples.forEach((value, index) => {
+                    const x = samples.length === 1 ? 0 : index / (samples.length - 1) * canvas.width;
+                    const y = canvas.height - value / maxValue * canvas.height;
+                    if (index) chart.lineTo(x, y); else chart.moveTo(x, y);
+                });
+                chart.stroke();
+            }
+            chart.fillStyle = '#fff'; chart.font = '14px sans-serif';
+            chart.fillText(`Ekran ${screenId} · anlık ${client.piezo?.latest || 0} · tepe ${client.piezo?.peak || 0} · eşik ${threshold}`, 14, 22);
+        }
+
+        function suggestPiezoThreshold() {
+            const screenId = parseInt(document.getElementById('telemetry-screen').value) || 1;
+            const client = latestTelemetry.clients.find(item => item.screen_id === screenId);
+            const samples = client?.piezo?.samples || [];
+            if (samples.length < 5) {
+                alert('Eşik önermek için en az 5 canlı sensör örneği gerekli.');
+                return;
+            }
+            const sorted = [...samples].sort((a,b) => a-b);
+            const noise95 = sorted[Math.floor((sorted.length - 1) * .95)];
+            const suggested = Math.max(10, Math.min(1023, Math.round(noise95 * 1.8 + 10)));
+            document.getElementById('piezo-threshold').value = suggested;
+            document.getElementById('threshold-value').textContent = suggested;
+            renderSelectedTelemetry();
+        }
+
+        async function loadClientTelemetry() {
+            try {
+                const response = await fetch('/api/clients/status');
+                latestTelemetry = await response.json();
+                const select = document.getElementById('telemetry-screen');
+                const selected = select.value;
+                select.innerHTML = latestTelemetry.clients.map(client =>
+                    `<option value="${client.screen_id}">Ekran ${client.screen_id}${client.online ? ' · bağlı' : ' · çevrimdışı'}</option>`
+                ).join('');
+                if ([...select.options].some(option => option.value === selected)) select.value = selected;
+                document.getElementById('telemetry-summary').textContent =
+                    `${latestTelemetry.online_count}/${latestTelemetry.clients.length} istemci çevrimiçi`;
+                document.getElementById('client-health').innerHTML = latestTelemetry.clients.map(client => `
+                    <div class="screen-card" style="border-color:${client.online ? '#22c55e' : '#ef4444'}">
+                        <h4>Ekran ${client.screen_id} · ${client.online ? 'Bağlı' : 'Çevrimdışı'}</h4>
+                        <div>FPS: ${client.fps ?? '—'} · RAM: ${client.memory_mb ? client.memory_mb + ' MB' : '—'}</div>
+                        <div>Sıcaklık: ${client.cpu_temp_c != null ? client.cpu_temp_c + ' °C' : '—'} · Seri: ${client.serial_connected ? 'OK' : 'Yok'}</div>
+                        <div>Sahne: ${client.active_scene || '—'} · Kuyruk: ${client.queue_depth ?? 0}</div>
+                    </div>`).join('');
+                renderSelectedTelemetry();
+            } catch (error) {
+                document.getElementById('telemetry-summary').textContent = 'Telemetri alınamadı';
+            }
+        }
         // === Piezo ayarla ===
         async function applyPiezoConfig() {
             const threshold = parseInt(document.getElementById('piezo-threshold').value);
@@ -1515,11 +2010,36 @@ DASHBOARD_HTML = """
                     document.getElementById('progress-text').textContent = `${pct.toFixed(1)}%`;
                     document.getElementById('target-score').textContent = status.target_score || '—';
 
+                    // Ekran başına bağımsız hırsız kotası
+                    const screenTargets = status.screen_targets || {};
+                    const screenScores = status.screen_scores || {};
+                    const completedScreens = new Set((status.completed_screens || []).map(String));
+                    for (let sid = 1; sid <= 8; sid++) {
+                        const key = String(sid);
+                        const score = Number(screenScores[key] ?? 0);
+                        const target = Number(screenTargets[key] ?? 0);
+                        const complete = completedScreens.has(key);
+                        const scoreEl = document.getElementById(`screen-${sid}-score`);
+                        const quotaEl = document.getElementById(`screen-${sid}-quota`);
+                        const stateEl = document.getElementById(`screen-${sid}-state`);
+                        const cardEl = document.getElementById(`screen-${sid}-card`);
+                        if (scoreEl) scoreEl.textContent = score;
+                        if (quotaEl) quotaEl.textContent = `${score} / ${target || "—"} hırsız`;
+                        if (stateEl) {
+                            stateEl.textContent = complete ? "HAPİSTE · TAMAMLANDI" : "Devam ediyor";
+                            stateEl.style.color = complete ? "#22c55e" : "";
+                        }
+                        if (cardEl) {
+                            cardEl.style.borderColor = complete ? "#22c55e" : "";
+                            cardEl.style.background = complete ? "rgba(34,197,94,.12)" : "";
+                        }
+                    }
+
                     // Ekran spawn istatistikleri
                     if (status.screen_stats) {
                         for (const [sid, pctVal] of Object.entries(status.screen_stats)) {
                             const pctEl = document.getElementById(`screen-${sid}-pct`);
-                            if (pctEl) pctEl.textContent = `${pctVal}%`;
+                            if (pctEl) pctEl.textContent = `Spawn: ${pctVal}%`;
                         }
                     }
                 } else {
@@ -1579,11 +2099,14 @@ DASHBOARD_HTML = """
 
         // === Başlat ===
         initScreenCards(numScreens);
+        loadGameProfiles();
         updateStatus();
         loadPiezoConfig();
         loadAudioStatus(true);
+        loadClientTelemetry();
 
         setInterval(updateStatus, 1000);
+        setInterval(loadClientTelemetry, 2000);
         setInterval(() => loadAudioStatus(false), 3000);
     </script>
 </body>
@@ -1988,6 +2511,23 @@ async def dashboard():
 async def screen():
     """Seyir ekrani - animasyonlu skor gorunumu"""
     return SCREEN_HTML
+
+
+@app.get("/scene-editor", response_class=HTMLResponse)
+async def scene_editor():
+    """Tarayıcı tabanlı sürükle-bırak Pygame sahne editörü."""
+    editor_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "scene_editor.html",
+    )
+    try:
+        with open(editor_path, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Sahne editörü dosyası okunamadı",
+        ) from exc
 
 
 # ============== Main ==============

@@ -79,6 +79,8 @@ class AudioManager:
             "start": str(merged.get("start_sound_file", "") or ""),
             "success": str(merged.get("success_sound_file", "") or ""),
             "end": str(merged.get("end_sound_file", "") or ""),
+            "countdown": str(merged.get("countdown_sound_file", "") or ""),
+            "go": str(merged.get("go_sound_file", "") or ""),
         }
 
         self._pygame = pygame if pygame_module is None else pygame_module
@@ -95,6 +97,8 @@ class AudioManager:
         self.hit_count = 0
 
         self._sounds: Dict[str, object] = {}
+        self._scene_sound_cache: Dict[str, object] = {}
+        self._scene_loop_channels: List[object] = []
         self._fallback_music = None
         self._music_channel = None
         self._music_file_path: Optional[str] = None
@@ -225,6 +229,7 @@ class AudioManager:
     def shutdown(self):
         with self._lock:
             self.stop_music(fade_ms=0)
+            self.stop_scene_audio()
             if self._pygame is not None:
                 try:
                     if self._pygame.mixer.get_init():
@@ -275,10 +280,15 @@ class AudioManager:
             "start": [(440, 0.09), (660, 0.09), (880, 0.16)],
             "success": [(523.25, 0.10), (659.25, 0.10), (783.99, 0.10), (1046.5, 0.24)],
             "end": [(392, 0.13), (330, 0.13), (262, 0.26)],
+            "countdown_3": [(523.25, 0.11), (659.25, 0.08)],
+            "countdown_2": [(659.25, 0.11), (783.99, 0.08)],
+            "countdown_1": [(783.99, 0.11), (1046.50, 0.12)],
+            "go": [(523.25, 0.07), (783.99, 0.07), (1174.66, 0.20)],
         }
 
         for name, fallback in fallback_sequences.items():
-            path = self._resolve_file(self.file_config[name])
+            config_name = "countdown" if name.startswith("countdown_") else name
+            path = self._resolve_file(self.file_config[config_name])
             if path:
                 self._sounds[name] = self._pygame.mixer.Sound(path)
                 self.using_fallback_sfx[name] = False
@@ -425,11 +435,103 @@ class AudioManager:
             self._play_sfx("start")
             self.play_music()
 
+    def begin_countdown(self):
+        """Intro kartı görünürken müziği kes ve açılış efektini çal."""
+        with self._lock:
+            self.stop_music(fade_ms=80)
+            return self._play_sfx("start")
+
+    def play_countdown(self, value: int) -> bool:
+        with self._lock:
+            if value not in (1, 2, 3):
+                return False
+            return self._play_sfx(f"countdown_{value}")
+
+    def begin_gameplay(self):
+        """1'den sonra güçlü başlangıç efekti ve müziği başlat."""
+        with self._lock:
+            self._play_sfx("go")
+            return self.play_music()
+
     def end_game(self, completed: bool):
         with self._lock:
             self.stop_music()
             self._play_sfx("success" if completed else "end")
 
+    def play_scene_cue(
+        self,
+        *,
+        sound_name: str = "",
+        asset_path: Optional[str] = None,
+        volume: float = 1.0,
+        loop: bool = False,
+        fade_in_ms: int = 0,
+        fade_out_ms: int = 0,
+        max_duration_ms: int = 0,
+        pan: float = 0.0,
+    ) -> bool:
+        """Yayınlanmış sahnenin timeline cue kaydını merkezi USB kartta çal."""
+        with self._lock:
+            if not self.enabled or not self.available:
+                return False
+            try:
+                sound = None
+                if asset_path and os.path.isfile(asset_path):
+                    absolute = os.path.abspath(asset_path)
+                    sound = self._scene_sound_cache.get(absolute)
+                    if sound is None:
+                        sound = self._pygame.mixer.Sound(absolute)
+                        self._scene_sound_cache[absolute] = sound
+                elif sound_name:
+                    sound = self._sounds.get(sound_name)
+                if sound is None:
+                    return False
+                sound.set_volume(self.master_volume * self.sfx_volume)
+                fade_in_ms = max(0, min(60_000, int(fade_in_ms)))
+                if fade_in_ms:
+                    channel = sound.play(loops=-1 if loop else 0, fade_ms=fade_in_ms)
+                else:
+                    channel = sound.play(loops=-1 if loop else 0)
+                if channel is None:
+                    return False
+                cue_volume = self._clamp_volume(volume)
+                pan = max(-1.0, min(1.0, float(pan)))
+                left = cue_volume * (1.0 - max(0.0, pan))
+                right = cue_volume * (1.0 + min(0.0, pan))
+                channel.set_volume(left, right)
+                if loop:
+                    self._scene_loop_channels.append(channel)
+                if max_duration_ms > 0:
+                    timer = threading.Timer(
+                        max_duration_ms / 1000.0,
+                        self._fade_scene_channel,
+                        args=(channel, sound, max(0, int(fade_out_ms))),
+                    )
+                    timer.daemon = True
+                    timer.start()
+                return True
+            except Exception as exc:
+                self.last_error = str(exc)
+                return False
+
+    @staticmethod
+    def _fade_scene_channel(channel, expected_sound, fade_out_ms: int):
+        try:
+            if channel.get_sound() is expected_sound:
+                if fade_out_ms > 0:
+                    channel.fadeout(fade_out_ms)
+                else:
+                    channel.stop()
+        except Exception:
+            pass
+    def stop_scene_audio(self):
+        with self._lock:
+            for channel in self._scene_loop_channels:
+                try:
+                    channel.fadeout(100)
+                except Exception:
+                    pass
+            self._scene_loop_channels.clear()
     def test_sound(self, sound_type: str) -> bool:
         with self._lock:
             if sound_type == "music":
@@ -437,7 +539,7 @@ class AudioManager:
                     self.stop_music()
                     return True
                 return self.play_music()
-            if sound_type not in ("hit", "start", "success", "end"):
+            if sound_type not in ("hit", "start", "success", "end", "go"):
                 return False
             return self._play_sfx(sound_type)
 

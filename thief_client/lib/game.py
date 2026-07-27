@@ -82,7 +82,8 @@ class GameLogic:
         self.thief_y = thief_y
         self.speed_px_s = speed_px_s
         self.random_direction = random_direction
-        self.band_enabled = band_enabled
+        self._base_band_enabled = bool(band_enabled)
+        self.band_enabled = bool(band_enabled)
         self.band_x_min = band_x_min
         self.band_x_max = band_x_max
         self.hit_cooldown_s = hit_cooldown_ms / 1000.0
@@ -122,6 +123,30 @@ class GameLogic:
 
         # Fall animasyonu süresi (saniye) — 10 frame @ 12fps = 0.83s + yerde kalma
         self.fall_duration = 1.5
+        self.runtime_hit_zones = []
+        self.runtime_path_points = []
+        self._active_path = []
+        self._path_index = 0
+
+    def configure_runtime_layout(self, hit_zones=None, path_points=None):
+        """Sahne editöründen yayınlanan vuruş alanı ve hareket yolunu uygula."""
+        self.runtime_hit_zones = [dict(zone) for zone in (hit_zones or []) if isinstance(zone, dict)]
+        self.runtime_path_points = [
+            (float(point[0]), float(point[1]))
+            for point in (path_points or [])
+            if isinstance(point, (list, tuple)) and len(point) >= 2
+        ]
+        self.band_enabled = bool(self.runtime_hit_zones) or self._base_band_enabled
+
+    def _start_runtime_path(self, direction):
+        if len(self.runtime_path_points) < 2:
+            self._active_path = []
+            return False
+        points = list(self.runtime_path_points)
+        self._active_path = list(reversed(points)) if direction == Direction.LEFT else points
+        self._path_index = 0
+        self.thief.x, self.thief.y = self._active_path[0]
+        return True
 
     def reset_score(self):
         """Yerel skor ve komboyu sifirla."""
@@ -152,6 +177,7 @@ class GameLogic:
 
         self.thief.y = self.thief_y
         self.thief.direction = new_direction
+        self._start_runtime_path(new_direction)
         self.thief.state = GameState.RUN
 
         # Yön değişim callback'i
@@ -188,6 +214,9 @@ class GameLogic:
 
     def _update_run(self, dt: float):
         """RUN durumunu güncelle"""
+        if len(self._active_path) >= 2:
+            self._update_runtime_path(dt)
+            return
         # Yöne göre hareket et
         self.thief.x += self.speed_px_s * dt * self.thief.direction.value
 
@@ -199,6 +228,25 @@ class GameLogic:
             self.combo = 0
             self.thief.state = GameState.RESET
 
+    def _update_runtime_path(self, dt: float):
+        remaining = max(0.0, self.speed_px_s * dt)
+        while remaining > 0 and self._path_index < len(self._active_path) - 1:
+            start_x, start_y = self.thief.x, self.thief.y
+            target_x, target_y = self._active_path[self._path_index + 1]
+            dx, dy = target_x - start_x, target_y - start_y
+            distance = (dx * dx + dy * dy) ** 0.5
+            if distance <= remaining + 0.001:
+                self.thief.x, self.thief.y = target_x, target_y
+                self._path_index += 1
+                remaining -= distance
+            else:
+                ratio = remaining / max(0.001, distance)
+                self.thief.x += dx * ratio
+                self.thief.y += dy * ratio
+                remaining = 0
+        if self._path_index >= len(self._active_path) - 1:
+            self.combo = 0
+            self.thief.state = GameState.RESET
     def _update_fall(self, current_time: float):
         """FALL durumunu güncelle"""
         elapsed = current_time - self.thief.fall_start
@@ -234,6 +282,7 @@ class GameLogic:
 
         self.thief.y = self.thief_y
         self.thief.direction = new_direction
+        self._start_runtime_path(new_direction)
         self.thief.state = GameState.RUN
 
         if self.on_direction_change:
@@ -280,7 +329,13 @@ class GameLogic:
             return False
 
     def _is_in_band(self) -> bool:
-        """Hırsız hedef bandında mı?"""
+        """Hırsız yayınlanan hit-zone veya eski hedef bandında mı?"""
+        if self.runtime_hit_zones:
+            return any(
+                float(zone.get("x", 0)) <= self.thief.x <= float(zone.get("x", 0)) + float(zone.get("width", 0))
+                and float(zone.get("y", 0)) <= self.thief.y <= float(zone.get("y", 0)) + float(zone.get("height", 0))
+                for zone in self.runtime_hit_zones
+            )
         return self.band_x_min <= self.thief.x <= self.band_x_max
 
     def get_thief_center_x(self) -> float:

@@ -9,6 +9,8 @@ import time
 import uuid
 import os
 import tempfile
+import hashlib
+import base64
 from typing import Optional, Dict, Any
 from dataclasses import dataclass, asdict
 
@@ -51,7 +53,9 @@ class NetClient:
         screen_id: int,
         poll_interval_ms: int = 500,
         queue_file: str = "event_queue.json",
+        scene_cache_dir: Optional[str] = None,
         debug: bool = False,
+        telemetry_provider=None,
     ):
         """
         Args:
@@ -67,16 +71,21 @@ class NetClient:
         self.screen_id = screen_id
         self.poll_interval_s = poll_interval_ms / 1000.0
         self.queue_file = queue_file
+        self.scene_cache_dir = os.path.abspath(scene_cache_dir or "scene_cache")
         self.debug = debug
         self._offline_lock = threading.RLock()
         self._offline_event_ids = set()
         self._stop_event = threading.Event()
+        self.telemetry_provider = telemetry_provider
+        self._started_at = time.monotonic()
+        self._last_heartbeat = 0.0
+        self.heartbeat_interval_s = 5.0
 
         # Gönderim kuyruğu
         self.send_queue: queue.Queue = queue.Queue()
 
         # Spawn kuyruğu (server'dan gelen spawn komutları)
-        self.spawn_queue: queue.Queue = queue.Queue()
+        self.spawn_queue: queue.Queue = queue.Queue(maxsize=1)
 
         # Piezo config kuyruğu (server'dan gelen ayar değişiklikleri)
         self.piezo_config_queue: queue.Queue = queue.Queue()
@@ -85,10 +94,21 @@ class NetClient:
         self.score_reset_queue: queue.Queue = queue.Queue()
         self.last_score_version: Optional[int] = None
 
+        # Server sahne editörü yayınları
+        self.scene_config_queue: queue.Queue = queue.Queue(maxsize=2)
+        self.scene_screenshot_request_queue: queue.Queue = queue.Queue(maxsize=2)
+        self.scene_screenshot_upload_queue: queue.Queue = queue.Queue(maxsize=2)
+        self.scene_version = ""
+        self.scene_preview = False
+        self.scene_preview_scene: Optional[str] = None
+        self._last_screenshot_token = ""
+        self._last_scene_poll = 0.0
+
         # Thread kontrolü
         self.running = False
         self.send_thread: Optional[threading.Thread] = None
         self.poll_thread: Optional[threading.Thread] = None
+        self.scene_thread: Optional[threading.Thread] = None
 
         # Durum
         self.connected = False
@@ -97,10 +117,24 @@ class NetClient:
         self.events_failed = 0
         self.spawns_received = 0
         self.server_game_active = False
+        self.server_scene = "waiting"
+        self.server_total_score = 0
+        self.server_target_score = 0
+        self.server_screen_score = 0
+        self.server_screen_target = 0
+        self.server_screen_remaining = 0
+        self.server_screen_complete = False
+        self.server_remaining_seconds = 0
+        self.countdown_active = False
+        self.countdown_message: Optional[str] = None
+        self.countdown_remaining_ms = 0
 
         # Offline queue'yu yükle
         self._load_offline_queue()
 
+    def set_telemetry_provider(self, provider):
+        """Pygame ana nesnesinden kilitsiz, hızlı bir sağlık özeti sağlayan callback ata."""
+        self.telemetry_provider = provider
     def start(self):
         """Thread'leri başlat"""
         if not REQUESTS_AVAILABLE:
@@ -118,6 +152,10 @@ class NetClient:
         self.poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self.poll_thread.start()
 
+        # Asset indirme spawn/piezo polling'i geciktirmesin.
+        self.scene_thread = threading.Thread(target=self._scene_loop, daemon=True)
+        self.scene_thread.start()
+
         if self.debug:
             print(f"[NetClient] Thread'ler başlatıldı: {self.server_base_url}")
 
@@ -130,6 +168,8 @@ class NetClient:
             self.send_thread.join(timeout=6.0)
         if self.poll_thread and self.poll_thread.is_alive():
             self.poll_thread.join(timeout=2.0)
+        if self.scene_thread and self.scene_thread.is_alive():
+            self.scene_thread.join(timeout=12.0)
 
         self._save_offline_queue()
 
@@ -178,6 +218,38 @@ class NetClient:
         except queue.Empty:
             return False
 
+    def consume_scene_config(self) -> Optional[Dict[str, Any]]:
+        """Yeni yayınlanan veya bu ekrana özel önizleme sahnesini tüket."""
+        try:
+            latest = self.scene_config_queue.get_nowait()
+            while True:
+                try:
+                    latest = self.scene_config_queue.get_nowait()
+                except queue.Empty:
+                    return latest
+        except queue.Empty:
+            return None
+
+    def consume_scene_screenshot_request(self) -> Optional[str]:
+        """Ana Pygame threadinin işleyeceği son ekran görüntüsü isteğini döndür."""
+        try:
+            latest = self.scene_screenshot_request_queue.get_nowait()
+            while True:
+                try:
+                    latest = self.scene_screenshot_request_queue.get_nowait()
+                except queue.Empty:
+                    return latest
+        except queue.Empty:
+            return None
+
+    def submit_scene_screenshot(self, request_token: str, png_content: bytes) -> bool:
+        """Pygame threadinden gelen PNG'yi ağ threadine devret."""
+        if not request_token or not png_content or len(png_content) > 4 * 1024 * 1024:
+            return False
+        if self.scene_screenshot_upload_queue.full():
+            self._clear_queue(self.scene_screenshot_upload_queue)
+        self.scene_screenshot_upload_queue.put((request_token, png_content, 0))
+        return True
     # ============== Send Loop ==============
 
     def _send_loop(self):
@@ -249,6 +321,9 @@ class NetClient:
                 # Piezo config polling
                 self._poll_piezo_config()
 
+                if time.monotonic() - self._last_heartbeat >= self.heartbeat_interval_s:
+                    self._send_heartbeat()
+
             except Exception as e:
                 if self.debug:
                     print(f"[NetClient] Poll hatası: {e}")
@@ -256,6 +331,42 @@ class NetClient:
             if self._stop_event.wait(self.poll_interval_s):
                 break
 
+    def _scene_loop(self):
+        """Sahne/asset güncellemelerini oyun polling'inden bağımsız tut."""
+        while self.running:
+            self._upload_scene_screenshot()
+            self._poll_scene_config()
+            self._last_scene_poll = time.monotonic()
+            if self._stop_event.wait(2.0):
+                break
+
+    def _send_heartbeat(self):
+        self._last_heartbeat = time.monotonic()
+        payload = {
+            "screen_id": self.screen_id,
+            "uptime_seconds": int(time.monotonic() - self._started_at),
+            "scene_version": self.scene_version,
+            "active_scene": self.server_scene,
+            "network_connected": self.connected,
+            "events_failed": self.events_failed,
+            "queue_depth": self.send_queue.qsize(),
+        }
+        if self.telemetry_provider:
+            try:
+                extra = self.telemetry_provider()
+                if isinstance(extra, dict):
+                    payload.update(extra)
+            except Exception as exc:
+                if self.debug:
+                    print(f"[NetClient] Telemetri sağlayıcı hatası: {exc}")
+        try:
+            requests.post(
+                f"{self.server_base_url}/api/clients/heartbeat",
+                json=payload,
+                timeout=2.0,
+            )
+        except requests.exceptions.RequestException:
+            pass
     def _poll_spawn(self):
         """Server'dan spawn komutu sorgula"""
         try:
@@ -266,8 +377,26 @@ class NetClient:
                 data = response.json()
                 self.connected = True
                 self.server_game_active = data.get("game_active", False)
-                if not self.server_game_active:
+                self.server_scene = str(data.get("active_scene", "waiting"))
+                self.server_total_score = int(data.get("total_score", 0) or 0)
+                self.server_target_score = int(data.get("target_score", 0) or 0)
+                self.server_screen_score = int(data.get("screen_score", 0) or 0)
+                self.server_screen_target = int(data.get("screen_target", 0) or 0)
+                self.server_screen_remaining = int(data.get("screen_remaining", 0) or 0)
+                self.server_screen_complete = bool(data.get("screen_complete", False))
+                self.server_remaining_seconds = int(
+                    data.get("remaining_seconds", 0) or 0
+                )
+                self.countdown_active = bool(data.get("countdown_active", False))
+                self.countdown_message = data.get("countdown_message")
+                self.countdown_remaining_ms = int(
+                    data.get("countdown_remaining_ms", 0) or 0
+                )
+                if not self.server_game_active or self.server_screen_complete:
                     self._clear_queue(self.spawn_queue)
+                    self.countdown_active = False
+                    self.countdown_message = None
+                    self.countdown_remaining_ms = 0
                 score_version = data.get("score_version")
                 if score_version is not None:
                     if self.last_score_version is None:
@@ -276,9 +405,12 @@ class NetClient:
                         self.last_score_version = score_version
                         self.score_reset_queue.put(score_version)
 
-                if data.get("spawn"):
-                    self.spawn_queue.put(data)
-                    self.spawns_received += 1
+                if data.get("spawn") and not self.server_screen_complete:
+                    try:
+                        self.spawn_queue.put_nowait(data)
+                        self.spawns_received += 1
+                    except queue.Full:
+                        pass
                     if self.debug:
                         print(f"[NetClient] Spawn komutu alındı! (#{self.spawns_received})")
 
@@ -305,6 +437,147 @@ class NetClient:
 
         except requests.exceptions.RequestException:
             pass  # Sessizce devam et
+
+    def _poll_scene_config(self):
+        """Sahne sürümü değiştiyse belgeyi ve assetleri yerel cache'e indir."""
+        try:
+            url = (
+                f"{self.server_base_url}/api/scenes/client"
+                f"?screen_id={self.screen_id}&known_version={self.scene_version}"
+            )
+            response = requests.get(url, timeout=5.0)
+            if response.status_code != 200:
+                return
+
+            data = response.json()
+            screenshot_token = str(data.get("screenshot_request") or "")
+            if screenshot_token and screenshot_token != self._last_screenshot_token:
+                if self.scene_screenshot_request_queue.full():
+                    self._clear_queue(self.scene_screenshot_request_queue)
+                self.scene_screenshot_request_queue.put(screenshot_token)
+                self._last_screenshot_token = screenshot_token
+            if not data.get("changed"):
+                return
+            document = data.get("document")
+            version = str(data.get("version", ""))
+            if not isinstance(document, dict) or not version:
+                return
+
+            asset_paths, assets_complete = self._sync_scene_assets(
+                data.get("assets", [])
+            )
+            payload = {
+                "version": version,
+                "document": document,
+                "asset_paths": asset_paths,
+                "preview": bool(data.get("preview", False)),
+                "preview_scene": data.get("preview_scene"),
+            }
+            if self.scene_config_queue.full():
+                self._clear_queue(self.scene_config_queue)
+            self.scene_config_queue.put(payload)
+
+            self.scene_preview = payload["preview"]
+            self.scene_preview_scene = payload["preview_scene"]
+            if assets_complete:
+                self.scene_version = version
+
+            if self.debug:
+                mode = "ÖNİZLEME" if self.scene_preview else "YAYIN"
+                print(f"[NetClient] Sahne {mode} sürümü alındı: {version}")
+        except (requests.exceptions.RequestException, ValueError, OSError) as exc:
+            if self.debug:
+                print(f"[NetClient] Sahne polling hatası: {exc}")
+
+    def _upload_scene_screenshot(self):
+        """Talep üzerine alınan görüntüyü scene polling threadinde yükle."""
+        try:
+            request_token, content, attempts = self.scene_screenshot_upload_queue.get_nowait()
+        except queue.Empty:
+            return
+        try:
+            response = requests.post(
+                f"{self.server_base_url}/api/scenes/screenshot/upload",
+                json={
+                    "screen_id": self.screen_id,
+                    "request_token": request_token,
+                    "data_base64": base64.b64encode(content).decode("ascii"),
+                },
+                timeout=10.0,
+            )
+            if response.status_code == 200:
+                if self.debug:
+                    print("[NetClient] Client görüntüsü editöre gönderildi")
+                return
+        except requests.exceptions.RequestException:
+            pass
+        if attempts < 2 and self.running:
+            self.scene_screenshot_upload_queue.put((request_token, content, attempts + 1))
+    def _sync_scene_assets(self, manifest: list) -> tuple:
+        """Manifest assetlerini checksum ile indir; (path map, tamlık) döndür."""
+        os.makedirs(self.scene_cache_dir, exist_ok=True)
+        paths = {}
+        complete = True
+        for asset in manifest:
+            name = os.path.basename(str(asset.get("name", "")))
+            expected = str(asset.get("sha256", ""))
+            relative_url = str(asset.get("url", ""))
+            if not name or not expected or not relative_url:
+                complete = False
+                continue
+            target = os.path.join(self.scene_cache_dir, name)
+            try:
+                if os.path.isfile(target) and self._file_sha256(target) == expected:
+                    paths[name] = target
+                    continue
+
+                asset_url = (
+                    relative_url
+                    if relative_url.startswith(("http://", "https://"))
+                    else f"{self.server_base_url}{relative_url}"
+                )
+                response = requests.get(asset_url, timeout=10.0)
+                if response.status_code != 200:
+                    complete = False
+                    continue
+                content = response.content
+                if len(content) > 10 * 1024 * 1024:
+                    complete = False
+                    continue
+                digest = hashlib.sha256(content).hexdigest()
+                if digest != expected:
+                    complete = False
+                    continue
+
+                fd, temp_path = tempfile.mkstemp(
+                    dir=self.scene_cache_dir,
+                    prefix=".scene_asset_",
+                    suffix=os.path.splitext(name)[1],
+                )
+                try:
+                    with os.fdopen(fd, "wb") as handle:
+                        handle.write(content)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temp_path, target)
+                except BaseException:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                    raise
+                paths[name] = target
+            except (requests.exceptions.RequestException, OSError):
+                complete = False
+        return paths, complete
+
+    @staticmethod
+    def _file_sha256(path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(64 * 1024)
+                if not chunk:
+                    return digest.hexdigest()
+                digest.update(chunk)
 
     # ============== Offline Queue ==============
 
@@ -429,11 +702,33 @@ class NetClient:
 
     # ============== Status ==============
 
+    def get_countdown_status(self) -> Dict[str, Any]:
+        """Sunucuyla senkron oyun başlangıç sayımını döndür."""
+        return {
+            "active": self.countdown_active,
+            "message": self.countdown_message,
+            "remaining_ms": self.countdown_remaining_ms,
+        }
+
     def get_status(self) -> Dict[str, Any]:
         """Client durumunu döndür"""
         return {
             "connected": self.connected,
             "game_active": self.server_game_active,
+            "active_scene": self.server_scene,
+            "server_total_score": self.server_total_score,
+"server_target_score": self.server_target_score,
+            "server_screen_score": self.server_screen_score,
+            "server_screen_target": self.server_screen_target,
+            "server_screen_remaining": self.server_screen_remaining,
+            "server_screen_complete": self.server_screen_complete,
+            "server_remaining_seconds": self.server_remaining_seconds,
+            "countdown_active": self.countdown_active,
+            "countdown_message": self.countdown_message,
+            "countdown_remaining_ms": self.countdown_remaining_ms,
+            "scene_version": self.scene_version,
+            "scene_preview": self.scene_preview,
+            "scene_preview_scene": self.scene_preview_scene,
             "events_sent": self.events_sent,
             "events_failed": self.events_failed,
             "spawns_received": self.spawns_received,

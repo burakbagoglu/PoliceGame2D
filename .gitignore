@@ -4,3 +4,5 @@ __pycache__/
 event_queue.json
 *.log
 *.tmp
+thief_server/scene_data/
+thief_client/scene_cache/

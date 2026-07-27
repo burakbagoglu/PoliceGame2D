@@ -10,13 +10,22 @@ class FakeSound:
         self.buffer = buffer
         self.volume = 1.0
         self.play_count = 0
+        self.fade_count = 0
 
-    def set_volume(self, volume):
-        self.volume = volume
+    def set_volume(self, volume, right=None):
+        if right is None:
+            self.volume = volume
+        else:
+            self.channel_volume = (volume, right)
 
-    def play(self):
+    def play(self, loops=0, fade_ms=0):
+        self.fade_ms = fade_ms
         self.play_count += 1
+        self.loops = loops
         return self
+
+    def fadeout(self, _milliseconds):
+        self.fade_count += 1
 
 
 class FakeMusic:
@@ -30,10 +39,14 @@ class FakeMusic:
     def load(self, path):
         self.loaded = path
 
-    def set_volume(self, volume):
-        self.volume = volume
+    def set_volume(self, volume, right=None):
+        if right is None:
+            self.volume = volume
+        else:
+            self.channel_volume = (volume, right)
 
-    def play(self, loops=0):
+    def play(self, loops=0, fade_ms=0):
+        self.fade_ms = fade_ms
         self.play_count += 1
         self.loops = loops
 
@@ -190,6 +203,22 @@ def test_game_music_hit_and_success_flow():
     assert manager._sounds["success"].play_count == 1
 
 
+def test_countdown_and_gameplay_audio_flow():
+    manager, _mixer = make_manager()
+    manager.initialize()
+
+    assert manager.begin_countdown() is True
+    assert manager._sounds["start"].play_count == 1
+    for value in (3, 2, 1):
+        assert manager.play_countdown(value) is True
+        assert manager._sounds[f"countdown_{value}"].play_count == 1
+
+    assert manager.play_countdown(4) is False
+    assert manager.begin_gameplay() is True
+    assert manager._sounds["go"].play_count == 1
+    assert manager.music_playing is True
+
+
 def test_runtime_volume_and_disable():
     manager, _mixer = make_manager()
     manager.initialize()
@@ -224,3 +253,16 @@ def test_disabled_audio_does_not_initialize():
     assert manager.initialize() is False
     assert mixer.initialized is False
     assert manager.get_status()["enabled"] is False
+
+
+def test_scene_cue_uses_central_mixer_and_stops_loop():
+    manager, _mixer = make_manager()
+    manager.initialize()
+
+    assert manager.play_scene_cue(sound_name="hit", volume=0.5, loop=True) is True
+    assert manager._sounds["hit"].loops == -1
+    assert manager._sounds["hit"].volume == manager.master_volume * manager.sfx_volume
+    assert manager._sounds["hit"].channel_volume == (0.5, 0.5)
+
+    manager.stop_scene_audio()
+    assert manager._sounds["hit"].fade_count == 1
