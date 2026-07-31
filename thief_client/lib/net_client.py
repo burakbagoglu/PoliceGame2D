@@ -1,5 +1,5 @@
 """
-Net Client modülü - Pi 5 server'a HTTP event gönderimi + spawn/piezo polling
+Net Client modülü - Pi 4 server'a HTTP event gönderimi + spawn/piezo polling
 Offline durumda event'leri yerel kuyruğa yazar
 """
 import threading
@@ -44,7 +44,7 @@ class ScoreEvent:
 
 
 class NetClient:
-    """Pi 5 server'a event gönderen ve spawn/piezo polling yapan client"""
+    """Pi 4 server'a event gönderen ve spawn/piezo polling yapan client"""
 
     def __init__(
         self,
@@ -75,11 +75,19 @@ class NetClient:
         self.debug = debug
         self._offline_lock = threading.RLock()
         self._offline_event_ids = set()
+        self._offline_events: Dict[str, dict] = {}
+        self._offline_dirty = False
+        self._last_offline_flush = 0.0
+        self.offline_flush_interval_s = 2.0
         self._stop_event = threading.Event()
         self.telemetry_provider = telemetry_provider
         self._started_at = time.monotonic()
         self._last_heartbeat = 0.0
         self.heartbeat_interval_s = 5.0
+        self._combined_poll_supported: Optional[bool] = None
+        self._send_http = requests.Session() if REQUESTS_AVAILABLE else None
+        self._poll_http = requests.Session() if REQUESTS_AVAILABLE else None
+        self._scene_http = requests.Session() if REQUESTS_AVAILABLE else None
 
         # Gönderim kuyruğu
         self.send_queue: queue.Queue = queue.Queue()
@@ -172,6 +180,9 @@ class NetClient:
             self.scene_thread.join(timeout=12.0)
 
         self._save_offline_queue()
+        for session in (self._send_http, self._poll_http, self._scene_http):
+            if session is not None:
+                session.close()
 
         if self.debug:
             print("[NetClient] Thread'ler durduruldu")
@@ -261,6 +272,7 @@ class NetClient:
             try:
                 event = self.send_queue.get(timeout=1.0)
             except queue.Empty:
+                self._flush_offline_events()
                 continue
 
             success = self._send_event(event)
@@ -269,11 +281,13 @@ class NetClient:
                 self.events_sent += 1
                 self.connected = True
                 self._remove_from_offline_queue(event.event_id)
+                self._flush_offline_events()
                 retry_delay = 1.0
             else:
                 self.events_failed += 1
                 self.connected = False
                 self._add_to_offline_queue(event)
+                self._flush_offline_events()
                 interrupted = self._stop_event.wait(
                     min(retry_delay, max_retry_delay)
                 )
@@ -286,7 +300,7 @@ class NetClient:
     def _send_event(self, event: ScoreEvent) -> bool:
         """Tek bir event'i gönder"""
         try:
-            response = requests.post(
+            response = self._send_http.post(
                 self.server_url,
                 json=event.to_dict(),
                 timeout=5.0,
@@ -315,14 +329,12 @@ class NetClient:
         """Spawn + piezo config polling döngüsü"""
         while self.running:
             try:
-                # Spawn polling
-                self._poll_spawn()
-
-                # Piezo config polling
-                self._poll_piezo_config()
-
-                if time.monotonic() - self._last_heartbeat >= self.heartbeat_interval_s:
-                    self._send_heartbeat()
+                # Yeni serverda spawn + piezo + seyrek heartbeat tek keep-alive çağrısıdır.
+                if not self._poll_combined():
+                    self._poll_spawn()
+                    self._poll_piezo_config()
+                    if time.monotonic() - self._last_heartbeat >= self.heartbeat_interval_s:
+                        self._send_heartbeat()
 
             except Exception as e:
                 if self.debug:
@@ -340,8 +352,7 @@ class NetClient:
             if self._stop_event.wait(2.0):
                 break
 
-    def _send_heartbeat(self):
-        self._last_heartbeat = time.monotonic()
+    def _build_telemetry_payload(self) -> dict:
         payload = {
             "screen_id": self.screen_id,
             "uptime_seconds": int(time.monotonic() - self._started_at),
@@ -359,85 +370,112 @@ class NetClient:
             except Exception as exc:
                 if self.debug:
                     print(f"[NetClient] Telemetri sağlayıcı hatası: {exc}")
+        return payload
+
+    def _send_heartbeat(self):
+        self._last_heartbeat = time.monotonic()
         try:
-            requests.post(
+            self._poll_http.post(
                 f"{self.server_base_url}/api/clients/heartbeat",
-                json=payload,
+                json=self._build_telemetry_payload(),
                 timeout=2.0,
             )
         except requests.exceptions.RequestException:
             pass
-    def _poll_spawn(self):
-        """Server'dan spawn komutu sorgula"""
+
+    def _poll_combined(self) -> bool:
+        if self._combined_poll_supported is False:
+            return False
+        now = time.monotonic()
+        include_telemetry = now - self._last_heartbeat >= self.heartbeat_interval_s
+        telemetry = self._build_telemetry_payload() if include_telemetry else None
         try:
-            url = f"{self.server_base_url}/spawn/poll?screen_id={self.screen_id}"
-            response = requests.get(url, timeout=3.0)
+            response = self._poll_http.post(
+                f"{self.server_base_url}/api/client/poll",
+                json={"screen_id": self.screen_id, "telemetry": telemetry},
+                timeout=3.0,
+            )
+            if response.status_code in (404, 405):
+                self._combined_poll_supported = False
+                return False
+            self._combined_poll_supported = True
+            if response.status_code != 200:
+                self.last_error = f"HTTP {response.status_code}"
+                return True
+            data = response.json()
+            self._apply_spawn_payload(data.get("spawn_state", {}))
+            self._apply_piezo_payload(data.get("piezo_config", {}))
+            if include_telemetry:
+                self._last_heartbeat = now
+            return True
+        except (requests.exceptions.RequestException, ValueError):
+            return True
 
+    def _apply_spawn_payload(self, data: dict):
+        self.connected = True
+        self.server_game_active = data.get("game_active", False)
+        self.server_scene = str(data.get("active_scene", "waiting"))
+        self.server_total_score = int(data.get("total_score", 0) or 0)
+        self.server_target_score = int(data.get("target_score", 0) or 0)
+        self.server_screen_score = int(data.get("screen_score", 0) or 0)
+        self.server_screen_target = int(data.get("screen_target", 0) or 0)
+        self.server_screen_remaining = int(data.get("screen_remaining", 0) or 0)
+        self.server_screen_complete = bool(data.get("screen_complete", False))
+        self.server_remaining_seconds = int(data.get("remaining_seconds", 0) or 0)
+        self.countdown_active = bool(data.get("countdown_active", False))
+        self.countdown_message = data.get("countdown_message")
+        self.countdown_remaining_ms = int(data.get("countdown_remaining_ms", 0) or 0)
+        if not self.server_game_active or self.server_screen_complete:
+            self._clear_queue(self.spawn_queue)
+            self.countdown_active = False
+            self.countdown_message = None
+            self.countdown_remaining_ms = 0
+        score_version = data.get("score_version")
+        if score_version is not None:
+            if self.last_score_version is None:
+                self.last_score_version = score_version
+            elif score_version != self.last_score_version:
+                self.last_score_version = score_version
+                self.score_reset_queue.put(score_version)
+        if data.get("spawn") and not self.server_screen_complete:
+            try:
+                self.spawn_queue.put_nowait(data)
+                self.spawns_received += 1
+            except queue.Full:
+                pass
+
+    def _poll_spawn(self):
+        try:
+            response = self._poll_http.get(
+                f"{self.server_base_url}/spawn/poll?screen_id={self.screen_id}",
+                timeout=3.0,
+            )
             if response.status_code == 200:
-                data = response.json()
-                self.connected = True
-                self.server_game_active = data.get("game_active", False)
-                self.server_scene = str(data.get("active_scene", "waiting"))
-                self.server_total_score = int(data.get("total_score", 0) or 0)
-                self.server_target_score = int(data.get("target_score", 0) or 0)
-                self.server_screen_score = int(data.get("screen_score", 0) or 0)
-                self.server_screen_target = int(data.get("screen_target", 0) or 0)
-                self.server_screen_remaining = int(data.get("screen_remaining", 0) or 0)
-                self.server_screen_complete = bool(data.get("screen_complete", False))
-                self.server_remaining_seconds = int(
-                    data.get("remaining_seconds", 0) or 0
-                )
-                self.countdown_active = bool(data.get("countdown_active", False))
-                self.countdown_message = data.get("countdown_message")
-                self.countdown_remaining_ms = int(
-                    data.get("countdown_remaining_ms", 0) or 0
-                )
-                if not self.server_game_active or self.server_screen_complete:
-                    self._clear_queue(self.spawn_queue)
-                    self.countdown_active = False
-                    self.countdown_message = None
-                    self.countdown_remaining_ms = 0
-                score_version = data.get("score_version")
-                if score_version is not None:
-                    if self.last_score_version is None:
-                        self.last_score_version = score_version
-                    elif score_version != self.last_score_version:
-                        self.last_score_version = score_version
-                        self.score_reset_queue.put(score_version)
+                self._apply_spawn_payload(response.json())
+        except (requests.exceptions.RequestException, ValueError):
+            pass
 
-                if data.get("spawn") and not self.server_screen_complete:
-                    try:
-                        self.spawn_queue.put_nowait(data)
-                        self.spawns_received += 1
-                    except queue.Full:
-                        pass
-                    if self.debug:
-                        print(f"[NetClient] Spawn komutu alındı! (#{self.spawns_received})")
-
-        except requests.exceptions.RequestException:
-            pass  # Sessizce devam et
+    def _apply_piezo_payload(self, data: dict):
+        if not data.get("changed"):
+            return
+        config = {
+            "threshold": data.get("threshold"),
+            "refractory_ms": data.get("refractory_ms"),
+        }
+        self.piezo_config_queue.put(config)
+        if self.debug:
+            print(f"[NetClient] Piezo config güncellendi: {config}")
 
     def _poll_piezo_config(self):
-        """Server'dan piezo config değişikliği sorgula"""
         try:
-            url = f"{self.server_base_url}/api/piezo/config/poll?screen_id={self.screen_id}"
-            response = requests.get(url, timeout=3.0)
-
+            response = self._poll_http.get(
+                f"{self.server_base_url}/api/piezo/config/poll?screen_id={self.screen_id}",
+                timeout=3.0,
+            )
             if response.status_code == 200:
-                data = response.json()
-
-                if data.get("changed"):
-                    config = {
-                        "threshold": data.get("threshold"),
-                        "refractory_ms": data.get("refractory_ms"),
-                    }
-                    self.piezo_config_queue.put(config)
-                    if self.debug:
-                        print(f"[NetClient] Piezo config güncellendi: {config}")
-
-        except requests.exceptions.RequestException:
-            pass  # Sessizce devam et
-
+                self._apply_piezo_payload(response.json())
+        except (requests.exceptions.RequestException, ValueError):
+            pass
     def _poll_scene_config(self):
         """Sahne sürümü değiştiyse belgeyi ve assetleri yerel cache'e indir."""
         try:
@@ -445,7 +483,7 @@ class NetClient:
                 f"{self.server_base_url}/api/scenes/client"
                 f"?screen_id={self.screen_id}&known_version={self.scene_version}"
             )
-            response = requests.get(url, timeout=5.0)
+            response = self._scene_http.get(url, timeout=5.0)
             if response.status_code != 200:
                 return
 
@@ -496,7 +534,7 @@ class NetClient:
         except queue.Empty:
             return
         try:
-            response = requests.post(
+            response = self._scene_http.post(
                 f"{self.server_base_url}/api/scenes/screenshot/upload",
                 json={
                     "screen_id": self.screen_id,
@@ -536,7 +574,7 @@ class NetClient:
                     if relative_url.startswith(("http://", "https://"))
                     else f"{self.server_base_url}{relative_url}"
                 )
-                response = requests.get(asset_url, timeout=10.0)
+                response = self._scene_http.get(asset_url, timeout=10.0)
                 if response.status_code != 200:
                     complete = False
                     continue
@@ -641,65 +679,61 @@ class NetClient:
                 events_data = self._read_offline_events_unlocked()
                 for data in events_data:
                     event = ScoreEvent(**data)
-                    if event.event_id in self._offline_event_ids:
-                        continue
+                    self._offline_events[event.event_id] = event.to_dict()
                     self._offline_event_ids.add(event.event_id)
                     self.send_queue.put(event)
-
+                self._offline_dirty = False
+                self._last_offline_flush = time.monotonic()
                 if self.debug and events_data:
                     print(f"[NetClient] {len(events_data)} offline event yüklendi")
-
-            except Exception as e:
+            except Exception as exc:
                 if self.debug:
-                    print(f"[NetClient] Offline queue yükleme hatası: {e}")
+                    print(f"[NetClient] Offline queue yükleme hatası: {exc}")
+
+    def _flush_offline_events(self, force: bool = False):
+        with self._offline_lock:
+            if not self._offline_dirty:
+                return
+            now = time.monotonic()
+            if not force and now - self._last_offline_flush < self.offline_flush_interval_s:
+                return
+            try:
+                self._write_offline_events_unlocked(list(self._offline_events.values()))
+                self._offline_dirty = False
+                self._last_offline_flush = now
+            except Exception as exc:
+                if self.debug:
+                    print(f"[NetClient] Offline queue flush hatası: {exc}")
 
     def _save_offline_queue(self):
         with self._offline_lock:
-            try:
-                events = self._read_offline_events_unlocked()
-                while True:
-                    try:
-                        event = self.send_queue.get_nowait()
-                        events.append(event.to_dict())
-                    except queue.Empty:
-                        break
-
-                self._write_offline_events_unlocked(events)
-
-                if self.debug and events:
-                    print(f"[NetClient] {len(events)} event dosyaya kaydedildi")
-
-            except Exception as e:
-                if self.debug:
-                    print(f"[NetClient] Offline queue kaydetme hatası: {e}")
+            while True:
+                try:
+                    event = self.send_queue.get_nowait()
+                    self._offline_events[event.event_id] = event.to_dict()
+                    self._offline_event_ids.add(event.event_id)
+                    self._offline_dirty = True
+                except queue.Empty:
+                    break
+        self._flush_offline_events(force=True)
+        if self.debug and self._offline_events:
+            print(f"[NetClient] {len(self._offline_events)} event dosyaya kaydedildi")
 
     def _add_to_offline_queue(self, event: ScoreEvent):
         with self._offline_lock:
             if event.event_id in self._offline_event_ids:
                 return
-            try:
-                events = self._read_offline_events_unlocked()
-                events.append(event.to_dict())
-                self._write_offline_events_unlocked(events)
-            except Exception as e:
-                if self.debug:
-                    print(f"[NetClient] Offline queue ekleme hatası: {e}")
+            self._offline_events[event.event_id] = event.to_dict()
+            self._offline_event_ids.add(event.event_id)
+            self._offline_dirty = True
 
     def _remove_from_offline_queue(self, event_id: str):
         with self._offline_lock:
             if event_id not in self._offline_event_ids:
                 return
-            try:
-                events = [
-                    event
-                    for event in self._read_offline_events_unlocked()
-                    if event.get("event_id") != event_id
-                ]
-                self._write_offline_events_unlocked(events)
-            except Exception as e:
-                if self.debug:
-                    print(f"[NetClient] Offline queue temizleme hatası: {e}")
-
+            self._offline_events.pop(event_id, None)
+            self._offline_event_ids.discard(event_id)
+            self._offline_dirty = True
     # ============== Status ==============
 
     def get_countdown_status(self) -> Dict[str, Any]:

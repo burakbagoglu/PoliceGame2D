@@ -32,6 +32,11 @@ class ClientTelemetryStore:
             "events_failed": max(0, int(payload.get("events_failed", 0) or 0)),
             "queue_depth": max(0, int(payload.get("queue_depth", 0) or 0)),
             "app_version": str(payload.get("app_version", ""))[:40],
+            "frame_time_p95_ms": round(max(0.0, min(1000.0, float(payload.get("frame_time_p95_ms", 0) or 0))), 1),
+            "performance_profile": str(payload.get("performance_profile", ""))[:32],
+            "quality_level": str(payload.get("quality_level", ""))[:16],
+            "render_width": max(0, min(7680, int(payload.get("render_width", 0) or 0))),
+            "render_height": max(0, min(4320, int(payload.get("render_height", 0) or 0))),
             "piezo": self._clean_piezo(payload.get("piezo")),
         }
         temperature = clean["cpu_temp_c"]
@@ -68,7 +73,7 @@ class ClientTelemetryStore:
         result["online"] = age <= self.offline_after_seconds
         return result
 
-    def list(self, num_screens: int = 12) -> dict:
+    def list(self, num_screens: int = 8) -> dict:
         now = time.time()
         with self._lock:
             clients = []

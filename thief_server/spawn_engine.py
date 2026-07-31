@@ -84,7 +84,7 @@ class ScreenSelector:
     Fair distribution + Round-robin + Randomness
     """
 
-    def __init__(self, screen_count: int = 12):
+    def __init__(self, screen_count: int = 8):
         self.screen_count = screen_count
         self.spawn_history: deque = deque(maxlen=50)
         self.screen_spawn_counts: Dict[int, int] = {
@@ -653,9 +653,15 @@ class SpawnScheduler:
                     print(f"[SpawnScheduler] Bitiş callback hatası: {e}")
 
     def _get_active_screen_ids(self) -> List[int]:
-        """Çocuk sayısından ve polling durumundan bağımsız tüm eksik ekranlar."""
+        """Kotası açık ve yakın zamanda poll yapan bağlı ekranları döndür."""
         with self._lock:
-            return list(self.session.incomplete_screens)
+            now = time.time()
+            incomplete = set(self.session.incomplete_screens)
+            return [
+                screen_id
+                for screen_id, last_poll in self._active_screens.items()
+                if screen_id in incomplete and now - last_poll < self._active_timeout
+            ]
 
     def _trigger_spawn(self, params: dict):
         """Hırsız spawn et"""
@@ -668,7 +674,7 @@ class SpawnScheduler:
         concurrent = max(concurrent, phase_hint)
         concurrent = min(concurrent, self.adaptive.max_concurrent_spawns)
 
-        # Kotası dolmamış sekiz ekranın tamamını kullan
+        # Kotası dolmamış ve gerçekten bağlı ekranları kullan
         active_screens = self._get_active_screen_ids()
 
         with self._lock:

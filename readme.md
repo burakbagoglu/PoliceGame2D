@@ -3,11 +3,11 @@ Interaktif Hırsız Oyunu — Pygame Teknik Dokümanı (v2)
 
 Kurulum:
 
-5 ekran → 5 ayrı Raspberry Pi Zero 2 W (client)
+8 ekran → 8 ayrı Raspberry Pi Zero 2 W (client)
 
 Her ekranda cam + piezo → Arduino → Pi Zero (hit input)
 
-Tüm skorlar → Raspberry Pi 5 (server)
+Tüm skorlar → Raspberry Pi 4 2 GB (server)
 
 Oyun:
 
@@ -17,7 +17,7 @@ Ekranda sabit “hedef band” vardır.
 
 Hit geldiği anda hırsız band içindeyse: düşer +1 puan.
 
-Her skor artışı Pi 5’e event olarak gönderilir.
+Her skor artışı Pi 4’e event olarak gönderilir.
 
 2) Donanım ve Bağlantılar
 2.1 Client (her ekran)
@@ -38,7 +38,7 @@ Serial output: HIT\n
 
 2.2 Server (merkez)
 
-Raspberry Pi 5
+Raspberry Pi 4 2 GB
 
 Aynı LAN (router/AP)
 
@@ -53,11 +53,11 @@ GameState (RUN/FALL/RESET/COOLDOWN)
 
 Animator (run/fall frame oynatma)
 
-NetClient (Pi 5’e HTTP event post)
+NetClient (Pi 4’e HTTP event post)
 
 Config (screen_id, speed, band, vb.)
 
-3.2 Pi 5 (Server) bileşenleri
+3.2 Pi 4 (Server) bileşenleri
 
 HTTP API: POST /event
 
@@ -139,10 +139,10 @@ Başarı: +1
 
 Fail: +0 (opsiyonel miss efekt/ses)
 
-6) Network: Event gönderimi (Pi Zero → Pi 5)
+6) Network: Event gönderimi (Pi Zero → Pi 4)
 6.1 Endpoint
 
-POST http://<PI5_IP>:8078/event
+POST http://<PI4_IP>:8078/event
 
 Payload:
 
@@ -260,10 +260,10 @@ Asset boyutlarını küçült (özellikle alpha)
 
 Parallax varsa 2–3 layer yeter
 
-12) Dağıtım (5 cihaz)
+12) Dağıtım (8 client + 1 server)
 12.1 Ağ
 
-Pi 5 statik IP: 192.168.1.10 önerilir
+Pi 4 statik IP: 192.168.1.10 önerilir
 
 Pi Zero’lar DHCP reservation veya statik:
 
@@ -298,7 +298,7 @@ Arduino çek-tak testi
 
 Wi-Fi kopma/geri gelme testi
 
-13.3 5 ekran entegrasyon
+13.3 8 ekran entegrasyon
 
 Server toplam skor doğru mu?
 
@@ -314,4 +314,4 @@ Background
 
 Local score
 
-Pi 5’e event gönderimi + total skor
+Pi 4’e event gönderimi + total skor

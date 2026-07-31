@@ -1,6 +1,6 @@
 # Sahne Editörü Kullanım Kılavuzu
 
-Sahne editörü Pi 5 server üzerinde çalışır:
+Sahne editörü Pi 4 server üzerinde çalışır:
 
 ```text
 http://SERVER_IP:8078/scene-editor
@@ -273,3 +273,19 @@ Timeline track görünümü bütün öğeleri ve keyframe noktalarını birlikte
 - Oyun ancak sekiz ekranın tamamı kotasını doldurursa kazanılmış sayılır; süre dolarsa tamamlanmayan ekranlar nedeniyle kaybetme sahnesi açılır.
 - Kontrol panelindeki sekiz ekran kartı kendi `skor / hedef` değerini ve tamamlanma durumunu canlı gösterir.
 - Editörde `screen_complete` olayıyla özel sahne kuralları tanımlanabilir; canlı simülasyondaki **Ekran tamamlandı** seçeneğiyle test edilir.
+## Pi Zero 2 W istemci performans profili
+
+Pi Zero 2 W clientlarda varsayılan profil `pi_zero_2w` olarak gelir. Fiziksel HDMI çıkışı 1920×1080 kalabilir; oyun içeride 1280×720 çizilir ve yalnızca son aşamada ekrana büyütülür. Bu, sahne düzeninin koordinatlarını değiştirmeden işlenen piksel sayısını yaklaşık yüzde 56 azaltır.
+
+`thief_client/config.json` içindeki temel seçenekler:
+
+- `performance_profile`: `pi_zero_2w`, `balanced` veya `high`.
+- `render_width` / `render_height`: iç render çözünürlüğü. Pi Zero için 1280×720 önerilir.
+- `adaptive_quality`: FPS, P95 kare süresi ve CPU sıcaklığına göre efekt kalitesini otomatik ayarlar.
+- `min_fps`: kalite yöneticisinin korumaya çalıştığı alt FPS sınırı; Pi Zero profili için 24'tür.
+
+Düşük kalite profili ağır blur ve gölge bulanıklığını kapatır, konfeti/parçacık sayılarını sınırlar ve sahne yüzeylerini 48 MB'lık LRU önbellekte tutar. Yük altında kalite kademeli olarak `low` → `minimal` düşer; sistem 30 saniye sağlıklı kaldığında tekrar yükselir.
+
+Client, spawn durumu, piezo ayarı ve seyrek telemetriyi `/api/client/poll` üzerinden tek keep-alive isteğinde alır. Eski server sürümleriyle karşılaşırsa otomatik olarak ayrı endpointlere döner. Ağ kesintisindeki skor olayları RAM'de biriktirilip iki saniyelik gruplar halinde atomik yazıldığı için SD kart yazma yükü azalır; kapanışta bekleyen olaylar zorla diske alınır.
+
+Kontrol panelindeki istemci kartları FPS yanında P95 kare süresini, aktif kalite kademesini, performans profilini ve gerçek iç render çözünürlüğünü gösterir. Pi Zero için P95 değeri sürekli 41,7 ms üstündeyse sahnedeki blur, büyük gölge, yüksek adetli konfeti ve çok büyük sprite'lar azaltılmalıdır.

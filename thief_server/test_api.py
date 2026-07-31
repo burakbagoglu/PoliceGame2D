@@ -625,3 +625,30 @@ def test_scene_diff_endpoint_returns_publish_summary():
     response = client.get("/api/scenes/diff")
     assert response.status_code == 200
     assert {"has_changes", "changed_total", "draft_revision", "published_version"} <= set(response.json())
+
+def test_combined_client_poll(monkeypatch):
+    import main
+    from client_telemetry import ClientTelemetryStore
+
+    monkeypatch.setattr(main, "client_telemetry", ClientTelemetryStore())
+    response = client.post("/api/client/poll", json={
+        "screen_id": 1,
+        "telemetry": {
+            "fps": 29.7,
+            "frame_time_p95_ms": 35.1,
+            "performance_profile": "pi_zero_2w",
+            "quality_level": "low",
+            "render_width": 1280,
+            "render_height": 720,
+        },
+    })
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "spawn_state" in payload
+    assert payload["piezo_config"]["changed"] is True
+    assert payload["heartbeat"]["frame_time_p95_ms"] == 35.1
+
+    second = client.post("/api/client/poll", json={"screen_id": 1})
+    assert second.status_code == 200
+    assert second.json()["piezo_config"]["changed"] is False

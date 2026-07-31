@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Thief Server - Raspberry Pi 5 için skor toplama + spawn kontrol sunucusu
+Thief Server - Raspberry Pi 4 için skor toplama + spawn kontrol sunucusu
 Tüm client'lardan gelen skorları toplar, spawn zamanlamasını yönetir ve dashboard sunar
 """
 import json
@@ -176,7 +176,17 @@ class ClientTelemetryRequest(BaseModel):
     events_failed: int = Field(default=0, ge=0)
     queue_depth: int = Field(default=0, ge=0)
     app_version: str = Field(default="", max_length=40)
+    frame_time_p95_ms: float = Field(default=0, ge=0, le=1000)
+    performance_profile: str = Field(default="", max_length=32)
+    quality_level: str = Field(default="", max_length=16)
+    render_width: int = Field(default=0, ge=0, le=7680)
+    render_height: int = Field(default=0, ge=0, le=4320)
     piezo: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ClientPollRequest(BaseModel):
+    screen_id: int = Field(ge=1, le=GAME_SCREEN_COUNT)
+    telemetry: Optional[Dict[str, Any]] = None
 
 
 class SceneScreenshotRequest(BaseModel):
@@ -194,7 +204,7 @@ class SceneScreenshotUpload(BaseModel):
 class ScoreManager:
     """Skor yöneticisi - idempotent event işleme"""
 
-    def __init__(self, num_screens: int = 12):
+    def __init__(self, num_screens: int = GAME_SCREEN_COUNT):
         self._lock = threading.RLock()
         self.num_screens = num_screens
         self.screen_scores: Dict[int, int] = {i: 0 for i in range(1, num_screens + 1)}
@@ -772,6 +782,26 @@ async def poll_piezo_config(
 async def client_heartbeat(req: ClientTelemetryRequest):
     """İstemci sağlık verisini RAM üzerinde güncelle; kalıcı disk yazımı yapma."""
     return {"success": True, **client_telemetry.update(req.screen_id, req.model_dump())}
+
+
+@app.post("/api/client/poll")
+async def combined_client_poll(req: ClientPollRequest):
+    """Spawn, piezo ve seyrek heartbeat verisini tek keep-alive isteğinde birleştir."""
+    spawn_state = await spawn_poll(req.screen_id)
+    piezo_state = piezo_config.poll(req.screen_id)
+    heartbeat = None
+    if isinstance(req.telemetry, dict):
+        payload = {**req.telemetry, "screen_id": req.screen_id}
+        try:
+            validated = ClientTelemetryRequest(**payload)
+            heartbeat = client_telemetry.update(req.screen_id, validated.model_dump())
+        except (TypeError, ValueError):
+            heartbeat = None
+    return {
+        "spawn_state": spawn_state,
+        "piezo_config": {"changed": bool(piezo_state), **(piezo_state or {})},
+        "heartbeat": heartbeat,
+    }
 
 
 @app.get("/api/clients/status")
@@ -1867,8 +1897,10 @@ DASHBOARD_HTML = """
                 document.getElementById('client-health').innerHTML = latestTelemetry.clients.map(client => `
                     <div class="screen-card" style="border-color:${client.online ? '#22c55e' : '#ef4444'}">
                         <h4>Ekran ${client.screen_id} · ${client.online ? 'Bağlı' : 'Çevrimdışı'}</h4>
-                        <div>FPS: ${client.fps ?? '—'} · RAM: ${client.memory_mb ? client.memory_mb + ' MB' : '—'}</div>
-                        <div>Sıcaklık: ${client.cpu_temp_c != null ? client.cpu_temp_c + ' °C' : '—'} · Seri: ${client.serial_connected ? 'OK' : 'Yok'}</div>
+                        <div>FPS: ${client.fps ?? '—'} · P95 kare: ${client.frame_time_p95_ms ? client.frame_time_p95_ms + ' ms' : '—'}</div>
+                        <div>RAM: ${client.memory_mb ? client.memory_mb + ' MB' : '—'} · Sıcaklık: ${client.cpu_temp_c != null ? client.cpu_temp_c + ' °C' : '—'}</div>
+                        <div>Profil: ${client.performance_profile || '—'} · Kalite: ${client.quality_level || '—'}</div>
+                        <div>Render: ${client.render_width && client.render_height ? client.render_width + '×' + client.render_height : '—'} · Seri: ${client.serial_connected ? 'OK' : 'Yok'}</div>
                         <div>Sahne: ${client.active_scene || '—'} · Kuyruk: ${client.queue_depth ?? 0}</div>
                     </div>`).join('');
                 renderSelectedTelemetry();

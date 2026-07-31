@@ -1,5 +1,5 @@
 """
-Raspberry Pi 5 üzerinde merkezi müzik ve efekt oynatma.
+Raspberry Pi 4 üzerinde merkezi müzik ve efekt oynatma.
 
 Ses çıkışı client'larda değil, server'a bağlı USB ses kartındadır. Modül;
 pygame/SDL ses cihazı bulunamadığında server'ı durdurmadan sessiz moda geçer.

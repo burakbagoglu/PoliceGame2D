@@ -1,15 +1,15 @@
 # Production Checklist
 
-Bu notlar Pi 5 server ve Pi Zero client kurulumunu sahada daha sorunsuz calistirmak icin kisa kontrol listesidir.
+Bu notlar Pi 4 server ve Pi Zero client kurulumunu sahada daha sorunsuz calistirmak icin kisa kontrol listesidir.
 
 ## Server
 
-1. Pi 5 icin statik IP veya DHCP reservation ayarla. Varsayilan dokuman IP: `192.168.1.10`.
+1. Pi 4 icin statik IP veya DHCP reservation ayarla. Varsayilan dokuman IP: `192.168.1.10`.
 2. `thief_server/config.json` icinde:
    - `port`: `8078`
    - `debug`: `false`
    - `access_log`: `false`
-   - `num_screens`: sahadaki ekran sayisi
+   - `num_screens`: `8` (oyun mimarisi sabit sekiz ekran kullanir)
 3. Kurulum:
    ```bash
    cd /home/pi/thief_server
@@ -18,16 +18,16 @@ Bu notlar Pi 5 server ve Pi Zero client kurulumunu sahada daha sorunsuz calistir
    sudo systemctl status thief-server
    ```
 4. Kontrol:
-   - Dashboard: `http://<PI5_IP>:8078/dashboard`
-   - Seyir ekrani: `http://<PI5_IP>:8078/screen`
-   - Health: `http://<PI5_IP>:8078/health`
+   - Dashboard: `http://<PI4_IP>:8078/dashboard`
+   - Seyir ekrani: `http://<PI4_IP>:8078/screen`
+   - Health: `http://<PI4_IP>:8078/health`
 
 ## Client
 
 Her Pi Zero icin:
 
 1. `thief_client/config.json` icinde benzersiz `screen_id` ver.
-2. `server_base_url` ve `server_url` degerlerini Pi 5 IP adresine gore ayarla:
+2. `server_base_url` ve `server_url` degerlerini Pi 4 IP adresine gore ayarla:
    ```json
    "server_base_url": "http://192.168.1.10:8078",
    "server_url": "http://192.168.1.10:8078/event"
@@ -46,7 +46,7 @@ Her Pi Zero icin:
 
 Sunucudaki tarayici tabanli seyir ekrani iki sekilde gosterilebilir:
 
-1. **Tarayici** (guclu cihazlar): `http://<PI5_IP>:8078/screen`
+1. **Tarayici** (guclu cihazlar): `http://<PI4_IP>:8078/screen`
 2. **Pygame spectator** (dusuk RAM'li cihazlar, orn. Pi 3 / Pi Zero 512MB):
    `thief_spectator/` klasorundeki hafif uygulama. Chromium ~300MB+ RAM isterken
    bu uygulama ~40-60MB kullanir ve ayni JSON uclarini (`/score`, `/api/game/status`,
@@ -55,7 +55,7 @@ Sunucudaki tarayici tabanli seyir ekrani iki sekilde gosterilebilir:
    Kurulum (seyir cihazinda):
    ```bash
    cd /home/pi/thief_spectator
-   # config.json icinde server_base_url'i Pi 5 IP'sine ayarla
+   # config.json icinde server_base_url'i Pi 4 IP'sine ayarla
    ./setup_spectator.sh
    sudo systemctl start thief-spectator
    ```
@@ -133,10 +133,10 @@ Sahada kesintisiz calismak icin yapilan sertlestirmeler:
 
 ## Server USB Ses Karti
 
-Ses Pi Zero client'lardan degil, Pi 5 server'a bagli USB ses kartindan cikar:
+Ses Pi Zero client'lardan degil, Pi 4 server'a bagli USB ses kartindan cikar:
 
 ```text
-Pi 5 USB -> USB ses karti -> 3.5 mm -> aktif hoparlor
+Pi 4 USB -> USB ses karti -> 3.5 mm -> aktif hoparlor
 ```
 
 Kontrol:

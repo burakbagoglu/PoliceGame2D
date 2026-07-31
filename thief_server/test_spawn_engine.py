@@ -382,6 +382,21 @@ class TestSpawnScheduler:
             phase_spawner=phase,
         )
 
+    def test_single_polling_client_is_the_only_spawn_candidate(self):
+        scheduler = self._make_scheduler(screen_count=8)
+        assert scheduler._get_active_screen_ids() == []
+
+        scheduler.poll_spawn(1)
+        scheduler._active_screens[2] = time.time() - scheduler._active_timeout - 1
+
+        assert scheduler._get_active_screen_ids() == [1]
+        scheduler._trigger_spawn({
+            "concurrent_spawns": 3,
+            "urgency": "NORMAL",
+            "spawn_interval": 3.0,
+        })
+        assert scheduler.poll_spawn(1)["spawn"] is True
+        assert all(scheduler.spawn_queues[sid].empty() for sid in range(2, 9))
     def test_poll_spawn_empty(self):
         scheduler = self._make_scheduler()
         result = scheduler.poll_spawn(1)

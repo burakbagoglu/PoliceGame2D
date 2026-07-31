@@ -14,6 +14,7 @@ import math
 import io
 import pygame
 import time
+from collections import deque
 
 # Modül yolunu ekle
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -81,6 +82,18 @@ class ThiefGame:
 
         # Saat
         self.clock = pygame.time.Clock()
+        self._frame_times_ms = deque(maxlen=180)
+        self.frame_time_p95_ms = 0.0
+        self.performance_profile = self.config.performance_profile
+        self._quality_order = ["minimal", "low", "medium", "high"]
+        self._base_quality = {
+            "pi_zero_2w": "low",
+            "balanced": "medium",
+            "high": "high",
+        }.get(self.performance_profile, "low")
+        self.quality_level = self._base_quality
+        self._last_quality_evaluation = time.monotonic()
+        self._quality_recovery_since = None
 
         # Fontlar (bir kez)
         self.font = pygame.font.Font(None, 72)
@@ -157,8 +170,70 @@ class ThiefGame:
             "cpu_temp_c": self._read_cpu_temperature(),
             "serial_connected": bool(getattr(self.hit_input, "connected", False)),
             "piezo": self.hit_input.get_telemetry(),
-            "app_version": "scene-engine-v5",
+            "frame_time_p95_ms": round(self.frame_time_p95_ms, 1),
+            "performance_profile": self.performance_profile,
+            "quality_level": self.quality_level,
+            "render_width": getattr(self, "view_w", self.config.render_width),
+            "render_height": getattr(self, "view_h", self.config.render_height),
+            "app_version": "scene-engine-v6-pizero",
         }
+    def _set_quality_level(self, quality_level: str):
+        if quality_level == self.quality_level:
+            return
+        self.quality_level = quality_level
+        if hasattr(self, "scene_renderer"):
+            self.scene_renderer.set_quality(quality_level)
+        if self.config.debug:
+            print(f"[Performans] Kalite seviyesi: {quality_level}")
+
+    def _record_frame_performance(self, frame_ms: float):
+        self._frame_times_ms.append(max(0.0, float(frame_ms)))
+        if len(self._frame_times_ms) >= 20:
+            ordered = sorted(self._frame_times_ms)
+            index = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * 0.95) - 1))
+            self.frame_time_p95_ms = ordered[index]
+        if not self.config.adaptive_quality or len(self._frame_times_ms) < 30:
+            return
+        now = time.monotonic()
+        if now - self._last_quality_evaluation < 3.0:
+            return
+        self._last_quality_evaluation = now
+        fps = float(self.clock.get_fps())
+        temperature = self._read_cpu_temperature()
+        frame_budget_ms = 1000.0 / max(15.0, self.config.min_fps)
+        overloaded = (
+            self.frame_time_p95_ms > frame_budget_ms
+            or (fps > 1.0 and fps < self.config.min_fps)
+            or (temperature is not None and temperature >= 78.0)
+        )
+        current_index = self._quality_order.index(self.quality_level)
+        base_index = self._quality_order.index(self._base_quality)
+        if overloaded:
+            self._quality_recovery_since = None
+            if current_index > 0:
+                self._set_quality_level(self._quality_order[current_index - 1])
+            return
+        healthy = (
+            self.frame_time_p95_ms < frame_budget_ms * 0.65
+            and (fps <= 1.0 or fps >= self.config.min_fps + 2.0)
+            and (temperature is None or temperature < 72.0)
+        )
+        if not healthy or current_index >= base_index:
+            self._quality_recovery_since = None
+            return
+        self._quality_recovery_since = self._quality_recovery_since or now
+        if now - self._quality_recovery_since >= 30.0:
+            self._set_quality_level(self._quality_order[current_index + 1])
+            self._quality_recovery_since = None
+
+    def _effect_budget(self, high: int, medium: int, low: int, minimal: int) -> int:
+        return {
+            "high": high,
+            "medium": medium,
+            "low": low,
+            "minimal": minimal,
+        }[self.quality_level]
+
     def _resolve_sprite_paths(self):
         """Sprite dosya yollarını çöz."""
         script_dir = self.script_dir
@@ -232,16 +307,28 @@ class ThiefGame:
         # --- Oynanabilir alan (pleksi) ---
         rect = cfg.playarea.compute(self.screen_width, self.screen_height)
         self.view_x, self.view_y = rect.x, rect.y
-        self.view_w, self.view_h = rect.w, rect.h
+        self.output_view_w, self.output_view_h = rect.w, rect.h
+        self.render_ratio = min(
+            1.0,
+            cfg.render_width / max(1, self.output_view_w),
+            cfg.render_height / max(1, self.output_view_h),
+        )
+        self.view_w = max(320, round(self.output_view_w * self.render_ratio))
+        self.view_h = max(180, round(self.output_view_h * self.render_ratio))
 
-        # Çizim hedefi (canvas) — pleksi boyutunda
-        self.canvas = pygame.Surface((self.view_w, self.view_h))
+        # Oyun düşük çözünürlüklü canvas'a çizilir; yalnız sunumda fiziksel alana büyütülür.
+        self.canvas = pygame.Surface((self.view_w, self.view_h)).convert()
+        self.present_surface = (
+            pygame.Surface((self.output_view_w, self.output_view_h)).convert()
+            if (self.view_w, self.view_h) != (self.output_view_w, self.output_view_h)
+            else None
+        )
 
         # --- Oyun koordinatları (oynanabilir alan uzayında, çözünürlükten bağımsız) ---
         self.thief_y = int(round(self.view_h * cfg.thief_ground_pct / 100))
 
         if cfg.band_enabled:
-            bw = max(1, int(cfg.band_width_px))
+            bw = max(1, round(cfg.band_width_px * self.render_ratio))
             cx = self.view_w * cfg.band_center_pct / 100
             self.band_x_min = int(round(cx - bw / 2))
             self.band_x_max = int(round(cx + bw / 2))
@@ -251,15 +338,17 @@ class ThiefGame:
             self.band_x_max = 0
         self.band_width_px = bw
 
-        scale = int(cfg.thief_scale)
-        margin = cfg.spawn_margin_px or (48 * scale // 2 + 60)
+        scale = max(1, round(cfg.thief_scale * self.render_ratio))
+        self.runtime_thief_scale = scale
+        configured_margin = round(cfg.spawn_margin_px * self.render_ratio)
+        margin = configured_margin or (48 * scale // 2 + round(60 * self.render_ratio))
         spawn_x = self.view_w + margin
         reset_x = -margin
 
         # --- Animatör ---
         self.animator = ThiefAnimator(
             self.sprite_path,
-            scale=cfg.thief_scale,
+            scale=scale,
             anim_fps=cfg.anim_fps,
             fall_sprite_path=self.fall_sprite_path,
             death_sprite_path=self.death_sprite_path,
@@ -271,7 +360,7 @@ class ThiefGame:
             spawn_x=spawn_x,
             reset_x=reset_x,
             thief_y=self.thief_y,
-            speed_px_s=cfg.thief_speed_px_s,
+            speed_px_s=cfg.thief_speed_px_s * self.render_ratio,
             random_direction=cfg.random_direction,
             band_enabled=cfg.band_enabled,
             band_x_min=self.band_x_min,
@@ -346,6 +435,7 @@ class ThiefGame:
         self.countdown_was_active = False
         self.countdown_confetti = []
         self.scene_renderer = SceneRenderer(self.view_w, self.view_h)
+        self.scene_renderer.set_quality(self.quality_level)
         if self._last_scene_payload:
             self.scene_renderer.apply(**self._last_scene_payload)
             self._apply_scene_runtime_layout(self._last_scene_payload.get("document"))
@@ -404,7 +494,7 @@ class ThiefGame:
             )
 
         # Para/Altın parçacıkları fırlat
-        for _ in range(15):
+        for _ in range(self._effect_budget(15, 12, 8, 4)):
             self.particles.append(Particle(thief_x, self.thief_y - 80))
 
     def _on_direction_change(self, direction: int):
@@ -462,6 +552,7 @@ class ThiefGame:
         """Ana oyun döngüsü (tek oturum)"""
         while self.running:
             dt = self.clock.tick(self.config.fps) / 1000.0
+            frame_started = time.perf_counter()
 
             # Hit Stop (Zaman donması) hesaplaması
             game_dt = dt
@@ -519,10 +610,19 @@ class ThiefGame:
             self._draw()
             self._present()
             self._capture_requested_scene_preview()
+            self._record_frame_performance((time.perf_counter() - frame_started) * 1000.0)
 
     def _present(self):
-        """Canvas'ı ekrana (oynanabilir alana) blit et."""
-        self.screen.blit(self.canvas, (self.view_x, self.view_y))
+        """Düşük çözünürlüklü canvas'ı fiziksel oyun alanına tek adımda büyüt."""
+        output = self.canvas
+        if self.present_surface is not None:
+            pygame.transform.scale(
+                self.canvas,
+                (self.output_view_w, self.output_view_h),
+                self.present_surface,
+            )
+            output = self.present_surface
+        self.screen.blit(output, (self.view_x, self.view_y))
         pygame.display.flip()
 
     def _capture_requested_scene_preview(self):
@@ -653,7 +753,7 @@ class ThiefGame:
         self.countdown_stage_start = now
         self.countdown_display_until = now + duration_ms
 
-        count = 82 if message == "HIRSIZLARI VUR" else 58
+        count = self._effect_budget(82, 65, 42, 20) if message == "HIRSIZLARI VUR" else self._effect_budget(58, 45, 30, 14)
         if self.scene_renderer.ready:
             return
         origin_y = int(self.view_h * (0.58 if message == "HIRSIZLARI VUR" else 0.52))
@@ -833,7 +933,7 @@ class ThiefGame:
             y = self.game.thief.y - shadow_height // 2 + self.config.shadow_offset_y + offset_y
 
             if self.animator.current_state == "fall":
-                y += 15 * self.config.thief_scale
+                y += 15 * self.runtime_thief_scale
 
             draw_shadow = shadow
             if self.thief_alpha < 255:
@@ -854,7 +954,7 @@ class ThiefGame:
             y = self.game.thief.y - frame.get_height() + offset_y
 
             if self.animator.current_state == "fall":
-                y += 15 * self.config.thief_scale
+                y += 15 * self.runtime_thief_scale
 
             if self.thief_alpha < 255:
                 frame = frame.copy()

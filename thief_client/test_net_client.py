@@ -535,3 +535,88 @@ class TestNetClientPolling:
         assert payload["screen_id"] == 3
         assert payload["fps"] == 29.5
         assert payload["piezo"]["latest"] == 100
+
+@pytest.mark.skipif(not RESPONSES_AVAILABLE, reason="responses kutuphanesi yuklu degil")
+class TestCombinedPolling:
+    @responses.activate
+    def test_combined_poll_applies_all_payloads(self):
+        responses.post(
+            "http://test:8000/api/client/poll",
+            json={
+                "spawn_state": {
+                    "spawn": True,
+                    "game_active": True,
+                    "active_scene": "gameplay",
+                    "screen_score": 2,
+                    "screen_target": 10,
+                    "screen_remaining": 8,
+                },
+                "piezo_config": {
+                    "changed": True,
+                    "threshold": 180,
+                    "refractory_ms": 350,
+                },
+                "heartbeat": {"online": True},
+            },
+            status=200,
+        )
+        client = NetClient(
+            server_url="http://test:8000/event",
+            server_base_url="http://test:8000",
+            screen_id=4,
+            telemetry_provider=lambda: {
+                "fps": 29.4,
+                "frame_time_p95_ms": 36.2,
+                "performance_profile": "pi_zero_2w",
+                "quality_level": "low",
+            },
+        )
+        client._last_heartbeat = 0
+
+        assert client._poll_combined() is True
+        assert client.get_spawn() is True
+        assert client.get_piezo_config() == {"threshold": 180, "refractory_ms": 350}
+        assert client.server_screen_remaining == 8
+        request_body = json.loads(responses.calls[0].request.body)
+        assert request_body["screen_id"] == 4
+        assert request_body["telemetry"]["frame_time_p95_ms"] == 36.2
+
+    @responses.activate
+    def test_combined_poll_marks_old_server_for_fallback(self):
+        responses.post("http://test:8000/api/client/poll", status=404)
+        client = NetClient(
+            server_url="http://test:8000/event",
+            server_base_url="http://test:8000",
+            screen_id=1,
+        )
+
+        assert client._poll_combined() is False
+        assert client._combined_poll_supported is False
+
+
+def test_offline_events_are_written_in_batches(tmp_path):
+    queue_file = str(tmp_path / "event_queue.json")
+    client = NetClient(
+        server_url="http://test:8000/event",
+        server_base_url="http://test:8000",
+        screen_id=1,
+        queue_file=queue_file,
+    )
+    client.offline_flush_interval_s = 60
+    client._last_offline_flush = time.monotonic()
+    first = ScoreEvent.create(1, 1)
+    second = ScoreEvent.create(1, 2)
+
+    client._add_to_offline_queue(first)
+    client._add_to_offline_queue(second)
+    assert not os.path.exists(queue_file)
+
+    client._flush_offline_events(force=True)
+    with open(queue_file, "r", encoding="utf-8") as handle:
+        assert len(json.load(handle)) == 2
+
+    client._remove_from_offline_queue(first.event_id)
+    client._flush_offline_events(force=True)
+    with open(queue_file, "r", encoding="utf-8") as handle:
+        persisted = json.load(handle)
+    assert [event["event_id"] for event in persisted] == [second.event_id]

@@ -173,3 +173,40 @@ def test_layer_folder_visibility_and_filter_pipeline():
 
     assert renderer.draw(target, "waiting", {"score": 5}) is True
     assert target.get_at((150, 150))[:3] == (16, 32, 48)
+
+def test_screen_quota_tokens_are_replaced():
+    text = SceneRenderer._replace_tokens(
+        "{screen_score}/{screen_target} - {screen_remaining} - {screen_complete}",
+        {
+            "screen_score": 7,
+            "screen_target": 12,
+            "screen_remaining": 5,
+            "screen_complete": False,
+        },
+    )
+
+    assert text == "7/12 - 5 - False"
+
+
+def test_surface_cache_reuses_entries_and_stays_bounded():
+    renderer = SceneRenderer(960, 540)
+    renderer.apply("published-cache", make_document())
+    source = pygame.Surface((320, 180), pygame.SRCALPHA)
+    source.fill((200, 100, 40, 255))
+    filters = {"brightness": 1.1, "contrast": 1.1, "saturation": 0.9, "blur": 2}
+
+    first = renderer._apply_filters(source, filters)
+    second = renderer._apply_filters(source, filters)
+
+    assert first is second
+    assert renderer._surface_cache_bytes <= renderer._surface_cache_limit
+
+
+def test_low_quality_disables_blur_filter():
+    renderer = SceneRenderer(960, 540)
+    renderer.set_quality("low")
+    source = pygame.Surface((64, 64), pygame.SRCALPHA)
+
+    filtered = renderer._apply_filters(source, {"blur": 12})
+
+    assert filtered is source

@@ -52,6 +52,13 @@ class GameConfig:
     band_width_px: int = 120         # Band genişliği (piksel)
     spawn_margin_px: int = 0         # 0 = otomatik (sprite boyutuna göre)
 
+    # --- Pi client performans profili ---
+    performance_profile: str = "pi_zero_2w"
+    render_width: int = 1280
+    render_height: int = 720
+    adaptive_quality: bool = True
+    min_fps: float = 24.0
+
     @staticmethod
     def read_raw(filepath: str) -> dict:
         """JSON dosyasını ham sözlük olarak oku (sihirbaz/kaydetme için)."""
@@ -102,6 +109,21 @@ class GameConfig:
         )
         default_band_width = max(10, band_x_max - band_x_min)
 
+        profile = str(os.environ.get(
+            "THIEF_PERFORMANCE_PROFILE",
+            data.get("performance_profile", "pi_zero_2w"),
+        )).lower()
+        profile_defaults = {
+            "pi_zero_2w": (1280, 720, 24.0),
+            "balanced": (1600, 900, 26.0),
+            "high": (1920, 1080, 28.0),
+        }
+        if profile not in profile_defaults:
+            profile = "pi_zero_2w"
+        default_render_w, default_render_h, default_min_fps = profile_defaults[profile]
+        render_width = max(320, min(1920, int(data.get("render_width", default_render_w))))
+        render_height = max(180, min(1080, int(data.get("render_height", default_render_h))))
+
         return cls(
             screen_id=int(os.environ.get("THIEF_SCREEN_ID", data.get("screen_id", 1))),
             server_url=server_url,
@@ -138,6 +160,11 @@ class GameConfig:
             band_center_pct=float(data.get("band_center_pct", default_band_center)),
             band_width_px=int(data.get("band_width_px", default_band_width)),
             spawn_margin_px=int(data.get("spawn_margin_px", 0)),
+            performance_profile=profile,
+            render_width=render_width,
+            render_height=render_height,
+            adaptive_quality=env_bool("THIEF_ADAPTIVE_QUALITY", data.get("adaptive_quality", True)),
+            min_fps=max(15.0, min(60.0, float(data.get("min_fps", default_min_fps)))),
         )
 
     @property

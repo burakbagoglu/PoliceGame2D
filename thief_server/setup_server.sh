@@ -1,5 +1,5 @@
 #!/bin/bash
-# Raspberry Pi 5 Server Kurulum Script'i
+# Raspberry Pi 4 Server Kurulum Script'i
 
 echo "=== Thief Game Server Kurulumu ==="
 

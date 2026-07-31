@@ -1,10 +1,10 @@
 # Dashboard Kullanım Kılavuzu
 
-Bu kılavuz Pi 5 üzerinde çalışan Hırsız Oyunu kontrol panelini sahada kullanmak için hazırlanmıştır.
+Bu kılavuz Pi 4 üzerinde çalışan Hırsız Oyunu kontrol panelini sahada kullanmak için hazırlanmıştır.
 
 ## Adresler
 
-Pi 5 varsayılan IP adresi örneği:
+Pi 4 varsayılan IP adresi örneği:
 
 ```text
 192.168.1.10
@@ -34,9 +34,9 @@ Dashboard üst kısmındaki **Hızlı Başlangıç** alanı oyunu tek tıkla ba�
 
 Mevcut modlar:
 
-- **Kısa Tur**: 2 çocuk, 5 ekran, 6 dakika, kolay mod
-- **Standart**: 5 çocuk, 12 ekran, 20 dakika, normal mod
-- **Yoğun Mod**: 10 çocuk, 12 ekran, 30 dakika, zor mod
+- **Kısa Tur**: 2 çocuk, 8 ekran, 30 dakika, kolay mod
+- **Standart**: 5 çocuk, 8 ekran, 35 dakika, normal mod
+- **Yoğun Mod**: 10 çocuk, 8 ekran, 40 dakika, zor mod
 
 Bir moda tıklayınca dashboard çocuk sayısı, ekran sayısı, süre ve zorluk alanlarını otomatik doldurur ve oyunu başlatır.
 
@@ -45,14 +45,14 @@ Bir moda tıklayınca dashboard çocuk sayısı, ekran sayısı, süre ve zorluk
 **Oyun Kontrolü** bölümündeki alanlar:
 
 - **Çocuk**: Oyuna katılan çocuk sayısı
-- **Ekran**: Aktif ekran sayısı
+- **Ekran**: Sabit ekran sayısı (8)
 - **Süre**: Oyun süresi, dakika cinsinden
 - **Zorluk**: Kolay, normal veya zor
 
 Manuel başlatmak için:
 
 1. Çocuk sayısını girin.
-2. Ekran sayısını girin.
+2. Ekran sayısını 8 olarak bırakın.
 3. Süreyi seçin.
 4. Zorluğu seçin.
 5. **Oyunu Başlat** butonuna basın.
@@ -193,7 +193,7 @@ görünür.
 
 ## Server Ses Kontrolü
 
-Ses, Pi 5'e USB ses kartı üzerinden bağlanan 3.5 mm aktif hoparlörden çıkar.
+Ses, Pi 4'e USB ses kartı üzerinden bağlanan 3.5 mm aktif hoparlörden çıkar.
 Client cihazlarında hoparlör bulunması gerekmez.
 
 Dashboard içindeki **Server Sesi** kartında:
@@ -207,7 +207,7 @@ Yeni ve geçerli bir skor eventi geldiğinde vuruş sesi çalar. Aynı `event_id
 tekrar gönderildiğinde ses ikinci kez çalmaz. Oyun başlayınca müzik başlar;
 oyun manuel, süre dolarak veya hedef tamamlanarak bittiğinde müzik durur.
 
-USB kart görünmüyorsa Pi 5 üzerinde:
+USB kart görünmüyorsa Pi 4 üzerinde:
 
 ```bash
 aplay -l
@@ -219,7 +219,7 @@ komutlarıyla cihaz ve server logları kontrol edilmelidir.
 
 ## Sahada Hızlı Debug
 
-Server durumunu kontrol etmek için Pi 5 üzerinde:
+Server durumunu kontrol etmek için Pi 4 üzerinde:
 
 ```bash
 sudo systemctl status thief-server
@@ -255,7 +255,7 @@ sudo systemctl status thief-server
 curl http://localhost:8078/health
 ```
 
-Pi 5 IP adresi değişmiş olabilir.
+Pi 4 IP adresi değişmiş olabilir.
 
 ### Client skor göndermiyor
 
@@ -281,12 +281,12 @@ Config içindeki `serial_port` gerçek port ile aynı olmalıdır.
 
 ### Aynı ekran iki kez görünüyor gibi davranıyor
 
-Her Pi Zero’da `screen_id` benzersiz olmalıdır. 12 ekran için değerler `1` ile `12` arasında olmalıdır.
+Her Pi Zero’da `screen_id` benzersiz olmalıdır. Sabit 8 ekran için değerler `1` ile `8` arasında olmalıdır.
 
 ## Etkinlik Öncesi Kontrol Listesi
 
-- Pi 5 açık ve dashboard erişilebilir.
-- 12 Pi Zero açık.
+- Pi 4 açık ve dashboard erişilebilir.
+- 8 Pi Zero açık.
 - Her client farklı `screen_id` kullanıyor.
 - Her client server’a `8078` portundan ulaşabiliyor.
 - Dashboarddan kısa tur başlatılabiliyor.

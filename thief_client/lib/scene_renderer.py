@@ -7,6 +7,7 @@ import math
 import os
 import random
 import time
+from collections import OrderedDict
 from typing import Any, Dict, Optional, Tuple
 
 import pygame
@@ -42,11 +43,16 @@ class SceneRenderer:
         self._base_width = 1920.0
         self._base_height = 1080.0
         self._font_cache: Dict[Tuple[int, bool], pygame.font.Font] = {}
-        self._surface_cache: Dict[tuple, pygame.Surface] = {}
+        self._surface_cache = OrderedDict()
+        self._surface_cache_bytes = 0
+        self._surface_cache_limit = 48 * 1024 * 1024
         self._sprite_cache: Dict[str, pygame.Surface] = {}
         self._asset_paths: Dict[str, str] = {}
         self._active_token: Optional[str] = None
         self._scene_started_at = time.monotonic()
+        self.quality_level = "high"
+        self._compiled_scenes: Dict[str, dict] = {}
+        self._compiled_rules = []
 
     @property
     def ready(self) -> bool:
@@ -74,7 +80,9 @@ class SceneRenderer:
         self._scale_y = self.height / base_height
         self._asset_paths = dict(asset_paths or {})
         self._surface_cache.clear()
+        self._surface_cache_bytes = 0
         self._sprite_cache.clear()
+        self._compile_document()
         self._active_token = None
 
         for name, path in self._asset_paths.items():
@@ -85,12 +93,64 @@ class SceneRenderer:
             except (pygame.error, OSError):
                 continue
 
+    def set_quality(self, quality_level: str):
+        quality = str(quality_level or "high").lower()
+        if quality not in {"minimal", "low", "medium", "high"}:
+            quality = "low"
+        if quality != self.quality_level:
+            self.quality_level = quality
+            self._surface_cache.clear()
+            self._surface_cache_bytes = 0
+
+    def _compile_document(self):
+        self._compiled_scenes = {}
+        for scene_id, scene in (self.document or {}).get("scenes", {}).items():
+            elements = tuple(sorted(scene.get("elements", []), key=lambda item: float(item.get("z", 0))))
+            self._compiled_scenes[str(scene_id)] = {
+                "scene": scene,
+                "elements": elements,
+                "folders": {
+                    str(item.get("id", "")): item
+                    for item in scene.get("layer_groups", [])
+                    if isinstance(item, dict)
+                },
+                "element_map": {
+                    str(item.get("id", "")): item
+                    for item in elements
+                    if isinstance(item, dict)
+                },
+            }
+        self._compiled_rules = tuple(sorted(
+            (self.document or {}).get("rules", []),
+            key=lambda rule: float(rule.get("priority", 0)),
+            reverse=True,
+        ))
+
+    def _cache_get(self, key):
+        surface = self._surface_cache.get(key)
+        if surface is not None:
+            self._surface_cache.move_to_end(key)
+        return surface
+
+    def _cache_put(self, key, surface: pygame.Surface):
+        cost = max(1, surface.get_width() * surface.get_height() * 4)
+        previous = self._surface_cache.pop(key, None)
+        if previous is not None:
+            self._surface_cache_bytes -= previous.get_width() * previous.get_height() * 4
+        if cost > self._surface_cache_limit // 2:
+            return surface
+        self._surface_cache[key] = surface
+        self._surface_cache_bytes += cost
+        while self._surface_cache and self._surface_cache_bytes > self._surface_cache_limit:
+            _, removed = self._surface_cache.popitem(last=False)
+            self._surface_cache_bytes -= removed.get_width() * removed.get_height() * 4
+        return surface
+
     def set_active_scene(self, scene_id: str, restart_token: str = ""):
         token = f"{scene_id}:{restart_token}"
         if token != self._active_token:
             self._active_token = token
             self._scene_started_at = time.monotonic()
-
     def draw(
         self,
         target: pygame.Surface,
@@ -105,18 +165,21 @@ class SceneRenderer:
         if not self.has_scene(scene_id):
             return False
 
-        if len(self._surface_cache) > 256:
-            # Dinamik zaman/skor/sprite frame yüzeyleri sınırsız birikmesin.
-            self._surface_cache.clear()
-
         self.set_active_scene(scene_id, restart_token)
-        scene = self.document["scenes"][scene_id]
+        compiled = self._compiled_scenes.get(scene_id)
+        if not compiled:
+            return False
+        scene = compiled["scene"]
         elapsed = max(0.0, time.monotonic() - self._scene_started_at)
         duration = max(0.1, float(scene.get("duration", 5.0)))
         timeline_elapsed = elapsed % duration if scene.get("loop_timeline") else min(elapsed, duration)
         transition = scene.get("transition", {})
         transition_duration = max(0.0, float(transition.get("duration", 0.0)))
         transition_type = str(transition.get("type", "none"))
+        if self.quality_level == "minimal":
+            transition_type = "none"
+        elif self.quality_level == "low" and transition_type == "zoom":
+            transition_type = "fade"
         transition_active = transition_type != "none" and transition_duration > 0 and elapsed < transition_duration
         draw_target = pygame.Surface(target.get_size(), pygame.SRCALPHA) if transition_active else target
 
@@ -124,8 +187,9 @@ class SceneRenderer:
         if background != "transparent":
             draw_target.fill(parse_color(background, (40, 44, 52)))
 
-        folders = {str(item.get("id", "")): item for item in scene.get("layer_groups", []) if isinstance(item, dict)}
-        elements = sorted(scene.get("elements", []), key=lambda item: float(item.get("z", 0)))
+        folders = compiled["folders"]
+        elements = compiled["elements"]
+        element_map = compiled["element_map"]
         for element in elements:
             folder = folders.get(str(element.get("folder_id", "")), {})
             if folder.get("hidden"):
@@ -141,7 +205,7 @@ class SceneRenderer:
             previous_clip = draw_target.get_clip()
             mask_id = str(folder.get("mask_element_id", ""))
             if mask_id and mask_id != str(element.get("id", "")):
-                mask_element = next((item for item in elements if str(item.get("id", "")) == mask_id), None)
+                mask_element = element_map.get(mask_id)
                 if mask_element:
                     draw_target.set_clip(self._element_rect(mask_element))
             self._draw_element(draw_target, scene_id, animated, context, timeline_elapsed)
@@ -155,12 +219,7 @@ class SceneRenderer:
         """Öncelikli event kurallarından ilk eşleşen özel sahneyi seç."""
         if not self.ready:
             return fallback_scene
-        rules = sorted(
-            self.document.get("rules", []),
-            key=lambda rule: float(rule.get("priority", 0)),
-            reverse=True,
-        )
-        for rule in rules:
+        for rule in self._compiled_rules:
             scene_id = str(rule.get("scene_id", ""))
             if not rule.get("enabled", True) or not self.has_scene(scene_id):
                 continue
@@ -321,7 +380,11 @@ class SceneRenderer:
         rotation = float(element.get("rotation", 0) or 0)
         if rotation:
             center = draw_rect.center
-            surface = pygame.transform.rotate(surface, -rotation)
+            rotation_key = ("rotation", id(surface), round(rotation, 2))
+            rotated = self._cache_get(rotation_key)
+            if rotated is None:
+                rotated = self._cache_put(rotation_key, pygame.transform.rotate(surface, -rotation))
+            surface = rotated
             draw_rect = surface.get_rect(center=center)
 
         if opacity < 0.999:
@@ -335,15 +398,24 @@ class SceneRenderer:
         }
         target.blit(surface, draw_rect, special_flags=blend_flags.get(str(element.get("blend_mode", "normal")), 0))
 
-    @staticmethod
-    def _apply_filters(surface: pygame.Surface, element: dict) -> pygame.Surface:
+    def _apply_filters(self, surface: pygame.Surface, element: dict) -> pygame.Surface:
         filters = element.get("filters") if isinstance(element.get("filters"), dict) else {}
+        if self.quality_level == "minimal":
+            return surface
         brightness = max(0.0, min(2.0, float(filters.get("brightness", 1.0))))
         contrast = max(0.0, min(2.0, float(filters.get("contrast", 1.0))))
         saturation = max(0.0, min(2.0, float(filters.get("saturation", 1.0))))
         blur = max(0.0, min(30.0, float(filters.get("blur", 0.0))))
+        if self.quality_level == "low":
+            blur = 0.0
+        elif self.quality_level == "medium":
+            blur = min(8.0, blur)
         if abs(brightness - 1.0) < 0.01 and abs(contrast - 1.0) < 0.01 and abs(saturation - 1.0) < 0.01 and blur < 0.5:
             return surface
+        key = ("filter", id(surface), self.quality_level, round(brightness, 2), round(contrast, 2), round(saturation, 2), round(blur, 1))
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
         filtered = surface.copy()
         if abs(saturation - 1.0) >= 0.01:
             gray = pygame.transform.grayscale(filtered)
@@ -351,10 +423,8 @@ class SceneRenderer:
                 gray.set_alpha(round((1.0 - saturation) * 255))
                 filtered.blit(gray, (0, 0))
             else:
-                boost = min(1.0, saturation - 1.0)
                 filtered.blit(filtered, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
-                if boost < 1.0:
-                    filtered.set_alpha(255)
+                filtered.set_alpha(255)
         if abs(contrast - 1.0) >= 0.01:
             try:
                 pixels = pygame.surfarray.pixels3d(filtered)
@@ -368,23 +438,33 @@ class SceneRenderer:
         if blur >= 0.5:
             divisor = max(2, min(8, round(1 + blur / 4)))
             small = (max(1, filtered.get_width() // divisor), max(1, filtered.get_height() // divisor))
-            filtered = pygame.transform.smoothscale(pygame.transform.smoothscale(filtered, small), surface.get_size())
-        return filtered
+            filtered = pygame.transform.scale(pygame.transform.scale(filtered, small), surface.get_size())
+        return self._cache_put(key, filtered)
 
     def _draw_shadow(self, target: pygame.Surface, surface: pygame.Surface, rect: pygame.Rect, element: dict):
         shadow = element.get("shadow")
-        if not isinstance(shadow, dict) or not shadow.get("enabled", False):
+        if self.quality_level == "minimal" or not isinstance(shadow, dict) or not shadow.get("enabled", False):
             return
         color = parse_color(shadow.get("color", "#00000088"), (0, 0, 0, 136))
-        layer = surface.copy()
-        layer.fill(color, special_flags=pygame.BLEND_RGBA_MULT)
         blur = max(0, min(30, int(shadow.get("blur", 0) or 0)))
-        if blur:
-            divisor = max(2, min(8, 1 + blur // 4))
-            small = (max(1, layer.get_width() // divisor), max(1, layer.get_height() // divisor))
-            layer = pygame.transform.smoothscale(pygame.transform.smoothscale(layer, small), surface.get_size())
-        target.blit(layer, rect.move(round(float(shadow.get("x", 8)) * self._scale_x), round(float(shadow.get("y", 8)) * self._scale_y)))
-
+        if self.quality_level == "low":
+            blur = 0
+        elif self.quality_level == "medium":
+            blur = min(8, blur)
+        key = ("shadow", id(surface), color, blur, self.quality_level)
+        layer = self._cache_get(key)
+        if layer is None:
+            layer = surface.copy()
+            layer.fill(color, special_flags=pygame.BLEND_RGBA_MULT)
+            if blur:
+                divisor = max(2, min(8, 1 + blur // 4))
+                small = (max(1, layer.get_width() // divisor), max(1, layer.get_height() // divisor))
+                layer = pygame.transform.scale(pygame.transform.scale(layer, small), surface.get_size())
+            layer = self._cache_put(key, layer)
+        target.blit(layer, rect.move(
+            round(float(shadow.get("x", 8)) * self._scale_x),
+            round(float(shadow.get("y", 8)) * self._scale_y),
+        ))
     def _element_rect(self, element: dict) -> pygame.Rect:
         x, width = self._axis_layout(
             float(element.get("x", 0)),
@@ -442,22 +522,25 @@ class SceneRenderer:
         element_type = element.get("type")
         if element_type == "rect":
             key = ("rect", self._stable_key(element), size)
-            if key not in self._surface_cache:
-                self._surface_cache[key] = self._build_rect(element, size)
-            return self._surface_cache[key]
+            cached = self._cache_get(key)
+            if cached is None:
+                cached = self._cache_put(key, self._build_rect(element, size))
+            return cached
         if element_type == "text":
             text = self._replace_tokens(str(element.get("text", "")), context)
             key = ("text", self._stable_key(element), text, size)
-            if key not in self._surface_cache:
-                self._surface_cache[key] = self._build_text(element, text, size)
-            return self._surface_cache[key]
+            cached = self._cache_get(key)
+            if cached is None:
+                cached = self._cache_put(key, self._build_text(element, text, size))
+            return cached
         if element_type == "score":
             score = int(context.get("score", 0))
             combo = int(context.get("combo", 0))
             key = ("score", self._stable_key(element), score, combo, size)
-            if key not in self._surface_cache:
-                self._surface_cache[key] = self._build_score(element, score, combo, size)
-            return self._surface_cache[key]
+            cached = self._cache_get(key)
+            if cached is None:
+                cached = self._cache_put(key, self._build_score(element, score, combo, size))
+            return cached
         if element_type == "sprite":
             name = str(element.get("asset", ""))
             sprite = self._sprite_cache.get(name)
@@ -474,7 +557,11 @@ class SceneRenderer:
                 end = max(start, min(total - 1, int(sheet.get("end", total - 1))))
                 frame_count = end - start + 1
                 frame_step = int(elapsed * max(0.1, float(sheet.get("fps", 8))))
-                frame_index = start + (frame_step % frame_count if sheet.get("loop", True) else min(frame_step, frame_count - 1))
+                frame_index = start + (
+                    frame_step % frame_count
+                    if sheet.get("loop", True)
+                    else min(frame_step, frame_count - 1)
+                )
                 frame_width = max(1, sprite.get_width() // columns)
                 frame_height = max(1, sprite.get_height() // rows)
                 frame_rect = pygame.Rect(
@@ -485,18 +572,18 @@ class SceneRenderer:
                 ).clip(sprite.get_rect())
                 source = sprite.subsurface(frame_rect)
             key = ("sprite", name, frame_index, size, str(element.get("color", "")))
-            if key not in self._surface_cache:
-                scaled = pygame.transform.smoothscale(source, size)
+            cached = self._cache_get(key)
+            if cached is None:
+                cached = pygame.transform.scale(source, size)
                 tint = element.get("color")
                 if tint and str(tint).lower() != "#ffffff":
-                    scaled = scaled.copy()
+                    cached = cached.copy()
                     tint_color = parse_color(tint, (255, 255, 255))
                     mixed_tint = tuple(round(255 * 0.55 + channel * 0.45) for channel in tint_color[:3])
-                    scaled.fill((*mixed_tint, 255), special_flags=pygame.BLEND_RGBA_MULT)
-                self._surface_cache[key] = scaled
-            return self._surface_cache[key]
+                    cached.fill((*mixed_tint, 255), special_flags=pygame.BLEND_RGBA_MULT)
+                cached = self._cache_put(key, cached)
+            return cached
         return None
-
     @staticmethod
     def _stable_key(element: dict) -> str:
         serialized = repr(sorted(element.items())).encode("utf-8", "replace")
@@ -671,16 +758,15 @@ class SceneRenderer:
 
     def _build_missing_sprite(self, name: str, size: Tuple[int, int]) -> pygame.Surface:
         key = ("missing", name, size)
-        if key in self._surface_cache:
-            return self._surface_cache[key]
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
         surface = pygame.Surface(size, pygame.SRCALPHA)
         surface.fill((74, 44, 98, 255))
         font = self._font(max(12, min(28, size[1] // 6)), True)
         text = font.render("SPRITE YÜKLENEMEDİ", True, (255, 255, 255))
         surface.blit(text, text.get_rect(center=surface.get_rect().center))
-        self._surface_cache[key] = surface
-        return surface
-
+        return self._cache_put(key, surface)
     def _draw_glow(
         self,
         target: pygame.Surface,
@@ -724,7 +810,8 @@ class SceneRenderer:
             (255, 255, 255),
             (56, 205, 255),
         )
-        amount = max(1, min(180, int(element.get("amount", 70))))
+        quality_cap = {"minimal": 24, "low": 60, "medium": 110, "high": 180}[self.quality_level]
+        amount = max(1, min(quality_cap, int(element.get("amount", 70))))
         seed = int(hashlib.sha1(f"{scene_id}:{element.get('id')}".encode()).hexdigest()[:8], 16)
         rng = random.Random(seed)
         for index in range(amount):
@@ -752,6 +839,10 @@ class SceneRenderer:
             "combo": context.get("combo", 0),
             "countdown": context.get("countdown", 3),
             "target_score": context.get("target_score", 0),
+            "screen_score": context.get("screen_score", 0),
+            "screen_target": context.get("screen_target", 0),
+            "screen_remaining": context.get("screen_remaining", 0),
+            "screen_complete": context.get("screen_complete", False),
             "remaining_time": context.get("remaining_time", "--:--"),
             "screen_id": context.get("screen_id", 0),
         }
