@@ -131,13 +131,16 @@ Sahada kesintisiz calismak icin yapilan sertlestirmeler:
    - Dashboard skoru 0 olmali.
    - Client ekrandaki lokal skor bir sonraki poll sonrasi 0 olmali.
 
-## Server USB Ses Karti
+## Server Pi 4 3.5 mm Analog Ses
 
-Ses Pi Zero client'lardan degil, Pi 4 server'a bagli USB ses kartindan cikar:
+Ses Pi Zero client'lardan degil, Pi 4 server'in dahili analog jakindan cikar:
 
 ```text
-Pi 4 USB -> USB ses karti -> 3.5 mm -> aktif hoparlor
+Pi 4 3.5 mm jak -> 3.5 mm ses kablosu -> aktif hoparlor
 ```
+
+Pi 4 jak cikisi pasif hoparloru dogrudan surmek icin tasarlanmamistir; aktif
+hoparlor veya harici amfi kullan.
 
 Kontrol:
 
@@ -146,17 +149,41 @@ aplay -l
 speaker-test -c 2 -t wav
 ```
 
-`thief_server/config.json` icindeki `audio.device_name` varsayilan olarak
-`auto-usb` degerindedir. SDL cihaz listesi kullanilamiyorsa server
-`/proc/asound/cards` uzerinden USB karti bulup `plughw:N,0` secmeye calisir.
-Gerekirse systemd servisine su override eklenebilir:
+`setup_server.sh`, Raspberry Pi OS destekliyorsa `raspi-config nonint do_audio 1`
+ile analog cikisi secer. `thief_server/config.json` icindeki
+`audio.device_name` varsayilan olarak `auto-analog` degerindedir. Server once
+SDL cihazlarinda `Headphones`, `Analog` veya HDMI olmayan `bcm2835` cikisini
+arar; listeleme yoksa `/proc/asound/cards` icinden dahili analog karti bulur.
+
+Raspberry Pi OS Desktop/PipeWire kullaniyorsan mevcut cikislari ve varsayilani
+su komutlarla kontrol edebilirsin:
+
+```bash
+wpctl status
+wpctl set-default <ANALOG_SINK_ID>
+```
+
+Gerekirse systemd servisine cihaz adini acikca veren su override eklenebilir:
 
 ```ini
-Environment=THIEF_AUDIO_DEVICE=plughw:1,0
+Environment=THIEF_AUDIO_DEVICE=plughw:Headphones,0
 ```
+
+Kart adi model veya imaja gore farkliysa `aplay -l` ciktisindaki analog kart
+adini kullan. Eski USB ses karti kurulumu gerekirse `THIEF_AUDIO_DEVICE=auto-usb`
+hala desteklenir.
 
 Harici dosya verilmezse server sentetik muzik ve efektlerle calisir. Kendi
 dosyalarini kullanmak icin `music_file`, `hit_sound_file`,
 `start_sound_file`, `success_sound_file` ve `end_sound_file` alanlari
 server klasorune gore bagil dosya yolu olarak ayarlanabilir. Kisa efektler
 icin WAV, muzik icin OGG onerilir.
+
+## Fotoğraf Galerisi Güvenliği
+
+- USB kamerayı Pi 4'e bağla ve `v4l2-ctl --list-devices` ile `/dev/video0` yolunu doğrula.
+- `/etc/police-game/photos.env` dosyası `root:root` ve `0600` olmalı; içinde en az altı karakterli `THIEF_PHOTO_ADMIN_PIN` bulunmalı.
+- PIN değiştirildikten sonra `sudo systemctl restart thief-server` çalıştırılmalı.
+- `thief_server/photo_sessions/` klasörü düzenli yedeklenmeli ve yetkisiz ağ paylaşımlarına açılmamalı.
+- Etkinlik sonunda gereksiz fotoğraflar operatör galerisinden silinmeli; aktif oturum silinemez.
+- Fotoğraflı oyun başlamadan önce dashboarddaki onay kutusu yalnız gerçekten gerekli izin alındıysa işaretlenmeli.

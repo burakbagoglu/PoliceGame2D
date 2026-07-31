@@ -193,12 +193,12 @@ görünür.
 
 ## Server Ses Kontrolü
 
-Ses, Pi 4'e USB ses kartı üzerinden bağlanan 3.5 mm aktif hoparlörden çıkar.
+Ses, Pi 4'ün dahili 3.5 mm analog jakına bağlanan aktif hoparlörden çıkar.
 Client cihazlarında hoparlör bulunması gerekmez.
 
 Dashboard içindeki **Server Sesi** kartında:
 
-- USB ses kartı ve mixer durumu görüntülenir.
+- Pi 4 analog jak ve mixer durumu görüntülenir.
 - Genel, müzik ve efekt seviyeleri ayarlanır.
 - Vuruş efekti test edilir.
 - Müzik test amaçlı açılıp kapatılır.
@@ -207,7 +207,7 @@ Yeni ve geçerli bir skor eventi geldiğinde vuruş sesi çalar. Aynı `event_id
 tekrar gönderildiğinde ses ikinci kez çalmaz. Oyun başlayınca müzik başlar;
 oyun manuel, süre dolarak veya hedef tamamlanarak bittiğinde müzik durur.
 
-USB kart görünmüyorsa Pi 4 üzerinde:
+Analog jak görünmüyorsa Pi 4 üzerinde:
 
 ```bash
 aplay -l
@@ -293,3 +293,38 @@ Her Pi Zero’da `screen_id` benzersiz olmalıdır. Sabit 8 ekran için değerle
 - En az bir vuruş dashboard skorunu artırıyor.
 - Skor sıfırlama client ekranlarına yansıyor.
 - Seyir ekranı ayrı ekranda açık.
+## USB Kamera ve Oturum Fotoğrafları
+
+Kamera Pi 4 server'a USB üzerinden bağlanır; client ekranlarında kamera gerekmez. Dashboard üstündeki **Fotoğraflar** bağlantısı `/photos` operatör sayfasını açar.
+
+İlk kurulumda `setup_server.sh`, `fswebcam` ve `v4l-utils` paketlerini yükler. Ayrıca sekiz haneli bir operatör PIN'i üretip yalnız root tarafından okunabilen `/etc/police-game/photos.env` dosyasına yazar. PIN repoya veya dashboard HTML'ine kaydedilmez. Galeri oturumu 8 saat sonra sona erer; tüm görüntüleme, indirme, satış, kamera testi ve silme API'leri giriş gerektirir.
+
+Oyun öncesi akış:
+
+1. Aynı tarayıcıda **Fotoğraflar** sayfasını açıp operatör PIN'iyle giriş yapın.
+2. Kontrol paneline dönüp isteğe bağlı **Oturum adı** girin.
+3. **Ekran kotası bitince fotoğraf çek** seçeneğini açık bırakın.
+4. Fotoğraf çekimi için gerekli veli/katılımcı onayını aldıktan sonra onay kutusunu işaretleyin.
+5. Oyunu başlatın.
+
+Her ekran kendi hırsız kotasını ilk kez tamamladığında skor isteğini bekletmeden kamera kuyruğuna tek çekim eklenir. Varsayılan 350 ms gecikme çocukların tepki anını yakalar. Kamera veya disk hatası oyunu durdurmaz; hata ilgili oturumun galeri kaydında görünür.
+
+Oyun sonunda `/photos` sayfasından:
+
+- Oturum adına veya müşteri adına göre arama yapılabilir.
+- Fotoğraflar tek tek ya da ZIP olarak indirilebilir.
+- **Yazdır** ile tarayıcının bağlı yazıcısına A4 yatay baskı hazırlanabilir.
+- Müşteri adı, satış tutarı ve **Satıldı** durumu kaydedilebilir.
+- Yanlış veya saklama süresi dolmuş oturumlar kalıcı olarak silinebilir. Aktif veya kamera kuyruğunda çekimi bulunan oturum silinemez.
+
+Fotoğraflar varsayılan olarak `/home/pi/thief_server/photo_sessions/` altında oturum klasörlerinde saklanır. Bu klasör Git'e alınmaz. Satış ve saklama politikası uygulanırken fotoğraf onayı, erişim yetkisi ve silme süresi işletmenin geçerli kurallarına göre yönetilmelidir.
+
+Kamera kontrolü:
+
+```bash
+v4l2-ctl --list-devices
+fswebcam --device /dev/video0 --resolution 1920x1080 --no-banner test.jpg
+sudo systemctl restart thief-server
+```
+
+Kamera farklı bir aygıtsa `thief_server/config.json` içindeki `camera.device` değiştirilir. Çözünürlük, JPEG kalitesi, ısınma frame sayısı ve tepki gecikmesi aynı `camera` bölümünden ayarlanabilir.

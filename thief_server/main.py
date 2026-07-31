@@ -7,14 +7,17 @@ import json
 import os
 import time
 import threading
+import subprocess
 import base64
 import binascii
 from datetime import datetime
 from typing import Any, Dict, Set, Optional, Literal
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from audio_manager import AudioManager
@@ -23,6 +26,8 @@ from scene_manager import (
 )
 from scene_audio_runtime import SceneAudioRuntime
 from client_telemetry import ClientTelemetryStore
+from photo_manager import PhotoSessionManager
+from photo_auth import PhotoAccessGuard
 from spawn_engine import (
     TargetCalculator,
     ScreenSelector,
@@ -64,7 +69,7 @@ def load_config(filepath: str = "config.json") -> dict:
             "default_piezo_refractory_ms": 200,
             "audio": {
                 "enabled": True,
-                "device_name": "auto-usb",
+                "device_name": "auto-analog",
                 "frequency": 44100,
                 "output_channels": 2,
                 "buffer": 512,
@@ -126,6 +131,9 @@ class StartGameRequest(BaseModel):
     )
     difficulty: Optional[Literal["easy", "normal", "hard"]] = None
     duration_minutes: Optional[int] = Field(default=None, ge=1, le=120)
+    session_name: str = Field(default="", max_length=80)
+    capture_photos: bool = False
+    photo_consent: bool = False
 
 
 class PiezoConfigRequest(BaseModel):
@@ -187,6 +195,16 @@ class ClientTelemetryRequest(BaseModel):
 class ClientPollRequest(BaseModel):
     screen_id: int = Field(ge=1, le=GAME_SCREEN_COUNT)
     telemetry: Optional[Dict[str, Any]] = None
+
+
+class PhotoLoginRequest(BaseModel):
+    pin: str = Field(min_length=1, max_length=128)
+
+
+class PhotoSaleUpdateRequest(BaseModel):
+    sold: bool = False
+    sale_price: Optional[float] = Field(default=None, ge=0, le=1_000_000)
+    customer_name: str = Field(default="", max_length=80)
 
 
 class SceneScreenshotRequest(BaseModel):
@@ -301,6 +319,16 @@ scene_manager = SceneManager(
 client_telemetry = ClientTelemetryStore(
     offline_after_seconds=CONFIG.get("client_offline_after_seconds", 15)
 )
+photo_manager = PhotoSessionManager(
+    base_dir=os.environ.get(
+        "THIEF_PHOTO_DATA_DIR",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "photo_sessions"),
+    ),
+    camera_config=CONFIG.get("camera", {}),
+)
+photo_guard = PhotoAccessGuard(
+    ttl_seconds=int(CONFIG.get("camera", {}).get("admin_session_seconds", 28800))
+)
 
 # Spawn scheduler (oyun başlatılınca oluşturulur)
 spawn_scheduler: Optional[SpawnScheduler] = None
@@ -317,6 +345,7 @@ active_polling_lock = threading.RLock()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    photo_manager.initialize()
     audio_ready = audio_manager.initialize()
     print("=" * 50)
     print("Thief Server başlatıldı")
@@ -333,6 +362,7 @@ async def lifespan(app: FastAPI):
     if spawn_scheduler:
         spawn_scheduler.stop()
     audio_manager.shutdown()
+    photo_manager.shutdown()
     print("\nThief Server kapatıldı")
 
 
@@ -344,12 +374,27 @@ app = FastAPI(
 )
 
 
+@app.middleware("http")
+async def protect_photo_responses(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path == "/photos" or request.url.path.startswith((
+        "/api/photo-", "/api/camera/",
+    )):
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
 # ============== Game API Endpoints ==============
 
 def _on_session_end(reason: str):
-    """Süre/hedef nedeniyle otomatik biten oyunun sesini yönet."""
-    _show_result_scene("win" if reason == "target" else "lose")
-    audio_manager.end_game(completed=(reason == "target"))
+    """Süre/hedef nedeniyle otomatik biten oyunun sesini ve fotoğraf oturumunu yönet."""
+    completed = reason == "target"
+    _show_result_scene("win" if completed else "lose")
+    audio_manager.end_game(completed=completed)
+    photo_manager.end_session(reason, completed=completed)
 
 
 def _show_result_scene(scene_id: Optional[str]):
@@ -442,9 +487,16 @@ async def game_profiles():
     return {"profiles": scene_manager.get_published_document().get("game_profiles", {})}
 
 @app.post("/api/game/start")
-async def start_game(req: StartGameRequest):
+async def start_game(req: StartGameRequest, request: Request):
     """Yeni oyun başlat"""
     global spawn_scheduler
+    if req.capture_photos:
+        if not req.photo_consent:
+            raise HTTPException(
+                status_code=400,
+                detail="Fotoğraf çekimi için veli/katılımcı onayı doğrulanmalıdır",
+            )
+        photo_guard.authorize(request, write=True)
     _show_result_scene(None)
     scene_audio_runtime.reset()
 
@@ -517,6 +569,19 @@ async def start_game(req: StartGameRequest):
     if CONFIG.get("debug"):
         print(f"[Game] Kayıtlı aktif ekranlar: {[sid for sid, _ in active_snapshot]}")
 
+    try:
+        photo_session = photo_manager.start_session(
+            req.session_name,
+            capture_enabled=req.capture_photos,
+            consent_confirmed=req.photo_consent,
+            child_count=child_count,
+            duration_minutes=duration,
+            difficulty=difficulty,
+            screen_targets=target_info["screen_targets"],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     # Skorları sıfırla
     score_manager.reset()
     if spawn_scheduler:
@@ -539,17 +604,29 @@ async def start_game(req: StartGameRequest):
         "difficulty": difficulty,
         "game_duration_minutes": duration,
         "countdown_seconds": countdown_seconds,
+        "photo_session": photo_session,
     }
 
 
 @app.get("/api/game/status")
 async def game_status():
     """Oyun durumu"""
+    current_photo_session = photo_manager.get_current()
+    photo_capture = {
+        "enabled": bool(current_photo_session and current_photo_session.get("capture_enabled")),
+        "photo_count": len(current_photo_session.get("photos", [])) if current_photo_session else 0,
+        "status": current_photo_session.get("status") if current_photo_session else None,
+    }
     if not spawn_scheduler:
-        return {"is_active": False, "message": "Oyun başlatılmadı"}
+        return {
+            "is_active": False,
+            "message": "Oyun başlatılmadı",
+            "photo_capture": photo_capture,
+        }
 
     status = spawn_scheduler.get_status()
     status['score_data'] = score_manager.get_scores().model_dump()
+    status['photo_capture'] = photo_capture
     return status
 
 
@@ -566,6 +643,7 @@ async def end_game():
         completed = bool(status.get("all_screens_complete"))
         _show_result_scene("win" if completed else "lose")
         audio_manager.end_game(completed=completed)
+        photo_session = photo_manager.end_session("manual", completed=completed)
 
         if CONFIG.get("debug"):
             print(f"[Game] Oyun bitti! Skor: {final_score}/{target}")
@@ -575,6 +653,7 @@ async def end_game():
             "final_score": final_score,
             "target_score": target,
             "completed": completed,
+            "photo_session": photo_session,
         }
 
     return {"success": False, "message": "Aktif oyun yok"}
@@ -659,10 +738,12 @@ async def spawn_poll(
 @app.post("/event")
 async def receive_event(event: ScoreEvent):
     """Client vuruşunu yalnızca o ekranın kalan kotası kadar işle."""
+    screen_was_complete = False
     if spawn_scheduler and spawn_scheduler.session.is_active:
         if event.screen_id > spawn_scheduler.session.screen_count:
             raise HTTPException(status_code=409, detail=f"Ekran {event.screen_id} aktif oyun oturumuna dahil değil")
         before = spawn_scheduler.session.screen_status(event.screen_id)
+        screen_was_complete = bool(before["screen_complete"])
         if before["screen_complete"]:
             return {"success": True, "is_new": False, "accepted_points": 0,
                     "total_score": spawn_scheduler.session.current_score, **before}
@@ -676,6 +757,8 @@ async def receive_event(event: ScoreEvent):
     quota_result = {}
     if is_new and spawn_scheduler and spawn_scheduler.session.is_active:
         quota_result = spawn_scheduler.update_score(event.screen_id, accepted_points)
+        if quota_result.get("screen_complete") and not screen_was_complete:
+            photo_manager.capture_screen(event.screen_id)
     if is_new:
         audio_manager.play_hit()
 
@@ -809,11 +892,156 @@ async def get_client_status():
     """Dashboard için çevrimiçi istemci, FPS, sıcaklık ve piezo özetini getir."""
     return client_telemetry.list(GAME_SCREEN_COUNT)
 
+
+# ============== Korumalı USB Kamera ve Oturum Fotoğrafları ==============
+
+@app.get("/api/photo-auth/status")
+async def photo_auth_status(request: Request):
+    csrf = photo_guard.validate(request.cookies.get(photo_guard.COOKIE_NAME, ""))
+    return {
+        "configured": photo_guard.configured,
+        "authenticated": bool(csrf),
+        "csrf": csrf if csrf else None,
+    }
+
+
+@app.post("/api/photo-auth/login")
+async def photo_auth_login(req: PhotoLoginRequest, request: Request):
+    token, csrf = photo_guard.login(req.pin, request)
+    response = JSONResponse({"success": True, "csrf": csrf})
+    response.set_cookie(
+        photo_guard.COOKIE_NAME,
+        token,
+        max_age=photo_guard.ttl_seconds,
+        httponly=True,
+        secure=photo_guard.secure_cookie,
+        samesite="strict",
+        path="/",
+    )
+    return response
+
+
+@app.post("/api/photo-auth/logout")
+async def photo_auth_logout(request: Request):
+    photo_guard.authorize(request, write=True)
+    response = JSONResponse({"success": True})
+    response.delete_cookie(photo_guard.COOKIE_NAME, path="/")
+    return response
+
+
+@app.get("/api/camera/status")
+async def camera_status(request: Request):
+    photo_guard.authorize(request)
+    return photo_manager.camera_status()
+
+
+@app.post("/api/camera/test")
+async def camera_test(request: Request):
+    photo_guard.authorize(request, write=True)
+    try:
+        await run_in_threadpool(photo_manager.capture_test)
+    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"success": True, "url": f"/api/camera/test-image?v={int(_time.time())}"}
+
+
+@app.get("/api/camera/test-image")
+async def camera_test_image(request: Request):
+    photo_guard.authorize(request)
+    try:
+        path = photo_manager.get_test_photo()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/photo-sessions")
+async def photo_sessions(request: Request):
+    photo_guard.authorize(request)
+    sessions = photo_manager.list_sessions()
+    return {"sessions": sessions, "count": len(sessions)}
+
+
+@app.get("/api/photo-sessions/{session_id}")
+async def photo_session_detail(session_id: str, request: Request):
+    photo_guard.authorize(request)
+    try:
+        return photo_manager.get_session(session_id)
+    except (FileNotFoundError, ValueError, OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.patch("/api/photo-sessions/{session_id}")
+async def update_photo_session(session_id: str, req: PhotoSaleUpdateRequest, request: Request):
+    photo_guard.authorize(request, write=True)
+    try:
+        return photo_manager.update_sale(
+            session_id,
+            sold=req.sold,
+            sale_price=req.sale_price,
+            customer_name=req.customer_name,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/photo-sessions/{session_id}")
+async def delete_photo_session(session_id: str, request: Request):
+    photo_guard.authorize(request, write=True)
+    try:
+        photo_manager.delete_session(session_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"success": True}
+
+
+@app.get("/api/photo-sessions/{session_id}/photos/{filename}")
+async def photo_session_file(
+    session_id: str,
+    filename: str,
+    request: Request,
+    download: bool = False,
+):
+    photo_guard.authorize(request)
+    try:
+        path = photo_manager.get_photo_path(session_id, filename)
+    except (FileNotFoundError, ValueError, OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(
+        path,
+        media_type="image/jpeg",
+        filename=filename if download else None,
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+@app.get("/api/photo-sessions/{session_id}/download")
+async def download_photo_session(session_id: str, request: Request):
+    photo_guard.authorize(request)
+    try:
+        zip_path, download_name = await run_in_threadpool(
+            photo_manager.build_download_zip, session_id
+        )
+    except (FileNotFoundError, ValueError, OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=download_name,
+        headers={"Cache-Control": "private, no-store"},
+        background=BackgroundTask(zip_path.unlink, missing_ok=True),
+    )
+
+
 # ============== Server Audio Endpoints ==============
 
 @app.get("/api/audio/status")
 async def get_audio_status():
-    """USB ses kartı ve mixer durumunu getir."""
+    """Pi 4 analog ses çıkışı ve mixer durumunu getir."""
     return audio_manager.get_status()
 
 
@@ -1200,7 +1428,8 @@ DASHBOARD_HTML = """
         .btn-orange { background: #e67e22; }
         .btn-orange:hover { background: #f39c12; }
 
-        input[type="number"] {
+        input[type="number"],
+        input[type="text"] {
             background: rgba(255, 255, 255, 0.15);
             border: 1px solid rgba(255, 255, 255, 0.3);
             color: #fff;
@@ -1482,6 +1711,7 @@ DASHBOARD_HTML = """
         .btn-orange { background: #d97706; }
 
         input[type="number"],
+        input[type="text"],
         select {
             background: #0b1220;
             border: 1px solid #263244;
@@ -1527,7 +1757,8 @@ DASHBOARD_HTML = """
 </head>
 <body>
     <div class="container">
-        <div style="display:flex;justify-content:flex-end;margin-bottom:10px;">
+        <div style="display:flex;justify-content:flex-end;gap:8px;margin-bottom:10px;">
+            <a href="/photos" style="background:#e5e7eb;color:#111827;text-decoration:none;padding:10px 14px;border-radius:8px;font-weight:800;">📷 Fotoğraflar</a>
             <a href="/scene-editor" style="background:#fbbf24;color:#111827;text-decoration:none;padding:10px 14px;border-radius:8px;font-weight:800;">🎨 Sahne Editörü</a>
         </div>
         <h1>🎮 Hırsız Oyunu — Kontrol Paneli</h1>
@@ -1567,6 +1798,18 @@ DASHBOARD_HTML = """
             <!-- Oyun Kontrol -->
             <div class="card">
                 <h3>🎯 Oyun Kontrolü</h3>
+                <div class="controls" style="margin-bottom: 12px;">
+                    <label>Oturum adı:</label>
+                    <input type="text" id="session-name" maxlength="80" placeholder="Örn. Ece'nin doğum günü">
+                    <label>Profil:</label>
+                    <select id="game-profile" onchange="applyGameProfile()"><option value="">Özel</option></select>
+                </div>
+                <div class="controls" style="margin-bottom: 12px;">
+                    <label><input type="checkbox" id="capture-photos" checked> Ekran kotası bitince fotoğraf çek</label>
+                    <label><input type="checkbox" id="photo-consent"> Veli/katılımcı fotoğraf onayı alındı</label>
+                </div>
+                <div id="photo-auth-status" style="color:#9ca3af;margin-bottom:8px">Fotoğraf yetkisi kontrol ediliyor…</div>
+                <div id="game-start-error" style="color:#f87171;margin-bottom:10px"></div>
                 <div class="controls" style="margin-bottom: 15px;">
                     <label>Çocuk:</label>
                     <input type="number" id="child-count" value="3" min="1" max="50">
@@ -1643,7 +1886,7 @@ DASHBOARD_HTML = """
             <div class="card">
                 <h3>🔊 Server Sesi</h3>
                 <div class="stat-row">
-                    <span class="stat-label">USB Ses Kartı</span>
+                    <span class="stat-label">Pi 4 Analog Jak</span>
                     <span class="stat-value" id="audio-device">Kontrol ediliyor…</span>
                 </div>
                 <div class="stat-row">
@@ -1735,6 +1978,7 @@ DASHBOARD_HTML = """
         const numScreens = 8;
         let lastEventCount = 0;
         let gameProfiles = {};
+        let photoCsrf = null;
 
         // === Ekran kartlarını oluştur ===
         function initScreenCards(count) {
@@ -1771,6 +2015,25 @@ DASHBOARD_HTML = """
             });
         }
 
+        async function loadPhotoAuth() {
+            const statusEl = document.getElementById('photo-auth-status');
+            try {
+                const response = await fetch('/api/photo-auth/status');
+                const data = await response.json();
+                photoCsrf = data.authenticated ? data.csrf : null;
+                if (!data.configured) {
+                    statusEl.innerHTML = 'Fotoğraf galerisi PIN’i Pi 4 üzerinde henüz ayarlanmamış.';
+                } else if (!data.authenticated) {
+                    statusEl.innerHTML = 'Fotoğraflı oyun için önce <a href="/photos" style="color:#93c5fd">galeriye operatör girişi yapın</a>.';
+                } else {
+                    statusEl.textContent = 'Fotoğraf yetkisi hazır.';
+                }
+            } catch (error) {
+                photoCsrf = null;
+                statusEl.textContent = 'Fotoğraf yetkisi kontrol edilemedi.';
+            }
+        }
+
         async function loadGameProfiles() {
             try {
                 const response = await fetch('/api/game/profiles'); const data = await response.json(); gameProfiles = data.profiles || {};
@@ -1798,23 +2061,45 @@ DASHBOARD_HTML = """
             const durationMinutes = parseInt(document.getElementById('duration-minutes').value) || 35;
             const difficulty = document.getElementById('difficulty').value;
             const profileId = document.getElementById('game-profile').value || null;
+            const sessionName = document.getElementById('session-name').value.trim();
+            const capturePhotos = document.getElementById('capture-photos').checked;
+            const photoConsent = document.getElementById('photo-consent').checked;
+            const errorBox = document.getElementById('game-start-error');
+            errorBox.textContent = '';
+            if (capturePhotos && !photoConsent) {
+                errorBox.textContent = 'Fotoğraf çekimi için onay kutusunu işaretleyin veya çekimi kapatın.';
+                return;
+            }
+            if (capturePhotos && !photoCsrf) {
+                errorBox.innerHTML = 'Fotoğraflı oyun için önce <a href="/photos" style="color:#93c5fd">galeriye operatör girişi yapın</a>.';
+                return;
+            }
 
             try {
                 const res = await fetch('/api/game/start', {
                     method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
+                    headers: {
+                        'Content-Type': 'application/json',
+                        ...(capturePhotos ? {'X-Photo-CSRF': photoCsrf} : {}),
+                    },
                     body: JSON.stringify({
                         profile_id: profileId,
                         child_count: childCount,
                         screen_count: screenCount,
                         duration_minutes: durationMinutes,
                         difficulty: difficulty,
+                        session_name: sessionName,
+                        capture_photos: capturePhotos,
+                        photo_consent: photoConsent,
                     }),
                 });
                 const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || 'Oyun başlatılamadı');
                 document.getElementById('target-score').textContent = data.target_score;
+                document.getElementById('photo-consent').checked = false;
                 initScreenCards(8);
             } catch (err) {
+                errorBox.textContent = err.message || 'Oyun başlatılamadı';
                 console.error('Oyun başlatma hatası:', err);
             }
         }
@@ -2132,6 +2417,7 @@ DASHBOARD_HTML = """
         // === Başlat ===
         initScreenCards(numScreens);
         loadGameProfiles();
+        loadPhotoAuth();
         updateStatus();
         loadPiezoConfig();
         loadAudioStatus(true);
@@ -2537,6 +2823,31 @@ SCREEN_HTML = """
 async def dashboard():
     """Ana sayfa - Dashboard"""
     return DASHBOARD_HTML
+
+
+@app.get("/photos", response_class=HTMLResponse)
+async def photo_gallery():
+    """PIN korumalı API'leri kullanan operatör fotoğraf galerisi."""
+    gallery_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "photo_gallery.html",
+    )
+    try:
+        with open(gallery_path, "r", encoding="utf-8") as handle:
+            content = handle.read()
+        return HTMLResponse(
+            content,
+            headers={
+                "Content-Security-Policy": (
+                    "default-src 'self'; img-src 'self' data:; "
+                    "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
+                    "connect-src 'self'; object-src 'none'; base-uri 'none'; "
+                    "frame-ancestors 'none'; form-action 'self'"
+                ),
+            },
+        )
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="Fotoğraf galerisi okunamadı") from exc
 
 
 @app.get("/screen", response_class=HTMLResponse)

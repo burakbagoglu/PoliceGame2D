@@ -5,15 +5,28 @@ import time
 import base64
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from main import app, audio_manager, score_manager, piezo_config, spawn_scheduler
 from scene_manager import SceneManager, default_scene_document
 
 
 @pytest.fixture(autouse=True)
-def reset_state():
-    """Her test öncesi state'i sıfırla"""
+def reset_state(monkeypatch, tmp_path):
+    """Her test öncesi state'i ve hassas fotoğraf deposunu sıfırla."""
     import main
+    from photo_auth import PhotoAccessGuard
+    from photo_manager import PhotoSessionManager
+
+    def fake_capture(path):
+        Image.new("RGB", (960, 540), (30, 100, 190)).save(path, "JPEG", quality=88)
+
+    test_photo_manager = PhotoSessionManager(
+        tmp_path / "photo_sessions", capture_backend=fake_capture
+    )
+    monkeypatch.setattr(main, "photo_manager", test_photo_manager)
+    monkeypatch.setattr(main, "photo_guard", PhotoAccessGuard(pin="123456"))
+    client.cookies.clear()
     score_manager.reset()
     piezo_config.__init__(threshold=100, refractory_ms=200)
     with main.active_polling_lock:
@@ -26,6 +39,7 @@ def reset_state():
     if main.spawn_scheduler:
         main.spawn_scheduler.stop()
         main.spawn_scheduler = None
+    test_photo_manager.shutdown()
 
 
 client = TestClient(app)
@@ -603,6 +617,14 @@ class TestHealth:
         assert res.status_code == 200
         assert 'Toplam Skor' in res.text
 
+    def test_photo_gallery_route(self):
+        res = client.get("/photos")
+        assert res.status_code == 200
+        assert 'Fotoğraf Satış & Baskı' in res.text
+        assert res.headers["x-frame-options"] == "DENY"
+        assert "frame-ancestors 'none'" in res.headers["content-security-policy"]
+        assert res.headers["cache-control"] == "private, no-store"
+
 
 def test_game_profiles_can_start_a_session():
     profiles = client.get("/api/game/profiles")
@@ -652,3 +674,100 @@ def test_combined_client_poll(monkeypatch):
     second = client.post("/api/client/poll", json={"screen_id": 1})
     assert second.status_code == 200
     assert second.json()["piezo_config"]["changed"] is False
+
+def _photo_login():
+    response = client.post("/api/photo-auth/login", json={"pin": "123456"})
+    assert response.status_code == 200
+    return response.json()["csrf"]
+
+
+def test_photo_gallery_requires_operator_login():
+    assert client.get("/api/photo-sessions").status_code == 401
+    assert client.post("/api/photo-auth/login", json={"pin": "000000"}).status_code == 401
+
+    csrf = _photo_login()
+
+    assert len(csrf) >= 20
+    assert client.get("/api/photo-sessions").status_code == 200
+    assert client.get("/api/camera/status").status_code == 200
+
+
+def test_photo_capture_requires_consent():
+    response = client.post("/api/game/start", json={
+        "child_count": 2,
+        "session_name": "İzinsiz çekim",
+        "capture_photos": True,
+        "photo_consent": False,
+    })
+
+    assert response.status_code == 400
+    assert "onay" in response.json()["detail"]
+
+
+def test_authorization_is_required_to_start_photo_capture():
+    response = client.post("/api/game/start", json={
+        "child_count": 2,
+        "session_name": "Yetkisiz çekim",
+        "capture_photos": True,
+        "photo_consent": True,
+    })
+
+    assert response.status_code == 401
+
+
+def test_screen_completion_creates_protected_session_photo():
+    import main
+
+    csrf = _photo_login()
+    started = client.post("/api/game/start", headers={"X-Photo-CSRF": csrf}, json={
+        "child_count": 1,
+        "duration_minutes": 35,
+        "difficulty": "easy",
+        "session_name": "Grup Mavi",
+        "capture_photos": True,
+        "photo_consent": True,
+    })
+    assert started.status_code == 200
+    session_id = started.json()["photo_session"]["id"]
+    screen_target = started.json()["screen_targets"]["1"]
+
+    for index in range(screen_target):
+        hit = client.post("/event", json={
+            "event_id": f"photo-hit-{index}",
+            "screen_id": 1,
+            "points": 1,
+            "ts_ms": int(time.time() * 1000) + index,
+        })
+        assert hit.status_code == 200
+
+    deadline = time.time() + 3
+    session = main.photo_manager.get_session(session_id)
+    while not session["photos"] and time.time() < deadline:
+        time.sleep(0.02)
+        session = main.photo_manager.get_session(session_id)
+
+    assert len(session["photos"]) == 1
+    photo = session["photos"][0]
+    assert photo["screen_id"] == 1
+    assert client.get(photo["url"]).status_code == 200
+    assert client.patch(
+        f"/api/photo-sessions/{session_id}",
+        json={"sold": True, "sale_price": 300, "customer_name": "Aile Mavi"},
+    ).status_code == 403
+
+    updated = client.patch(
+        f"/api/photo-sessions/{session_id}",
+        headers={"X-Photo-CSRF": csrf},
+        json={"sold": True, "sale_price": 300, "customer_name": "Aile Mavi"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["sold"] is True
+    archive = client.get(f"/api/photo-sessions/{session_id}/download")
+    assert archive.status_code == 200
+    assert archive.content.startswith(b"PK")
+
+    client.post("/api/game/end")
+    deleted = client.delete(
+        f"/api/photo-sessions/{session_id}", headers={"X-Photo-CSRF": csrf}
+    )
+    assert deleted.status_code == 200

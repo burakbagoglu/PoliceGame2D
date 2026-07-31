@@ -6,3 +6,4 @@ event_queue.json
 *.tmp
 thief_server/scene_data/
 thief_client/scene_cache/
+thief_server/photo_sessions/

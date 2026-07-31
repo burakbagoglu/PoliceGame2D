@@ -18,7 +18,7 @@
   "default_piezo_refractory_ms": 200,
   "audio": {
     "enabled": true,
-    "device_name": "auto-usb",
+    "device_name": "auto-analog",
     "frequency": 44100,
     "output_channels": 2,
     "buffer": 512,
@@ -33,6 +33,18 @@
     "end_sound_file": "",
     "countdown_sound_file": "",
     "go_sound_file": ""
+  },
+  "camera": {
+    "enabled": true,
+    "device": "/dev/video0",
+    "command": "fswebcam",
+    "width": 1920,
+    "height": 1080,
+    "jpeg_quality": 92,
+    "warmup_frames": 5,
+    "timeout_seconds": 12,
+    "capture_delay_ms": 350,
+    "admin_session_seconds": 28800
   },
   "debug": false,
   "access_log": false

@@ -1,7 +1,7 @@
 """
 Raspberry Pi 4 üzerinde merkezi müzik ve efekt oynatma.
 
-Ses çıkışı client'larda değil, server'a bağlı USB ses kartındadır. Modül;
+Ses çıkışı client'larda değil, Pi 4 server'ın 3.5 mm analog jakındadır. Modül;
 pygame/SDL ses cihazı bulunamadığında server'ı durdurmadan sessiz moda geçer.
 Harici ses dosyaları opsiyoneldir; dosya yoksa telifsiz sentetik efektler ve
 basit bir oyun müziği çalışma anında üretilir.
@@ -27,7 +27,7 @@ ToneSequence = Sequence[Tuple[float, float]]
 
 DEFAULT_AUDIO_CONFIG = {
     "enabled": True,
-    "device_name": "auto-usb",
+    "device_name": "auto-analog",
     "frequency": 44100,
     "output_channels": 2,
     "buffer": 512,
@@ -44,7 +44,7 @@ DEFAULT_AUDIO_CONFIG = {
 
 
 class AudioManager:
-    """USB ses kartı üzerinden server-side ses oynatıcı."""
+    """Pi 4 analog jakı üzerinden server-side ses oynatıcı."""
 
     def __init__(
         self,
@@ -65,7 +65,7 @@ class AudioManager:
 
         self.base_dir = os.path.abspath(base_dir or os.path.dirname(__file__))
         self.enabled = bool(merged["enabled"])
-        self.device_name = str(merged["device_name"] or "auto-usb")
+        self.device_name = str(merged["device_name"] or "auto-analog")
         self.frequency = max(8000, int(merged["frequency"]))
         self.output_channels = 1 if int(merged["output_channels"]) == 1 else 2
         self.buffer = max(128, int(merged["buffer"]))
@@ -130,7 +130,33 @@ class AudioManager:
             os.environ["AUDIODEV"] = requested
             return None
 
-        if requested_lower in ("auto", "auto-usb", "usb"):
+        if requested_lower in (
+            "auto",
+            "auto-analog",
+            "analog",
+            "headphone",
+            "headphones",
+            "jack",
+            "3.5mm",
+        ):
+            for device in devices:
+                if self._is_analog_device(device):
+                    return device
+            alsa_device = self._discover_alsa_analog_device()
+            if alsa_device:
+                self._alsa_device_override = alsa_device
+                os.environ["AUDIODEV"] = alsa_device
+                return None
+            if devices:
+                raise RuntimeError(
+                    "Pi 4 analog ses çıkışı bulunamadı. Algılanan cihazlar: "
+                    + ", ".join(devices)
+                )
+            # Bazı SDL/ALSA sürümlerinde listeleme desteklenmez. Bu durumda
+            # sistem varsayılanını dene; setup_server.sh analog çıkışı seçer.
+            return None
+
+        if requested_lower in ("auto-usb", "usb"):
             for device in devices:
                 if "usb" in device.lower():
                     return device
@@ -158,6 +184,35 @@ class AudioManager:
                 f"Algılananlar: {', '.join(devices)}"
             )
         return requested
+
+    @staticmethod
+    def _is_analog_device(device: str) -> bool:
+        """HDMI'yi elemeden Pi'nin dahili analog cihaz adını tanı."""
+        normalized = device.lower()
+        if "hdmi" in normalized or "usb" in normalized:
+            return False
+        return any(
+            hint in normalized
+            for hint in ("headphone", "analog", "bcm2835", "onboard", "built-in")
+        )
+
+    @classmethod
+    def _discover_alsa_analog_device(cls) -> Optional[str]:
+        """SDL listeleyemezse /proc/asound/cards içinden analog kartı bul."""
+        try:
+            with open("/proc/asound/cards", "r", encoding="utf-8") as f:
+                cards = f.read()
+        except OSError:
+            return None
+
+        for line in cards.splitlines():
+            if not cls._is_analog_device(line):
+                continue
+            match = re.match(r"\s*(\d+)\s+\[([^\]]+)\]\s*:", line)
+            if match:
+                card_id = match.group(2).strip()
+                return f"plughw:{card_id or match.group(1)},0"
+        return None
 
     @staticmethod
     def _discover_alsa_usb_device() -> Optional[str]:
@@ -257,7 +312,7 @@ class AudioManager:
             if not self.enabled:
                 self.stop_music(fade_ms=100)
             elif not self.available:
-                # USB kart server açıldıktan sonra takılmış olabilir.
+                # Ses cihazı server açılışında henüz hazır olmayabilir.
                 self.initialize()
 
             self._apply_volumes()
@@ -470,7 +525,7 @@ class AudioManager:
         max_duration_ms: int = 0,
         pan: float = 0.0,
     ) -> bool:
-        """Yayınlanmış sahnenin timeline cue kaydını merkezi USB kartta çal."""
+        """Yayınlanmış sahnenin timeline cue kaydını merkezi analog çıkışta çal."""
         with self._lock:
             if not self.enabled or not self.available:
                 return False

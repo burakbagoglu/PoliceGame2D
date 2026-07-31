@@ -154,7 +154,7 @@ ilk sahne clientta gösterilir. Taslak client önizlemesi kurallardan izole edil
 
 WAV, OGG veya MP3 dosyası asset alanına yüklenebilir. Ses cue için dosya veya
 hazır efekt, başlangıç saniyesi, ses seviyesi ve loop seçilir. Ses clienttan
-değil, servera bağlı USB ses kartından çalar. Çok sayıda client aynı anda poll
+değil, Pi 4 serverın 3.5 mm analog jakından çalar. Çok sayıda client aynı anda poll
 etse bile her cue serverda tek kez tetiklenir; sahne değişince loop kanalları
 kapatılır.
 
@@ -213,7 +213,7 @@ Canlı piezo grafiği için Arduino seri porttan `PIEZO:123` veya `RAW:123` biç
 
 ## Gelişmiş merkezi ses cue'ları
 
-Ses timeline'ında yüklenen dosyanın dalga formu tarayıcıda gösterilir. Cue seçilerek başlangıç zamanı, ses seviyesi, fade-in/fade-out, maksimum çalma süresi, loop ve stereo pan değerleri güncellenebilir. Ses yine clientlardan değil serverın USB ses kartından çıkar.
+Ses timeline'ında yüklenen dosyanın dalga formu tarayıcıda gösterilir. Cue seçilerek başlangıç zamanı, ses seviyesi, fade-in/fade-out, maksimum çalma süresi, loop ve stereo pan değerleri güncellenebilir. Ses yine clientlardan değil Pi 4 serverın 3.5 mm analog jakından çıkar.
 ## Photoshop benzeri çalışma alanı
 
 - **V / Seç:** Öğe seçer; öğeyi sürükleyerek taşır. Seçim kutusundaki 8 tutamaçtan boyutlandırılır, üstteki yuvarlak tutamaçtan döndürülür.
@@ -251,7 +251,7 @@ Timeline track görünümü bütün öğeleri ve keyframe noktalarını birlikte
 
 - **Vuruş alanı**, piezonun hırsızı düşürebileceği gerçek oyun bölgesini tanımlar.
 - **Hareket yolu**, hırsızın izleyeceği çok noktalı rotayı tanımlar. Yola çift tıklamak yeni nokta ekler; noktalar inspector içinden sayısal olarak da düzenlenebilir.
-- Yayınlanan koordinatlar her clientın oynanabilir alanına ölçeklenir. Clientta hoparlör gerekmez; ses timelineı serverdaki USB ses kartından çalar.
+- Yayınlanan koordinatlar her clientın oynanabilir alanına ölçeklenir. Clientta hoparlör gerekmez; ses timelineı serverdaki Pi 4 analog jakından çalar.
 
 ### Simülasyon, asset kütüphanesi ve profiller
 

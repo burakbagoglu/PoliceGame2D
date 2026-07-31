@@ -1,4 +1,4 @@
-"""Server-side USB ses yöneticisi testleri."""
+"""Server-side Pi 4 analog ses yöneticisi testleri."""
 from types import SimpleNamespace
 
 from audio_manager import AudioManager
@@ -115,13 +115,17 @@ def make_manager(config=None, devices=None):
     pygame_module = SimpleNamespace(mixer=mixer)
     base_config = {
         "enabled": True,
-        "device_name": "auto-usb",
+        "device_name": "auto-analog",
         "frequency": 8000,
         "output_channels": 1,
         "buffer": 256,
     }
     base_config.update(config or {})
-    device_list = ["HDMI", "USB Audio Device"] if devices is None else devices
+    device_list = [
+        "USB Analog Audio",
+        "HDMI",
+        "bcm2835 Headphones",
+    ] if devices is None else devices
     manager = AudioManager(
         config=base_config,
         pygame_module=pygame_module,
@@ -130,11 +134,11 @@ def make_manager(config=None, devices=None):
     return manager, mixer
 
 
-def test_initializes_preferred_usb_device_and_fallback_assets():
+def test_initializes_preferred_analog_device_and_fallback_assets():
     manager, mixer = make_manager()
 
     assert manager.initialize() is True
-    assert mixer.init_kwargs["devicename"] == "USB Audio Device"
+    assert mixer.init_kwargs["devicename"] == "bcm2835 Headphones"
     assert mixer.init_kwargs["frequency"] == 8000
     assert mixer.num_channels == 8
     assert mixer.reserved == 1
@@ -143,36 +147,38 @@ def test_initializes_preferred_usb_device_and_fallback_assets():
     assert all(manager.using_fallback_sfx.values())
 
 
-def test_missing_usb_device_falls_back_to_silent_mode():
+def test_missing_analog_device_falls_back_to_silent_mode():
     manager, mixer = make_manager(devices=["HDMI Output"])
+    manager._discover_alsa_analog_device = lambda: None
 
     assert manager.initialize() is False
     assert manager.available is False
     assert mixer.initialized is False
-    assert "USB ses kartı bulunamadı" in manager.last_error
+    assert "Pi 4 analog ses çıkışı bulunamadı" in manager.last_error
 
 
-def test_alsa_proc_fallback_selects_usb_card(monkeypatch):
+def test_alsa_proc_fallback_selects_analog_card(monkeypatch):
     manager, mixer = make_manager(devices=[])
     monkeypatch.setenv("AUDIODEV", "")
     monkeypatch.setattr(
         manager,
-        "_discover_alsa_usb_device",
-        lambda: "plughw:2,0",
+        "_discover_alsa_analog_device",
+        lambda: "plughw:Headphones,0",
     )
 
     assert manager.initialize() is True
-    assert manager.active_device == "plughw:2,0"
+    assert manager.active_device == "plughw:Headphones,0"
     assert "devicename" not in mixer.init_kwargs
 
 
-def test_apply_retries_after_usb_hotplug():
+def test_apply_retries_after_analog_device_appears():
     devices = ["HDMI Output"]
     manager, _mixer = make_manager(devices=[])
     manager._device_provider = lambda: list(devices)
+    manager._discover_alsa_analog_device = lambda: None
     assert manager.initialize() is False
 
-    devices.append("USB Audio Device")
+    devices.append("bcm2835 Headphones")
     status = manager.configure(
         enabled=True,
         master_volume=0.8,
@@ -181,7 +187,17 @@ def test_apply_retries_after_usb_hotplug():
     )
 
     assert status["available"] is True
-    assert status["device_active"] == "USB Audio Device"
+    assert status["device_active"] == "bcm2835 Headphones"
+
+
+def test_explicit_usb_mode_remains_supported():
+    manager, mixer = make_manager(
+        config={"device_name": "auto-usb"},
+        devices=["bcm2835 Headphones", "USB Audio Device"],
+    )
+
+    assert manager.initialize() is True
+    assert mixer.init_kwargs["devicename"] == "USB Audio Device"
 
 
 def test_game_music_hit_and_success_flow():

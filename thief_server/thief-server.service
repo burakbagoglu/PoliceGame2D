@@ -10,6 +10,7 @@ User=pi
 WorkingDirectory=/home/pi/thief_server
 Environment=PYTHONUNBUFFERED=1
 Environment=THIEF_SERVER_CONFIG=/home/pi/thief_server/config.json
+EnvironmentFile=-/etc/police-game/photos.env
 Environment=SDL_AUDIODRIVER=alsa
 ExecStart=/usr/bin/python3 /home/pi/thief_server/main.py
 Restart=always
