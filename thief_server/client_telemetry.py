@@ -33,10 +33,16 @@ class ClientTelemetryStore:
             "queue_depth": max(0, int(payload.get("queue_depth", 0) or 0)),
             "app_version": str(payload.get("app_version", ""))[:40],
             "frame_time_p95_ms": round(max(0.0, min(1000.0, float(payload.get("frame_time_p95_ms", 0) or 0))), 1),
+            "draw_time_p95_ms": round(max(0.0, min(1000.0, float(payload.get("draw_time_p95_ms", 0) or 0))), 1),
+            "blit_time_p95_ms": round(max(0.0, min(1000.0, float(payload.get("blit_time_p95_ms", 0) or 0))), 1),
+            "flip_time_p95_ms": round(max(0.0, min(1000.0, float(payload.get("flip_time_p95_ms", 0) or 0))), 1),
             "performance_profile": str(payload.get("performance_profile", ""))[:32],
             "quality_level": str(payload.get("quality_level", ""))[:16],
             "render_width": max(0, min(7680, int(payload.get("render_width", 0) or 0))),
             "render_height": max(0, min(4320, int(payload.get("render_height", 0) or 0))),
+            "output_width": max(0, min(7680, int(payload.get("output_width", 0) or 0))),
+            "output_height": max(0, min(4320, int(payload.get("output_height", 0) or 0))),
+            "direct_render": bool(payload.get("direct_render", False)),
             "piezo": self._clean_piezo(payload.get("piezo")),
         }
         temperature = clean["cpu_temp_c"]

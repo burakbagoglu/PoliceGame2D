@@ -324,6 +324,8 @@ class SceneRenderer:
     ):
         opacity = max(0.0, min(1.0, float(element.get("opacity", 1.0))))
         effect = str(element.get("effect", "none"))
+        if self.quality_level == "minimal":
+            effect = "none"
         speed = max(0.1, float(element.get("effect_speed", 1.0)))
         phase = elapsed * speed
         scale = 1.0
@@ -802,6 +804,8 @@ class SceneRenderer:
         elapsed: float,
         opacity: float,
     ):
+        if self.quality_level == "minimal":
+            return
         colors = (
             (255, 224, 56),
             (236, 45, 76),

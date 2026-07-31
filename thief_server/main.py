@@ -185,10 +185,16 @@ class ClientTelemetryRequest(BaseModel):
     queue_depth: int = Field(default=0, ge=0)
     app_version: str = Field(default="", max_length=40)
     frame_time_p95_ms: float = Field(default=0, ge=0, le=1000)
+    draw_time_p95_ms: float = Field(default=0, ge=0, le=1000)
+    blit_time_p95_ms: float = Field(default=0, ge=0, le=1000)
+    flip_time_p95_ms: float = Field(default=0, ge=0, le=1000)
     performance_profile: str = Field(default="", max_length=32)
     quality_level: str = Field(default="", max_length=16)
     render_width: int = Field(default=0, ge=0, le=7680)
     render_height: int = Field(default=0, ge=0, le=4320)
+    output_width: int = Field(default=0, ge=0, le=7680)
+    output_height: int = Field(default=0, ge=0, le=4320)
+    direct_render: bool = False
     piezo: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -2183,10 +2189,11 @@ DASHBOARD_HTML = """
                     <div class="screen-card" style="border-color:${client.online ? '#22c55e' : '#ef4444'}">
                         <h4>Ekran ${client.screen_id} · ${client.online ? 'Bağlı' : 'Çevrimdışı'}</h4>
                         <div>FPS: ${client.fps ?? '—'} · P95 kare: ${client.frame_time_p95_ms ? client.frame_time_p95_ms + ' ms' : '—'}</div>
+                        <div>P95 çizim: ${client.draw_time_p95_ms ?? '—'} ms · kopya: ${client.blit_time_p95_ms ?? '—'} ms · flip: ${client.flip_time_p95_ms ?? '—'} ms</div>
                         <div>RAM: ${client.memory_mb ? client.memory_mb + ' MB' : '—'} · Sıcaklık: ${client.cpu_temp_c != null ? client.cpu_temp_c + ' °C' : '—'}</div>
                         <div>Profil: ${client.performance_profile || '—'} · Kalite: ${client.quality_level || '—'}</div>
-                        <div>Render: ${client.render_width && client.render_height ? client.render_width + '×' + client.render_height : '—'} · Seri: ${client.serial_connected ? 'OK' : 'Yok'}</div>
-                        <div>Sahne: ${client.active_scene || '—'} · Kuyruk: ${client.queue_depth ?? 0}</div>
+                        <div>Render: ${client.render_width && client.render_height ? client.render_width + '×' + client.render_height : '—'} → Çıkış: ${client.output_width && client.output_height ? client.output_width + '×' + client.output_height : '—'} · Direct: ${client.direct_render ? 'Aktif' : 'Kapalı'}</div>
+                        <div>Seri: ${client.serial_connected ? 'OK' : 'Yok'} · Sahne: ${client.active_scene || '—'} · Kuyruk: ${client.queue_depth ?? 0}</div>
                     </div>`).join('');
                 renderSelectedTelemetry();
             } catch (error) {

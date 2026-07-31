@@ -83,7 +83,13 @@ class ThiefGame:
         # Saat
         self.clock = pygame.time.Clock()
         self._frame_times_ms = deque(maxlen=180)
+        self._draw_times_ms = deque(maxlen=180)
+        self._blit_times_ms = deque(maxlen=180)
+        self._flip_times_ms = deque(maxlen=180)
         self.frame_time_p95_ms = 0.0
+        self.draw_time_p95_ms = 0.0
+        self.blit_time_p95_ms = 0.0
+        self.flip_time_p95_ms = 0.0
         self.performance_profile = self.config.performance_profile
         self._quality_order = ["minimal", "low", "medium", "high"]
         self._base_quality = {
@@ -171,11 +177,17 @@ class ThiefGame:
             "serial_connected": bool(getattr(self.hit_input, "connected", False)),
             "piezo": self.hit_input.get_telemetry(),
             "frame_time_p95_ms": round(self.frame_time_p95_ms, 1),
+            "draw_time_p95_ms": round(self.draw_time_p95_ms, 1),
+            "blit_time_p95_ms": round(self.blit_time_p95_ms, 1),
+            "flip_time_p95_ms": round(self.flip_time_p95_ms, 1),
             "performance_profile": self.performance_profile,
             "quality_level": self.quality_level,
             "render_width": getattr(self, "view_w", self.config.render_width),
             "render_height": getattr(self, "view_h", self.config.render_height),
-            "app_version": "scene-engine-v6-pizero",
+            "output_width": getattr(self, "output_view_w", self.screen_width),
+            "output_height": getattr(self, "output_view_h", self.screen_height),
+            "direct_render": bool(getattr(self, "direct_render", False)),
+            "app_version": "scene-engine-v7-direct-render",
         }
     def _set_quality_level(self, quality_level: str):
         if quality_level == self.quality_level:
@@ -186,12 +198,33 @@ class ThiefGame:
         if self.config.debug:
             print(f"[Performans] Kalite seviyesi: {quality_level}")
 
-    def _record_frame_performance(self, frame_ms: float):
+    @staticmethod
+    def _p95(samples) -> float:
+        if not samples:
+            return 0.0
+        ordered = sorted(samples)
+        index = max(
+            0,
+            min(len(ordered) - 1, math.ceil(len(ordered) * 0.95) - 1),
+        )
+        return ordered[index]
+
+    def _record_frame_performance(
+        self,
+        frame_ms: float,
+        draw_ms: float,
+        blit_ms: float,
+        flip_ms: float,
+    ):
         self._frame_times_ms.append(max(0.0, float(frame_ms)))
+        self._draw_times_ms.append(max(0.0, float(draw_ms)))
+        self._blit_times_ms.append(max(0.0, float(blit_ms)))
+        self._flip_times_ms.append(max(0.0, float(flip_ms)))
         if len(self._frame_times_ms) >= 20:
-            ordered = sorted(self._frame_times_ms)
-            index = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * 0.95) - 1))
-            self.frame_time_p95_ms = ordered[index]
+            self.frame_time_p95_ms = self._p95(self._frame_times_ms)
+            self.draw_time_p95_ms = self._p95(self._draw_times_ms)
+            self.blit_time_p95_ms = self._p95(self._blit_times_ms)
+            self.flip_time_p95_ms = self._p95(self._flip_times_ms)
         if not self.config.adaptive_quality or len(self._frame_times_ms) < 30:
             return
         now = time.monotonic()
@@ -316,13 +349,23 @@ class ThiefGame:
         self.view_w = max(320, round(self.output_view_w * self.render_ratio))
         self.view_h = max(180, round(self.output_view_h * self.render_ratio))
 
-        # Oyun düşük çözünürlüklü canvas'a çizilir; yalnız sunumda fiziksel alana büyütülür.
-        self.canvas = pygame.Surface((self.view_w, self.view_h)).convert()
-        self.present_surface = (
-            pygame.Surface((self.output_view_w, self.output_view_h)).convert()
-            if (self.view_w, self.view_h) != (self.output_view_w, self.output_view_h)
-            else None
+        # Render ve fiziksel alan aynı boyuttaysa doğrudan ekran alt yüzeyine çiz.
+        # Bu, Pi Zero'da her kare yapılan tam ekran canvas -> screen kopyasını kaldırır.
+        self.direct_render = (self.view_w, self.view_h) == (
+            self.output_view_w,
+            self.output_view_h,
         )
+        if self.direct_render:
+            self.screen.fill((0, 0, 0))
+            self.canvas = self.screen.subsurface(
+                pygame.Rect(self.view_x, self.view_y, self.view_w, self.view_h)
+            )
+            self.present_surface = None
+        else:
+            self.canvas = pygame.Surface((self.view_w, self.view_h)).convert()
+            self.present_surface = pygame.Surface(
+                (self.output_view_w, self.output_view_h)
+            ).convert()
 
         # --- Oyun koordinatları (oynanabilir alan uzayında, çözünürlükten bağımsız) ---
         self.thief_y = int(round(self.view_h * cfg.thief_ground_pct / 100))
@@ -606,14 +649,22 @@ class ThiefGame:
             self._update_effects(dt)
             self._update_countdown(dt)
 
-            # Çiz (canvas'a) ve ekrana sun
+            # Çiz (canvas'a) ve ekrana sun; aşamaları ayrı ölç.
+            draw_started = time.perf_counter()
             self._draw()
-            self._present()
+            draw_ms = (time.perf_counter() - draw_started) * 1000.0
+            blit_ms, flip_ms = self._present()
             self._capture_requested_scene_preview()
-            self._record_frame_performance((time.perf_counter() - frame_started) * 1000.0)
+            self._record_frame_performance(
+                (time.perf_counter() - frame_started) * 1000.0,
+                draw_ms,
+                blit_ms,
+                flip_ms,
+            )
 
     def _present(self):
-        """Düşük çözünürlüklü canvas'ı fiziksel oyun alanına tek adımda büyüt."""
+        """Canvas kopyalama/ölçekleme ve ekran flip sürelerini ayrı ölç."""
+        blit_started = time.perf_counter()
         output = self.canvas
         if self.present_surface is not None:
             pygame.transform.scale(
@@ -622,8 +673,14 @@ class ThiefGame:
                 self.present_surface,
             )
             output = self.present_surface
-        self.screen.blit(output, (self.view_x, self.view_y))
+        if not self.direct_render:
+            self.screen.blit(output, (self.view_x, self.view_y))
+        blit_ms = (time.perf_counter() - blit_started) * 1000.0
+
+        flip_started = time.perf_counter()
         pygame.display.flip()
+        flip_ms = (time.perf_counter() - flip_started) * 1000.0
+        return blit_ms, flip_ms
 
     def _capture_requested_scene_preview(self):
         """Server isterse güncel canvası bir kez küçültüp ağ threadine teslim et."""
@@ -833,13 +890,18 @@ class ThiefGame:
             if self.config.band_enabled:
                 self._draw_band(shake_x, shake_y)
 
-            if self.config.shadow_enabled and not self.game.is_idle():
+            if (
+                self.config.shadow_enabled
+                and self.quality_level != "minimal"
+                and not self.game.is_idle()
+            ):
                 self._draw_shadow(shake_x, shake_y)
 
             self._draw_thief(shake_x, shake_y)
 
-            for p in self.particles:
-                p.draw(self.canvas, shake_x, shake_y)
+            if self.quality_level != "minimal":
+                for p in self.particles:
+                    p.draw(self.canvas, shake_x, shake_y)
 
             for t in self.floating_texts:
                 t.draw(self.canvas, shake_x, shake_y)
@@ -1181,8 +1243,9 @@ class ThiefGame:
 
         self.canvas.blit(self.countdown_dim_surface, (0, 0))
 
-        for piece in self.countdown_confetti:
-            piece.draw(self.canvas)
+        if self.quality_level != "minimal":
+            for piece in self.countdown_confetti:
+                piece.draw(self.canvas)
 
         card = self.countdown_card_cache.get(message)
         if card is None:
@@ -1199,7 +1262,11 @@ class ThiefGame:
         )
         # Kısa introda her kare ölçeklenir; normal scale Pi Zero'da smoothscale'den
         # belirgin biçimde daha ucuzdur ve çizgi roman görünümüne de uyar.
-        scaled = pygame.transform.scale(card, scaled_size)
+        scaled = (
+            card
+            if self.quality_level == "minimal"
+            else pygame.transform.scale(card, scaled_size)
+        )
         self.canvas.blit(
             scaled,
             (

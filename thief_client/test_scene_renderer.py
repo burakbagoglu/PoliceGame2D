@@ -210,3 +210,28 @@ def test_low_quality_disables_blur_filter():
     filtered = renderer._apply_filters(source, {"blur": 12})
 
     assert filtered is source
+
+
+def test_minimal_quality_skips_scale_effect_and_confetti(monkeypatch):
+    document = make_document()
+    document["scenes"]["waiting"]["elements"][1]["effect"] = "scale"
+    document["scenes"]["waiting"]["elements"].append({
+        "id": "confetti",
+        "type": "confetti",
+        "x": 0,
+        "y": 0,
+        "width": 1920,
+        "height": 1080,
+        "amount": 180,
+    })
+    renderer = SceneRenderer(960, 540)
+    renderer.apply("published-minimal", document)
+    renderer.set_quality("minimal")
+    target = pygame.Surface((960, 540))
+
+    def unexpected_scale(*_args, **_kwargs):
+        raise AssertionError("minimal quality must not scale animated elements")
+
+    monkeypatch.setattr(pygame.transform, "scale", unexpected_scale)
+
+    assert renderer.draw(target, "waiting", {"score": 1}) is True
