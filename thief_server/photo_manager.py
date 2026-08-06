@@ -46,6 +46,9 @@ class PhotoSessionManager:
             "warmup_frames": 5,
             "timeout_seconds": 12,
             "capture_delay_ms": 350,
+            "retention_days": 30,
+            "auto_cleanup": True,
+            "protect_sold": True,
         }
         self.config = {**defaults, **(camera_config or {})}
         self.base_dir = Path(base_dir).resolve()
@@ -62,6 +65,13 @@ class PhotoSessionManager:
     def initialize(self):
         self.base_dir.mkdir(parents=True, exist_ok=True)
         with self._lock:
+            if not self.current_session_id:
+                active = [
+                    item for item in self.list_sessions()
+                    if item.get("status") == "active"
+                ]
+                if active:
+                    self.current_session_id = active[0]["id"]
             if self._worker and self._worker.is_alive():
                 return
             self._stop_event.clear()
@@ -71,6 +81,8 @@ class PhotoSessionManager:
                 daemon=True,
             )
             self._worker.start()
+        if self.config.get("auto_cleanup", True):
+            self.cleanup_expired(dry_run=False)
 
     def shutdown(self):
         self._stop_event.set()
@@ -402,6 +414,63 @@ class PhotoSessionManager:
             "queue_depth": self._capture_queue.qsize(),
             "last_error": self.last_error,
             "current_session": self.get_current(),
+            "storage": self.storage_status(),
+        }
+
+    def storage_status(self) -> dict:
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        total_bytes = 0
+        session_count = 0
+        for session_dir in self.base_dir.iterdir():
+            if not session_dir.is_dir() or session_dir.name.startswith("_"):
+                continue
+            session_count += 1
+            for path in session_dir.rglob("*"):
+                try:
+                    if path.is_file():
+                        total_bytes += path.stat().st_size
+                except OSError:
+                    continue
+        return {
+            "session_count": session_count,
+            "used_bytes": total_bytes,
+            "used_mb": round(total_bytes / (1024 * 1024), 1),
+            "retention_days": max(0, int(self.config.get("retention_days", 30))),
+            "auto_cleanup": bool(self.config.get("auto_cleanup", False)),
+            "protect_sold": bool(self.config.get("protect_sold", True)),
+        }
+
+    def cleanup_expired(self, *, dry_run: bool = True) -> dict:
+        retention_days = max(0, int(self.config.get("retention_days", 30)))
+        cutoff = time.time() - retention_days * 86400
+        candidates = []
+        for session in self.list_sessions():
+            if session["id"] == self.current_session_id or session.get("status") == "active":
+                continue
+            if self.config.get("protect_sold", True) and session.get("sold"):
+                continue
+            stamp = session.get("ended_at") or session.get("started_at")
+            try:
+                timestamp = datetime.fromisoformat(str(stamp)).timestamp()
+            except (TypeError, ValueError):
+                continue
+            if retention_days and timestamp < cutoff:
+                candidates.append(session["id"])
+        removed = []
+        if not dry_run:
+            for session_id in candidates:
+                try:
+                    self.delete_session(session_id)
+                    removed.append(session_id)
+                except (FileNotFoundError, ValueError, OSError):
+                    continue
+        return {
+            "dry_run": bool(dry_run),
+            "candidate_count": len(candidates),
+            "candidates": candidates,
+            "removed_count": len(removed),
+            "removed": removed,
+            "storage": self.storage_status(),
         }
 
     def capture_test(self) -> Path:

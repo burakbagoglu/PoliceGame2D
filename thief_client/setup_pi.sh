@@ -1,46 +1,222 @@
-#!/bin/bash
-# Raspberry Pi Zero 2 W Kurulum Script'i
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
-echo "=== Thief Game Client Kurulumu ==="
+# Pi Zero 2 W tek komut kurulum/guncelleme araci.
+# Ornek:
+#   sudo ./thief_client/setup_pi.sh --screen-id 1 --server 192.168.1.10
 
-# Sistem güncellemesi
-echo "[1/6] Sistem güncelleniyor..."
-sudo apt update && sudo apt upgrade -y
+SERVICE_NAME="thief-game"
+INSTALL_ROOT="/opt/polisoyunu"
+SCREEN_ID=""
+SERVER_ADDRESS=""
+SERIAL_PORT="/dev/ttyUSB0"
+TARGET_USER="${SUDO_USER:-${USER:-pi}}"
+SKIP_APT_UPDATE=0
+START_NOW=1
 
-# Gerekli paketler
-echo "[2/6] Gerekli paketler yükleniyor..."
-sudo apt install -y python3-pip python3-pygame python3-serial
+usage() {
+    cat <<'EOF'
+Kullanim:
+  sudo ./thief_client/setup_pi.sh --screen-id 1 --server 192.168.1.10 [secenekler]
 
-# Python paketleri
-echo "[3/6] Python paketleri yükleniyor..."
-pip3 install --user -r requirements.txt
+Zorunlu:
+  --screen-id N          Ekran numarasi (1-8)
+  --server IP|URL        Pi 4 adresi. Ornek: 192.168.1.10 veya http://192.168.1.10:8078
 
-# Kullanıcıyı dialout grubuna ekle (serial port erişimi için)
-echo "[4/6] Kullanıcı ayarları..."
-sudo usermod -a -G dialout $USER
+Secenekler:
+  --serial-port PATH     Arduino seri portu (varsayilan /dev/ttyUSB0)
+  --user USER            Servisi calistiracak kullanici
+  --install-root PATH    Kurulum dizini (varsayilan /opt/polisoyunu)
+  --skip-apt-update      apt update adimini atla
+  --no-start             Kur ama servisi hemen baslatma
+  -h, --help             Bu yardimi goster
 
-# Service dosyasını kopyala
-echo "[5/6] Systemd service kuruluyor..."
-sudo cp thief-game.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable thief-game.service
+Script tekrar calistirilabilir; mevcut config yedeklenir ve ekran/server ayarlari korunarak guncellenir.
+EOF
+}
 
-# Otomatik login ayarı (GUI olmadan)
-echo "[6/6] Otomatik başlatma ayarlanıyor..."
-sudo raspi-config nonint do_boot_behaviour B2
+log() { printf '\n[%s] %s\n' "$(date '+%H:%M:%S')" "$*"; }
+fail() { printf '\nHATA: %s\n' "$*" >&2; exit 1; }
 
-# Ekran kararmasını engelle (kiosk - etkinlik boyunca ekran sönmesin)
-sudo raspi-config nonint do_blanking 1 || true
+while (($#)); do
+    case "$1" in
+        --screen-id) SCREEN_ID="${2:-}"; shift 2 ;;
+        --server) SERVER_ADDRESS="${2:-}"; shift 2 ;;
+        --serial-port) SERIAL_PORT="${2:-}"; shift 2 ;;
+        --user) TARGET_USER="${2:-}"; shift 2 ;;
+        --install-root) INSTALL_ROOT="${2:-}"; shift 2 ;;
+        --skip-apt-update) SKIP_APT_UPDATE=1; shift ;;
+        --no-start) START_NOW=0; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) fail "Bilinmeyen secenek: $1" ;;
+    esac
+done
 
-echo ""
-echo "=== Kurulum Tamamlandı ==="
-echo ""
-echo "Önemli notlar:"
-echo "1. config.json dosyasında her cihaz için benzersiz screen_id değerini ayarlayın (1-8)"
-echo "2. config.json içinde server_base_url değerini Pi 4 IP adresine göre ayarlayın"
-echo "3. Arduino'yu USB'ye bağlayın"
-echo "4. 'sudo reboot' ile yeniden başlatın"
-echo ""
-echo "Manuel başlatma: python3 main.py"
-echo "Service başlatma: sudo systemctl start thief-game"
-echo "Logları görme: journalctl -u thief-game -f"
+[[ "${EUID}" -eq 0 ]] || fail "Bu script sudo ile calistirilmali."
+[[ "${SCREEN_ID}" =~ ^[1-8]$ ]] || fail "--screen-id 1 ile 8 arasinda olmali."
+[[ -n "${SERVER_ADDRESS}" ]] || fail "--server zorunlu."
+id "${TARGET_USER}" >/dev/null 2>&1 || fail "Kullanici bulunamadi: ${TARGET_USER}"
+[[ "${INSTALL_ROOT}" == /* ]] || fail "--install-root mutlak bir yol olmali."
+case "${INSTALL_ROOT%/}" in
+    ""|/|/opt|/usr|/var|/home|/root) fail "Guvenli olmayan install-root: ${INSTALL_ROOT}" ;;
+esac
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+[[ -f "${SOURCE_ROOT}/thief_client/main.py" ]] || fail "Proje kok dizini bulunamadi."
+
+if [[ "${SERVER_ADDRESS}" =~ ^https?:// ]]; then
+    SERVER_BASE="${SERVER_ADDRESS%/}"
+else
+    SERVER_BASE="http://${SERVER_ADDRESS%/}"
+fi
+[[ "${SERVER_BASE}" =~ :[0-9]+$ ]] || SERVER_BASE="${SERVER_BASE}:8078"
+
+export DEBIAN_FRONTEND=noninteractive
+if ((SKIP_APT_UPDATE == 0)); then
+    log "Paket listesi guncelleniyor"
+    apt-get update
+fi
+
+log "Pygame, serial, ag ve kurulum araclari yukleniyor"
+apt-get install -y --no-install-recommends \
+    python3 python3-pygame python3-serial python3-requests \
+    rsync curl ca-certificates
+
+log "Kullanici donanim gruplarina ekleniyor"
+for group in dialout video render input tty; do
+    getent group "${group}" >/dev/null && usermod -a -G "${group}" "${TARGET_USER}" || true
+done
+
+log "Proje ${INSTALL_ROOT} dizinine kopyalaniyor"
+install -d -m 0755 "${INSTALL_ROOT}"
+EXISTING_CONFIG="${INSTALL_ROOT}/thief_client/config.json"
+CONFIG_BACKUP=""
+if [[ -f "${EXISTING_CONFIG}" ]]; then
+    CONFIG_BACKUP="$(mktemp)"
+    cp "${EXISTING_CONFIG}" "${CONFIG_BACKUP}"
+fi
+if [[ "$(readlink -f "${SOURCE_ROOT}")" != "$(readlink -f "${INSTALL_ROOT}")" ]]; then
+    rsync -a --delete \
+        --exclude='.git/' --exclude='__pycache__/' --exclude='.pytest_cache/' \
+        --exclude='thief_client/scene_cache/' --exclude='thief_server/photo_sessions/' \
+        "${SOURCE_ROOT}/" "${INSTALL_ROOT}/"
+fi
+if [[ -n "${CONFIG_BACKUP}" ]]; then
+    cp "${CONFIG_BACKUP}" "${EXISTING_CONFIG}"
+    rm -f "${CONFIG_BACKUP}"
+fi
+
+log "Client config ayarlaniyor"
+python3 - "${EXISTING_CONFIG}" "${SCREEN_ID}" "${SERVER_BASE}" "${SERIAL_PORT}" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+path, screen_id, server_base, serial_port = sys.argv[1:]
+with open(path, "r", encoding="utf-8") as handle:
+    data = json.load(handle)
+data.update({
+    "screen_id": int(screen_id),
+    "server_base_url": server_base,
+    "server_url": server_base.rstrip("/") + "/event",
+    "serial_port": serial_port,
+    "server_controlled": True,
+    "fullscreen": True,
+    "debug": False,
+    "installed": True,
+    "performance_profile": "pi_zero_2w",
+    "render_width": 1280,
+    "render_height": 720,
+    "adaptive_quality": True,
+})
+directory = os.path.dirname(path)
+fd, temporary = tempfile.mkstemp(prefix="config-", suffix=".json", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+PY
+
+chown -R "${TARGET_USER}:${TARGET_USER}" "${INSTALL_ROOT}"
+chmod +x "${INSTALL_ROOT}/thief_client/setup_pi.sh"
+
+log "Systemd servisi olusturuluyor"
+cat >"/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
+[Unit]
+Description=Polis Oyunu - Pi Zero Client ${SCREEN_ID}
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=${TARGET_USER}
+WorkingDirectory=${INSTALL_ROOT}/thief_client
+ExecStart=/usr/bin/python3 -u ${INSTALL_ROOT}/thief_client/main.py
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+KillSignal=SIGINT
+Environment=PYTHONUNBUFFERED=1
+Environment=SDL_VIDEODRIVER=kmsdrm
+Environment=SDL_AUDIODRIVER=dummy
+Environment=SDL_VIDEO_ALLOW_SCREENSAVER=0
+Environment=THIEF_SCREEN_ID=${SCREEN_ID}
+Environment=THIEF_SERVER_BASE_URL=${SERVER_BASE}
+Environment=THIEF_SERVER_URL=${SERVER_BASE}/event
+Environment=THIEF_SERIAL_PORT=${SERIAL_PORT}
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+log "Ekran kararmasi kapatiliyor"
+command -v raspi-config >/dev/null && raspi-config nonint do_blanking 1 || true
+
+log "Kurulum dogrulaniyor"
+python3 -m py_compile \
+    "${INSTALL_ROOT}/thief_client/main.py" \
+    "${INSTALL_ROOT}/thief_client/lib/"*.py
+systemctl daemon-reload
+systemctl enable "${SERVICE_NAME}.service"
+if ((START_NOW)); then
+    systemctl restart "${SERVICE_NAME}.service"
+    sleep 2
+    systemctl is-active --quiet "${SERVICE_NAME}.service" || {
+        journalctl -u "${SERVICE_NAME}.service" -n 60 --no-pager >&2
+        fail "Servis baslatilamadi."
+    }
+fi
+
+if curl --silent --show-error --max-time 3 "${SERVER_BASE}/health" >/dev/null; then
+    SERVER_RESULT="ulasildi"
+else
+    SERVER_RESULT="su an ulasilamiyor; client baglanti gelince otomatik toparlanacak"
+fi
+
+cat <<EOF
+
+============================================================
+ Kurulum tamamlandi
+ Ekran             : ${SCREEN_ID}
+ Server            : ${SERVER_BASE} (${SERVER_RESULT})
+ Arduino           : ${SERIAL_PORT}
+ Kurulum dizini    : ${INSTALL_ROOT}
+ Servis            : ${SERVICE_NAME}.service
+============================================================
+
+Elektrik gidip geldiginde servis boot sirasinda otomatik acilir.
+Oyun kapanir veya hata verirse systemd 2 saniye sonra yeniden baslatir.
+
+Durum : sudo systemctl status ${SERVICE_NAME}
+Log   : sudo journalctl -u ${SERVICE_NAME} -f
+Yenile: ayni setup_pi.sh komutunu tekrar calistir
+EOF

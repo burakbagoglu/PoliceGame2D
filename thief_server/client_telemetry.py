@@ -43,6 +43,15 @@ class ClientTelemetryStore:
             "output_width": max(0, min(7680, int(payload.get("output_width", 0) or 0))),
             "output_height": max(0, min(4320, int(payload.get("output_height", 0) or 0))),
             "direct_render": bool(payload.get("direct_render", False)),
+            "render_mode": str(payload.get("render_mode", "full-render"))[:24],
+            "updated_pixel_ratio": round(max(
+                0.0,
+                min(100.0, float(payload.get("updated_pixel_ratio", 100) or 0)),
+            ), 2),
+            "dirty_rect_count": max(
+                0,
+                min(128, int(payload.get("dirty_rect_count", 0) or 0)),
+            ),
             "piezo": self._clean_piezo(payload.get("piezo")),
         }
         temperature = clean["cpu_temp_c"]

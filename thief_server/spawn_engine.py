@@ -174,7 +174,12 @@ class GameSession:
         self.screen_count = int(self.screen_count)
         self.screen_targets = {int(k): max(1, int(v)) for k, v in self.screen_targets.items()}
         self.screen_scores = {
-            screen_id: max(0, int(self.screen_scores.get(screen_id, 0)))
+            screen_id: max(0, int(
+                self.screen_scores.get(
+                    screen_id,
+                    self.screen_scores.get(str(screen_id), 0),
+                )
+            ))
             for screen_id in range(1, self.screen_count + 1)
         }
         if self.screen_targets:
@@ -500,6 +505,24 @@ class SpawnScheduler:
 
         if self.debug:
             print(f"[SpawnScheduler] Başlatıldı. Hedef: {self.session.target_score}")
+
+    def resume(self):
+        """Daha önce kaydedilmiş start_time değerini koruyarak loop'u sürdür."""
+        with self._lock:
+            self.session.is_active = True
+            self._running = True
+            self._last_spawn_time = 0
+            self._end_notified = False
+            self._last_countdown_message = None
+            self._gameplay_notified = not self.session.countdown_active
+        self._thread = threading.Thread(target=self._spawn_loop, daemon=True)
+        self._thread.start()
+
+        if self.debug:
+            print(
+                f"[SpawnScheduler] Oturum kurtarıldı. "
+                f"Kalan: {max(0, self.session.total_seconds - self.session.elapsed_seconds)} sn"
+            )
 
     def stop(self):
         """Spawn loop'u durdur"""

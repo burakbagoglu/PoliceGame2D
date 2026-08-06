@@ -557,6 +557,7 @@ class TestCombinedPolling:
                     "refractory_ms": 350,
                 },
                 "heartbeat": {"online": True},
+                "command": {"type": "restart", "token": "command-1"},
             },
             status=200,
         )
@@ -577,6 +578,10 @@ class TestCombinedPolling:
         assert client.get_spawn() is True
         assert client.get_piezo_config() == {"threshold": 180, "refractory_ms": 350}
         assert client.server_screen_remaining == 8
+        assert client.consume_command() == {
+            "type": "restart",
+            "token": "command-1",
+        }
         request_body = json.loads(responses.calls[0].request.body)
         assert request_body["screen_id"] == 4
         assert request_body["telemetry"]["frame_time_p95_ms"] == 36.2

@@ -17,6 +17,7 @@ def reset_state(monkeypatch, tmp_path):
     import main
     from photo_auth import PhotoAccessGuard
     from photo_manager import PhotoSessionManager
+    from runtime_state import RuntimeStateStore
 
     def fake_capture(path):
         Image.new("RGB", (960, 540), (30, 100, 190)).save(path, "JPEG", quality=88)
@@ -25,6 +26,11 @@ def reset_state(monkeypatch, tmp_path):
         tmp_path / "photo_sessions", capture_backend=fake_capture
     )
     monkeypatch.setattr(main, "photo_manager", test_photo_manager)
+    monkeypatch.setattr(
+        main,
+        "runtime_state_store",
+        RuntimeStateStore(tmp_path / "runtime_state.json"),
+    )
     monkeypatch.setattr(main, "photo_guard", PhotoAccessGuard(pin="123456"))
     client.cookies.clear()
     score_manager.reset()
@@ -638,6 +644,37 @@ def test_game_profiles_can_start_a_session():
     assert started.json()["game_duration_minutes"] == 30
 
 
+def test_active_game_recovers_from_runtime_checkpoint():
+    import main
+
+    started = client.post(
+        "/api/game/start",
+        json={"child_count": 1, "duration_minutes": 1, "difficulty": "easy"},
+    )
+    assert started.status_code == 200
+    event = {
+        "event_id": "power-loss-event",
+        "screen_id": 1,
+        "points": 1,
+        "ts_ms": int(time.time() * 1000),
+    }
+    scored = client.post("/event", json=event)
+    assert scored.status_code == 200
+    assert main.runtime_state_store.load()["session"]["is_active"] is True
+
+    main.spawn_scheduler.stop()
+    main.spawn_scheduler = None
+    score_manager.reset()
+
+    assert main._restore_runtime_checkpoint() is True
+    assert main.spawn_scheduler.session.is_active is True
+    assert main.spawn_scheduler.session.get_screen_score(1) == 1
+
+    duplicate = client.post("/event", json=event)
+    assert duplicate.status_code == 200
+    assert duplicate.json()["is_new"] is False
+
+
 def test_unknown_game_profile_is_rejected():
     response = client.post("/api/game/start", json={"profile_id": "missing"})
     assert response.status_code == 404
@@ -675,6 +712,75 @@ def test_combined_client_poll(monkeypatch):
     assert second.status_code == 200
     assert second.json()["piezo_config"]["changed"] is False
 
+def test_online_client_can_receive_restart_command(monkeypatch):
+    import main
+    from client_commands import ClientCommandStore
+    from client_telemetry import ClientTelemetryStore
+
+    telemetry = ClientTelemetryStore()
+    telemetry.update(3, {
+        "fps": 30,
+        "serial_connected": True,
+        "app_version": "scene-engine-v8-dirty-rect",
+    })
+    monkeypatch.setattr(main, "client_telemetry", telemetry)
+    monkeypatch.setattr(main, "client_commands", ClientCommandStore())
+
+    queued = client.post("/api/clients/3/restart")
+    assert queued.status_code == 200
+
+    poll = client.post("/api/client/poll", json={"screen_id": 3})
+    assert poll.status_code == 200
+    assert poll.json()["command"]["type"] == "restart"
+
+    next_poll = client.post("/api/client/poll", json={"screen_id": 3})
+    assert next_poll.json()["command"] is None
+
+
+def test_offline_client_restart_is_rejected(monkeypatch):
+    import main
+    from client_telemetry import ClientTelemetryStore
+
+    monkeypatch.setattr(main, "client_telemetry", ClientTelemetryStore())
+
+    response = client.post("/api/clients/2/restart")
+
+    assert response.status_code == 409
+
+
+def test_field_check_combines_clients_audio_and_camera(monkeypatch):
+    import main
+    from client_telemetry import ClientTelemetryStore
+
+    telemetry = ClientTelemetryStore()
+    for screen_id in range(1, 9):
+        telemetry.update(screen_id, {
+            "fps": 30,
+            "serial_connected": True,
+            "app_version": "scene-engine-v8-dirty-rect",
+            "cpu_temp_c": 55,
+        })
+    monkeypatch.setattr(main, "client_telemetry", telemetry)
+    monkeypatch.setattr(main.audio_manager, "get_status", lambda: {
+        "enabled": True,
+        "available": True,
+        "device_active": "Headphones",
+        "last_error": None,
+    })
+    monkeypatch.setattr(main.photo_manager, "camera_status", lambda: {
+        "enabled": True,
+        "available": True,
+        "device": "/dev/video0",
+        "last_error": None,
+    })
+
+    response = client.get("/api/field-check")
+
+    assert response.status_code == 200
+    assert response.json()["ready"] is True
+    assert response.json()["online_count"] == 8
+
+
 def _photo_login():
     response = client.post("/api/photo-auth/login", json={"pin": "123456"})
     assert response.status_code == 200
@@ -690,6 +796,23 @@ def test_photo_gallery_requires_operator_login():
     assert len(csrf) >= 20
     assert client.get("/api/photo-sessions").status_code == 200
     assert client.get("/api/camera/status").status_code == 200
+
+
+def test_photo_storage_requires_login_and_supports_dry_run():
+    assert client.get("/api/photo-storage").status_code == 401
+    csrf = _photo_login()
+
+    status = client.get("/api/photo-storage")
+    assert status.status_code == 200
+    assert "used_mb" in status.json()
+
+    cleanup = client.post(
+        "/api/photo-storage/cleanup",
+        headers={"X-Photo-CSRF": csrf},
+        json={"dry_run": True},
+    )
+    assert cleanup.status_code == 200
+    assert cleanup.json()["dry_run"] is True
 
 
 def test_photo_capture_requires_consent():

@@ -61,6 +61,51 @@ class SceneRenderer:
     def has_scene(self, scene_id: str) -> bool:
         return bool(self.ready and scene_id in self.document.get("scenes", {}))
 
+    def is_scene_static(
+        self,
+        scene_id: str,
+        context: Optional[dict] = None,
+        resolve_rules: bool = True,
+    ) -> bool:
+        """Return whether drawing the scene again can change visual pixels."""
+        context = context or {}
+        if resolve_rules:
+            scene_id = self.resolve_scene(scene_id, context)
+        compiled = self._compiled_scenes.get(str(scene_id))
+        if not compiled:
+            return False
+
+        scene = compiled["scene"]
+        transition = scene.get("transition", {})
+        transition_type = str(transition.get("type", "none"))
+        if self.quality_level != "minimal" and transition_type != "none":
+            if float(transition.get("duration", 0.0) or 0.0) > 0:
+                return False
+
+        for element in compiled["elements"]:
+            if element.get("hidden"):
+                continue
+            if element.get("keyframes"):
+                return False
+            sheet = element.get("sprite_sheet")
+            if isinstance(sheet, dict):
+                columns = max(1, int(sheet.get("columns", 1)))
+                rows = max(1, int(sheet.get("rows", 1)))
+                total = columns * rows
+                start = max(0, min(total - 1, int(sheet.get("start", 0))))
+                end = max(
+                    start,
+                    min(total - 1, int(sheet.get("end", total - 1))),
+                )
+                if end > start:
+                    return False
+            if self.quality_level != "minimal":
+                if str(element.get("effect", "none")) != "none":
+                    return False
+                if element.get("type") == "confetti":
+                    return False
+        return True
+
     def apply(
         self,
         version: str,

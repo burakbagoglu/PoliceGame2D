@@ -187,7 +187,13 @@ class ThiefGame:
             "output_width": getattr(self, "output_view_w", self.screen_width),
             "output_height": getattr(self, "output_view_h", self.screen_height),
             "direct_render": bool(getattr(self, "direct_render", False)),
-            "app_version": "scene-engine-v7-direct-render",
+            "render_mode": getattr(self, "render_mode", "full-render"),
+            "updated_pixel_ratio": round(
+                float(getattr(self, "updated_pixel_ratio", 100.0)),
+                2,
+            ),
+            "dirty_rect_count": int(getattr(self, "dirty_rect_count", 0)),
+            "app_version": "scene-engine-v8-dirty-rect",
         }
     def _set_quality_level(self, quality_level: str):
         if quality_level == self.quality_level:
@@ -195,6 +201,8 @@ class ThiefGame:
         self.quality_level = quality_level
         if hasattr(self, "scene_renderer"):
             self.scene_renderer.set_quality(quality_level)
+        self._last_render_key = None
+        self._dynamic_dirty_rects = []
         if self.config.debug:
             print(f"[Performans] Kalite seviyesi: {quality_level}")
 
@@ -503,6 +511,15 @@ class ThiefGame:
             bg = pygame.image.load(bg_path).convert()
             self.background = pygame.transform.scale(bg, (self.view_w, self.view_h))
 
+        # Minimal profilde statik kareleri ve yalnızca hareketli bölgeleri sun.
+        self._last_render_key = None
+        self._gameplay_base = None
+        self._gameplay_base_key = None
+        self._dynamic_dirty_rects = []
+        self.render_mode = "full-render"
+        self.updated_pixel_ratio = 100.0
+        self.dirty_rect_count = 0
+
         # Ekranı siyaha boya (bar bölgeleri sabit kalır)
         self.screen.fill((0, 0, 0))
         pygame.display.flip()
@@ -608,6 +625,12 @@ class ThiefGame:
             if not self.running:
                 break
 
+            command = self.net_client.consume_command()
+            if command and command.get("type") == "restart":
+                print("[Client] Uzaktan yeniden başlatma komutu alındı.")
+                self.running = False
+                break
+
             # Hit kontrolü
             if self.hit_input.get_hit() and not self.net_client.server_screen_complete:
                 self.game.process_hit()
@@ -651,9 +674,9 @@ class ThiefGame:
 
             # Çiz (canvas'a) ve ekrana sun; aşamaları ayrı ölç.
             draw_started = time.perf_counter()
-            self._draw()
+            dirty_rects = self._draw()
             draw_ms = (time.perf_counter() - draw_started) * 1000.0
-            blit_ms, flip_ms = self._present()
+            blit_ms, flip_ms = self._present(dirty_rects)
             self._capture_requested_scene_preview()
             self._record_frame_performance(
                 (time.perf_counter() - frame_started) * 1000.0,
@@ -662,8 +685,17 @@ class ThiefGame:
                 flip_ms,
             )
 
-    def _present(self):
+    def _present(self, dirty_rects=None):
         """Canvas kopyalama/ölçekleme ve ekran flip sürelerini ayrı ölç."""
+        if dirty_rects == []:
+            self.render_mode = "static-frozen"
+            self.updated_pixel_ratio = 0.0
+            self.dirty_rect_count = 0
+            return 0.0, 0.0
+
+        self.render_mode = "full-render"
+        self.updated_pixel_ratio = 100.0
+        self.dirty_rect_count = 0
         blit_started = time.perf_counter()
         output = self.canvas
         if self.present_surface is not None:
@@ -678,10 +710,36 @@ class ThiefGame:
         blit_ms = (time.perf_counter() - blit_started) * 1000.0
 
         flip_started = time.perf_counter()
-        pygame.display.flip()
+        if dirty_rects and self.direct_render:
+            screen_bounds = self.screen.get_rect()
+            screen_rects = [
+                pygame.Rect(rect).move(self.view_x, self.view_y).clip(screen_bounds)
+                for rect in dirty_rects
+            ]
+            screen_rects = [
+                rect for rect in screen_rects if rect.width and rect.height
+            ]
+            if screen_rects:
+                self.render_mode = "dirty-rect"
+                self.dirty_rect_count = len(screen_rects)
+                updated_pixels = sum(rect.width * rect.height for rect in screen_rects)
+                total_pixels = max(1, self.output_view_w * self.output_view_h)
+                self.updated_pixel_ratio = min(
+                    100.0,
+                    updated_pixels * 100.0 / total_pixels,
+                )
+                try:
+                    pygame.display.update(screen_rects)
+                except pygame.error:
+                    # Bazı eski SDL/KMS sürücüleri kısmi güncellemeyi desteklemez.
+                    self.render_mode = "full-render"
+                    self.updated_pixel_ratio = 100.0
+                    self.dirty_rect_count = 0
+                    pygame.display.flip()
+        else:
+            pygame.display.flip()
         flip_ms = (time.perf_counter() - flip_started) * 1000.0
         return blit_ms, flip_ms
-
     def _capture_requested_scene_preview(self):
         """Server isterse güncel canvası bir kez küçültüp ağ threadine teslim et."""
         request_token = self.net_client.consume_scene_screenshot_request()
@@ -819,17 +877,184 @@ class ThiefGame:
                 Confetti(self.view_w // 2, origin_y, spread=1.15)
             )
 
+    @staticmethod
+    def _context_signature(context):
+        return tuple(
+            sorted((str(key), str(value)) for key, value in context.items())
+        )
+
+    def _base_render_key(self):
+        return (
+            self.view_w,
+            self.view_h,
+            id(self.background),
+            self.bg_color,
+            bool(self.config.band_enabled),
+            id(self.band_surface),
+        )
+
+    def _get_gameplay_base(self):
+        key = self._base_render_key()
+        if self._gameplay_base is not None and key == self._gameplay_base_key:
+            return self._gameplay_base
+        base = pygame.Surface((self.view_w, self.view_h)).convert()
+        if self.background:
+            base.blit(self.background, (0, 0))
+        else:
+            base.fill(self.bg_color)
+        if self.config.band_enabled and self.band_surface:
+            base.blit(self.band_surface, (self.band_x_min, 0))
+        self._gameplay_base = base
+        self._gameplay_base_key = key
+        return base
+
+    @staticmethod
+    def _merge_dirty_rects(rects):
+        merged = []
+        for candidate in rects:
+            rect = pygame.Rect(candidate)
+            if rect.width <= 0 or rect.height <= 0:
+                continue
+            for index, current in enumerate(merged):
+                if current.inflate(8, 8).colliderect(rect):
+                    merged[index] = current.union(rect)
+                    break
+            else:
+                merged.append(rect)
+        return merged
+
+    def _draw_gameplay_dynamic(self):
+        rects = []
+        thief_rect = self._draw_thief()
+        if thief_rect:
+            rects.append(thief_rect)
+        for text in self.floating_texts:
+            text_rect = text.draw(self.canvas)
+            if text_rect:
+                rects.append(text_rect)
+        return self._merge_dirty_rects(rects)
+
+    def _draw_gameplay_dirty(self, context):
+        base = self._get_gameplay_base()
+        canvas_bounds = self.canvas.get_rect()
+        previous = [
+            pygame.Rect(rect).clip(canvas_bounds)
+            for rect in self._dynamic_dirty_rects
+        ]
+        for rect in previous:
+            if rect.width and rect.height:
+                self.canvas.blit(base, rect, rect)
+
+        current = self._draw_gameplay_dynamic()
+        dirty = self._merge_dirty_rects(previous + current)
+        if dirty and self.scene_renderer.ready:
+            previous_clip = self.canvas.get_clip()
+            for rect in dirty:
+                self.canvas.set_clip(rect)
+                self.scene_renderer.draw(self.canvas, "gameplay", context)
+            self.canvas.set_clip(previous_clip)
+        self._dynamic_dirty_rects = current
+        return dirty
+
     # ---------------------------------------------------------------- draw
     def _draw(self):
-        """Oynanabilir alanı (canvas) çiz"""
-        # Sarsıntı ofseti
+        """Oynanabilir alanı (canvas) çiz."""
+        context = self._scene_context()
+        now = pygame.time.get_ticks()
+        countdown_visible = bool(
+            self.countdown_display_message
+            and now < self.countdown_display_until
+        )
+        hit_flash_visible = bool(self.hit_flash and now < self.hit_flash_end)
+        preview_scene = (
+            self.scene_renderer.preview_scene
+            if self.scene_renderer.ready and self.scene_renderer.preview_scene
+            else None
+        )
+        jail_scene_active = (
+            self.net_client.server_game_active
+            and self.net_client.server_screen_complete
+            and self.net_client.server_scene == "jail"
+        )
+        result_scene_active = (
+            not self.net_client.server_game_active
+            and self.net_client.server_scene in ("win", "lose")
+        )
+        waiting_scene_active = (
+            self.game.is_idle() and not self.net_client.server_game_active
+        )
+
+        static_scene = None
+        resolve_rules = True
+        if preview_scene:
+            static_scene = preview_scene
+            resolve_rules = False
+        elif jail_scene_active:
+            static_scene = "jail"
+        elif result_scene_active:
+            static_scene = self.net_client.server_scene
+        elif waiting_scene_active:
+            static_scene = "waiting"
+
+        static_key = None
+        if (
+            static_scene
+            and not self.config.debug
+            and not countdown_visible
+            and not hit_flash_visible
+            and self.shake_timer <= 0
+            and self.scene_renderer.is_scene_static(
+                static_scene,
+                context,
+                resolve_rules=resolve_rules,
+            )
+        ):
+            static_key = (
+                "static",
+                static_scene,
+                self.scene_renderer.version,
+                self.quality_level,
+                self._base_render_key(),
+                self._context_signature(context),
+            )
+            if static_key == self._last_render_key:
+                return []
+
+        gameplay_key = None
+        if (
+            self.quality_level == "minimal"
+            and self.direct_render
+            and not self.config.debug
+            and self.net_client.server_game_active
+            and not self.net_client.server_screen_complete
+            and not preview_scene
+            and not countdown_visible
+            and not hit_flash_visible
+            and self.shake_timer <= 0
+            and self.scene_renderer.ready
+            and self.scene_renderer.is_scene_static("gameplay", context)
+        ):
+            gameplay_key = (
+                "gameplay-dirty",
+                self.scene_renderer.version,
+                self._base_render_key(),
+                self._context_signature(context),
+            )
+            if gameplay_key == self._last_render_key:
+                return self._draw_gameplay_dirty(context)
+
         shake_x = 0
         shake_y = 0
         if self.shake_timer > 0:
-            shake_x = random.randint(int(-self.shake_magnitude), int(self.shake_magnitude))
-            shake_y = random.randint(int(-self.shake_magnitude), int(self.shake_magnitude))
+            shake_x = random.randint(
+                int(-self.shake_magnitude),
+                int(self.shake_magnitude),
+            )
+            shake_y = random.randint(
+                int(-self.shake_magnitude),
+                int(self.shake_magnitude),
+            )
 
-        # Arka plan
         if self.background:
             if shake_x or shake_y:
                 self.canvas.fill((0, 0, 0))
@@ -837,59 +1062,43 @@ class ThiefGame:
         else:
             self.canvas.fill(self.bg_color)
 
-        if self.scene_renderer.ready and self.scene_renderer.preview_scene:
+        dynamic_rects = []
+        if preview_scene:
             self.scene_renderer.draw(
                 self.canvas,
-                self.scene_renderer.preview_scene,
-                self._scene_context(),
+                preview_scene,
+                context,
                 restart_token=self.scene_renderer.version or "",
                 resolve_rules=False,
             )
             if self.config.debug:
                 self._draw_debug(shake_x, shake_y)
-            return
+            self._last_render_key = static_key
+            self._dynamic_dirty_rects = []
+            return None
 
-        jail_scene_active = (
-            self.net_client.server_game_active
-            and self.net_client.server_screen_complete
-            and self.net_client.server_scene == "jail"
-        )
         if jail_scene_active:
-            if not self.scene_renderer.draw(
-                self.canvas,
-                "jail",
-                self._scene_context(),
-            ):
+            if not self.scene_renderer.draw(self.canvas, "jail", context):
                 self._draw_idle(shake_x, shake_y)
             if self.config.debug:
                 self._draw_debug(shake_x, shake_y)
-            return
+            self._last_render_key = static_key
+            self._dynamic_dirty_rects = []
+            return None
 
-        result_scene_active = (
-            not self.net_client.server_game_active
-            and self.net_client.server_scene in ("win", "lose")
-        )
-
-        # Sonuç sahnesi lokal hırsız animasyonunu beklemeden hemen görünür.
         if result_scene_active:
             if not self.scene_renderer.draw(
                 self.canvas,
                 self.net_client.server_scene,
-                self._scene_context(),
+                context,
             ):
                 self._draw_idle(shake_x, shake_y)
-        # IDLE durumunda ve oyun aktif değilse bekleme mesajı göster
-        elif self.game.is_idle() and not self.net_client.server_game_active:
-            if not self.scene_renderer.draw(
-                self.canvas,
-                "waiting",
-                self._scene_context(),
-            ):
+        elif waiting_scene_active:
+            if not self.scene_renderer.draw(self.canvas, "waiting", context):
                 self._draw_idle(shake_x, shake_y)
         else:
             if self.config.band_enabled:
                 self._draw_band(shake_x, shake_y)
-
             if (
                 self.config.shadow_enabled
                 and self.quality_level != "minimal"
@@ -897,21 +1106,19 @@ class ThiefGame:
             ):
                 self._draw_shadow(shake_x, shake_y)
 
-            self._draw_thief(shake_x, shake_y)
-
+            thief_rect = self._draw_thief(shake_x, shake_y)
+            if thief_rect:
+                dynamic_rects.append(thief_rect)
             if self.quality_level != "minimal":
-                for p in self.particles:
-                    p.draw(self.canvas, shake_x, shake_y)
-
-            for t in self.floating_texts:
-                t.draw(self.canvas, shake_x, shake_y)
+                for particle in self.particles:
+                    particle.draw(self.canvas, shake_x, shake_y)
+            for text in self.floating_texts:
+                text_rect = text.draw(self.canvas, shake_x, shake_y)
+                if text_rect:
+                    dynamic_rects.append(text_rect)
 
         if self.net_client.server_game_active and self.scene_renderer.ready:
-            self.scene_renderer.draw(
-                self.canvas,
-                "gameplay",
-                self._scene_context(),
-            )
+            self.scene_renderer.draw(self.canvas, "gameplay", context)
         elif not self.scene_renderer.ready:
             self._draw_score(shake_x, shake_y)
         self._draw_hit_flash(shake_x, shake_y)
@@ -919,6 +1126,10 @@ class ThiefGame:
 
         if self.config.debug:
             self._draw_debug(shake_x, shake_y)
+
+        self._last_render_key = static_key or gameplay_key
+        self._dynamic_dirty_rects = self._merge_dirty_rects(dynamic_rects)
+        return None
 
     def _draw_idle(self, offset_x=0, offset_y=0):
         """IDLE durumunda temalı, canlı bekleme kartı."""
@@ -1005,24 +1216,22 @@ class ThiefGame:
             self.canvas.blit(draw_shadow, (x, y))
 
     def _draw_thief(self, offset_x=0, offset_y=0):
-        """Hırsızı çiz"""
+        """Hırsızı çiz ve değişen ekran dikdörtgenini döndür."""
         if self.thief_alpha <= 0:
-            return
+            return None
 
         frame = self.animator.get_current_frame()
+        if not frame:
+            return None
 
-        if frame:
-            x = self.game.thief.x - frame.get_width() // 2 + offset_x
-            y = self.game.thief.y - frame.get_height() + offset_y
-
-            if self.animator.current_state == "fall":
-                y += 15 * self.runtime_thief_scale
-
-            if self.thief_alpha < 255:
-                frame = frame.copy()
-                frame.set_alpha(self.thief_alpha)
-
-            self.canvas.blit(frame, (x, y))
+        x = self.game.thief.x - frame.get_width() // 2 + offset_x
+        y = self.game.thief.y - frame.get_height() + offset_y
+        if self.animator.current_state == "fall":
+            y += 15 * self.runtime_thief_scale
+        if self.thief_alpha < 255:
+            frame = frame.copy()
+            frame.set_alpha(self.thief_alpha)
+        return self.canvas.blit(frame, (x, y))
 
     def _draw_score(self, offset_x=0, offset_y=0):
         """Skoru temalı kart içinde çiz."""

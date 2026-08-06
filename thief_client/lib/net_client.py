@@ -98,6 +98,9 @@ class NetClient:
         # Piezo config kuyruğu (server'dan gelen ayar değişiklikleri)
         self.piezo_config_queue: queue.Queue = queue.Queue()
 
+        # Dashboard'dan gelen sınırlı operasyon komutları
+        self.command_queue: queue.Queue = queue.Queue(maxsize=2)
+
         # Server skor reset bildirimi
         self.score_reset_queue: queue.Queue = queue.Queue()
         self.last_score_version: Optional[int] = None
@@ -218,6 +221,18 @@ class NetClient:
         """
         try:
             return self.piezo_config_queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    def consume_command(self) -> Optional[Dict[str, Any]]:
+        """Dashboard'dan gelen son operasyon komutunu ana threade aktar."""
+        try:
+            latest = self.command_queue.get_nowait()
+            while True:
+                try:
+                    latest = self.command_queue.get_nowait()
+                except queue.Empty:
+                    return latest
         except queue.Empty:
             return None
 
@@ -405,6 +420,7 @@ class NetClient:
             data = response.json()
             self._apply_spawn_payload(data.get("spawn_state", {}))
             self._apply_piezo_payload(data.get("piezo_config", {}))
+            self._apply_command_payload(data.get("command"))
             if include_telemetry:
                 self._last_heartbeat = now
             return True
@@ -454,6 +470,21 @@ class NetClient:
                 self._apply_spawn_payload(response.json())
         except (requests.exceptions.RequestException, ValueError):
             pass
+
+    def _apply_command_payload(self, data):
+        if not isinstance(data, dict):
+            return
+        command_type = str(data.get("type", "")).lower()
+        if command_type not in {"restart"}:
+            return
+        if self.command_queue.full():
+            self._clear_queue(self.command_queue)
+        self.command_queue.put({
+            "type": command_type,
+            "token": str(data.get("token", ""))[:64],
+        })
+        if self.debug:
+            print(f"[NetClient] Operasyon komutu alındı: {command_type}")
 
     def _apply_piezo_payload(self, data: dict):
         if not data.get("changed"):

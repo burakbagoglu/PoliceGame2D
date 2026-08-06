@@ -44,7 +44,10 @@
     "warmup_frames": 5,
     "timeout_seconds": 12,
     "capture_delay_ms": 350,
-    "admin_session_seconds": 28800
+    "admin_session_seconds": 28800,
+    "retention_days": 30,
+    "auto_cleanup": true,
+    "protect_sold": true
   },
   "debug": false,
   "access_log": false

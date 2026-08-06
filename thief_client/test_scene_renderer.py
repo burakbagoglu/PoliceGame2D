@@ -235,3 +235,39 @@ def test_minimal_quality_skips_scale_effect_and_confetti(monkeypatch):
     monkeypatch.setattr(pygame.transform, "scale", unexpected_scale)
 
     assert renderer.draw(target, "waiting", {"score": 1}) is True
+
+
+def test_minimal_scene_static_detection_ignores_disabled_effects():
+    document = make_document()
+    document["scenes"]["waiting"]["elements"][1]["effect"] = "pulse"
+    renderer = SceneRenderer(960, 540)
+    renderer.apply("published-static", document)
+
+    assert renderer.is_scene_static("waiting") is False
+
+    renderer.set_quality("minimal")
+
+    assert renderer.is_scene_static("waiting") is True
+
+
+def test_scene_static_detection_rejects_keyframes_and_sprite_sheets():
+    document = make_document()
+    renderer = SceneRenderer(960, 540)
+    renderer.apply("published-static", document)
+    assert renderer.is_scene_static("waiting") is True
+
+    document["scenes"]["waiting"]["elements"][0]["keyframes"] = [
+        {"time": 1, "x": 300}
+    ]
+    renderer.apply("published-keyframes", document)
+    assert renderer.is_scene_static("waiting") is False
+
+    document["scenes"]["waiting"]["elements"][0].pop("keyframes")
+    document["scenes"]["waiting"]["elements"][0]["sprite_sheet"] = {
+        "columns": 2,
+        "rows": 1,
+        "start": 0,
+        "end": 1,
+    }
+    renderer.apply("published-sheet", document)
+    assert renderer.is_scene_static("waiting") is False

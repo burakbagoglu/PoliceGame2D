@@ -26,6 +26,8 @@ from scene_manager import (
 )
 from scene_audio_runtime import SceneAudioRuntime
 from client_telemetry import ClientTelemetryStore
+from client_commands import ClientCommandStore
+from runtime_state import RuntimeStateStore
 from photo_manager import PhotoSessionManager
 from photo_auth import PhotoAccessGuard
 from spawn_engine import (
@@ -195,6 +197,9 @@ class ClientTelemetryRequest(BaseModel):
     output_width: int = Field(default=0, ge=0, le=7680)
     output_height: int = Field(default=0, ge=0, le=4320)
     direct_render: bool = False
+    render_mode: str = Field(default="full-render", max_length=24)
+    updated_pixel_ratio: float = Field(default=100, ge=0, le=100)
+    dirty_rect_count: int = Field(default=0, ge=0, le=128)
     piezo: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -211,6 +216,10 @@ class PhotoSaleUpdateRequest(BaseModel):
     sold: bool = False
     sale_price: Optional[float] = Field(default=None, ge=0, le=1_000_000)
     customer_name: str = Field(default="", max_length=80)
+
+
+class PhotoCleanupRequest(BaseModel):
+    dry_run: bool = True
 
 
 class SceneScreenshotRequest(BaseModel):
@@ -291,6 +300,48 @@ class ScoreManager:
         with self._lock:
             return list(self.event_history)
 
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "screen_scores": dict(self.screen_scores),
+                "total_score": self.total_score,
+                "processed_events": list(self.processed_events),
+                "event_count": self.event_count,
+                "event_history": list(self.event_history),
+                "score_version": self.score_version,
+                "last_event_time": (
+                    self.last_event_time.isoformat()
+                    if self.last_event_time else None
+                ),
+            }
+
+    def restore(self, payload: dict):
+        with self._lock:
+            raw_scores = payload.get("screen_scores", {})
+            self.screen_scores = {
+                screen_id: max(
+                    0,
+                    int(raw_scores.get(str(screen_id), raw_scores.get(screen_id, 0))),
+                )
+                for screen_id in range(1, self.num_screens + 1)
+            }
+            self.total_score = sum(self.screen_scores.values())
+            self.processed_events = {
+                str(item) for item in payload.get("processed_events", [])
+                if item
+            }
+            self.event_count = max(
+                len(self.processed_events),
+                int(payload.get("event_count", 0) or 0),
+            )
+            self.event_history = list(payload.get("event_history", []))[-self.max_history:]
+            self.score_version = max(0, int(payload.get("score_version", 0) or 0))
+            raw_time = payload.get("last_event_time")
+            try:
+                self.last_event_time = datetime.fromisoformat(raw_time) if raw_time else None
+            except (TypeError, ValueError):
+                self.last_event_time = None
+
     def reset(self):
         with self._lock:
             self.screen_scores = {i: 0 for i in range(1, self.num_screens + 1)}
@@ -325,6 +376,13 @@ scene_manager = SceneManager(
 client_telemetry = ClientTelemetryStore(
     offline_after_seconds=CONFIG.get("client_offline_after_seconds", 15)
 )
+client_commands = ClientCommandStore()
+runtime_state_store = RuntimeStateStore(
+    os.environ.get(
+        "THIEF_RUNTIME_STATE_FILE",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime_state.json"),
+    )
+)
 photo_manager = PhotoSessionManager(
     base_dir=os.environ.get(
         "THIEF_PHOTO_DATA_DIR",
@@ -353,6 +411,7 @@ active_polling_lock = threading.RLock()
 async def lifespan(app: FastAPI):
     photo_manager.initialize()
     audio_ready = audio_manager.initialize()
+    _restore_runtime_checkpoint()
     print("=" * 50)
     print("Thief Server başlatıldı")
     print(f"Adres: http://{CONFIG['host']}:{CONFIG['port']}")
@@ -366,6 +425,7 @@ async def lifespan(app: FastAPI):
     yield
     global spawn_scheduler
     if spawn_scheduler:
+        _checkpoint_runtime()
         spawn_scheduler.stop()
     audio_manager.shutdown()
     photo_manager.shutdown()
@@ -395,12 +455,103 @@ async def protect_photo_responses(request: Request, call_next):
 
 # ============== Game API Endpoints ==============
 
+def _checkpoint_runtime():
+    scheduler = spawn_scheduler
+    if not scheduler or not scheduler.session.is_active:
+        runtime_state_store.clear()
+        return
+    session = scheduler.session
+    runtime_state_store.save({
+        "schema_version": 1,
+        "saved_at": _time.time(),
+        "session": {
+            "child_count": session.child_count,
+            "target_score": session.target_score,
+            "screen_count": session.screen_count,
+            "current_score": session.current_score,
+            "start_time": session.start_time,
+            "is_active": session.is_active,
+            "total_seconds": session.total_seconds,
+            "total_spawns": session.total_spawns,
+            "countdown_seconds": session.countdown_seconds,
+            "screen_targets": dict(session.screen_targets),
+            "screen_scores": dict(session.screen_scores),
+        },
+        "score_manager": score_manager.snapshot(),
+        "photo_session_id": photo_manager.current_session_id,
+    })
+
+
+def _clear_runtime_checkpoint():
+    runtime_state_store.clear()
+
+
+def _restore_runtime_checkpoint() -> bool:
+    global spawn_scheduler
+    payload = runtime_state_store.load()
+    if not payload or payload.get("schema_version") != 1:
+        return False
+    raw = payload.get("session")
+    if not isinstance(raw, dict) or not raw.get("is_active"):
+        runtime_state_store.clear()
+        return False
+    start_time = float(raw.get("start_time", 0) or 0)
+    total_seconds = max(1, int(raw.get("total_seconds", 1) or 1))
+    if start_time <= 0 or _time.time() >= start_time + total_seconds:
+        runtime_state_store.clear()
+        photo_manager.end_session("power_timeout", completed=False)
+        return False
+
+    session = GameSession(
+        child_count=max(1, int(raw.get("child_count", 1))),
+        target_score=max(1, int(raw.get("target_score", 1))),
+        screen_count=GAME_SCREEN_COUNT,
+        current_score=max(0, int(raw.get("current_score", 0))),
+        start_time=start_time,
+        is_active=True,
+        total_seconds=total_seconds,
+        total_spawns=max(0, int(raw.get("total_spawns", 0))),
+        countdown_seconds=max(0, int(raw.get("countdown_seconds", 0))),
+        screen_targets=raw.get("screen_targets", {}),
+        screen_scores=raw.get("screen_scores", {}),
+    )
+    screen_selector = ScreenSelector(GAME_SCREEN_COUNT)
+    adaptive = AdaptiveSpawnController(
+        base_spawn_interval=CONFIG.get("base_spawn_interval", 3.0),
+        min_spawn_interval=CONFIG.get("min_spawn_interval", 0.5),
+        max_spawn_interval=CONFIG.get("max_spawn_interval", 8.0),
+        max_concurrent_spawns=CONFIG.get("max_concurrent_spawns", 3),
+    )
+    phase_spawner = PhaseBasedSpawner(total_seconds=total_seconds)
+    spawn_scheduler = SpawnScheduler(
+        session=session,
+        screen_selector=screen_selector,
+        adaptive_controller=adaptive,
+        phase_spawner=phase_spawner,
+        debug=CONFIG.get("debug", False),
+        on_session_end=_on_session_end,
+        on_countdown_tick=_on_countdown_tick,
+        on_gameplay_start=_on_gameplay_start,
+    )
+    score_manager.restore(payload.get("score_manager", {}))
+    spawn_scheduler.resume()
+    if not session.countdown_active:
+        audio_manager.play_music()
+    print(
+        f"[Recovery] Aktif oyun kurtarıldı: "
+        f"{session.current_score}/{session.target_score}, "
+        f"kalan {max(0, total_seconds - session.elapsed_seconds)} sn"
+    )
+    return True
+
+
 def _on_session_end(reason: str):
     """Süre/hedef nedeniyle otomatik biten oyunun sesini ve fotoğraf oturumunu yönet."""
     completed = reason == "target"
     _show_result_scene("win" if completed else "lose")
     audio_manager.end_game(completed=completed)
     photo_manager.end_session(reason, completed=completed)
+    _clear_runtime_checkpoint()
 
 
 def _show_result_scene(scene_id: Optional[str]):
@@ -595,6 +746,7 @@ async def start_game(req: StartGameRequest, request: Request):
 
     countdown_seconds = CONFIG.get("countdown_seconds", 4)
     spawn_scheduler.start(countdown_seconds=countdown_seconds)
+    _checkpoint_runtime()
 
     if CONFIG.get("debug"):
         print(f"[Game] Oyun başlatıldı! Çocuk: {child_count}, Hedef: {target_score}")
@@ -650,6 +802,7 @@ async def end_game():
         _show_result_scene("win" if completed else "lose")
         audio_manager.end_game(completed=completed)
         photo_session = photo_manager.end_session("manual", completed=completed)
+        _clear_runtime_checkpoint()
 
         if CONFIG.get("debug"):
             print(f"[Game] Oyun bitti! Skor: {final_score}/{target}")
@@ -767,6 +920,7 @@ async def receive_event(event: ScoreEvent):
             photo_manager.capture_screen(event.screen_id)
     if is_new:
         audio_manager.play_hit()
+        _checkpoint_runtime()
 
     if CONFIG.get("debug"):
         status = "✅ YENİ" if is_new else "⏭️ DUPLICATE"
@@ -797,6 +951,7 @@ async def reset_scores():
     score_manager.reset()
     if spawn_scheduler:
         spawn_scheduler.reset_score()
+        _checkpoint_runtime()
     if CONFIG.get("debug"):
         print("🔄 Skorlar sıfırlandı!")
     return {
@@ -890,6 +1045,7 @@ async def combined_client_poll(req: ClientPollRequest):
         "spawn_state": spawn_state,
         "piezo_config": {"changed": bool(piezo_state), **(piezo_state or {})},
         "heartbeat": heartbeat,
+        "command": client_commands.poll(req.screen_id),
     }
 
 
@@ -897,6 +1053,71 @@ async def combined_client_poll(req: ClientPollRequest):
 async def get_client_status():
     """Dashboard için çevrimiçi istemci, FPS, sıcaklık ve piezo özetini getir."""
     return client_telemetry.list(GAME_SCREEN_COUNT)
+
+
+@app.post("/api/clients/{screen_id}/restart")
+async def restart_client(screen_id: int):
+    """İstemciyi normal poll kanalı üzerinden kapat; systemd yeniden açar."""
+    if not 1 <= int(screen_id) <= GAME_SCREEN_COUNT:
+        raise HTTPException(status_code=422, detail="Ekran numarası geçersiz")
+    status = client_telemetry.list(GAME_SCREEN_COUNT)["clients"][screen_id - 1]
+    if not status.get("online"):
+        raise HTTPException(status_code=409, detail="İstemci çevrimdışı")
+    command = client_commands.queue(screen_id, "restart")
+    return {"success": True, "command": command}
+
+
+@app.get("/api/field-check")
+async def field_check():
+    """Sekiz client, kamera ve sesi tek saha hazırlık raporunda birleştir."""
+    telemetry = client_telemetry.list(GAME_SCREEN_COUNT)
+    clients = []
+    for client in telemetry["clients"]:
+        issues = []
+        if not client.get("online"):
+            issues.append("çevrimdışı")
+        else:
+            if not client.get("serial_connected"):
+                issues.append("Arduino/seri bağlantı yok")
+            temperature = client.get("cpu_temp_c")
+            if temperature is not None and float(temperature) >= 78:
+                issues.append("yüksek sıcaklık")
+            if client.get("app_version") != "scene-engine-v8-dirty-rect":
+                issues.append("client sürümü eski")
+            if float(client.get("fps", 0) or 0) < 15:
+                issues.append("FPS düşük")
+        clients.append({
+            "screen_id": client["screen_id"],
+            "ready": not issues,
+            "issues": issues,
+            "online": bool(client.get("online")),
+            "app_version": client.get("app_version", ""),
+        })
+
+    audio = audio_manager.get_status()
+    camera = photo_manager.camera_status()
+    audio_ready = not audio.get("enabled") or bool(audio.get("available"))
+    camera_ready = not camera.get("enabled") or bool(camera.get("available"))
+    return {
+        "ready": all(item["ready"] for item in clients) and audio_ready and camera_ready,
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
+        "clients": clients,
+        "online_count": telemetry["online_count"],
+        "audio": {
+            "ready": audio_ready,
+            "enabled": bool(audio.get("enabled")),
+            "available": bool(audio.get("available")),
+            "device": audio.get("device_active") or audio.get("device_requested"),
+            "error": audio.get("last_error"),
+        },
+        "camera": {
+            "ready": camera_ready,
+            "enabled": bool(camera.get("enabled")),
+            "available": bool(camera.get("available")),
+            "device": camera.get("device"),
+            "error": camera.get("last_error"),
+        },
+    }
 
 
 # ============== Korumalı USB Kamera ve Oturum Fotoğrafları ==============
@@ -959,6 +1180,24 @@ async def camera_test_image(request: Request):
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/photo-storage")
+async def photo_storage(request: Request):
+    photo_guard.authorize(request)
+    return {
+        **photo_manager.storage_status(),
+        "cleanup_preview": photo_manager.cleanup_expired(dry_run=True),
+    }
+
+
+@app.post("/api/photo-storage/cleanup")
+async def cleanup_photo_storage(
+    req: PhotoCleanupRequest,
+    request: Request,
+):
+    photo_guard.authorize(request, write=True)
+    return photo_manager.cleanup_expired(dry_run=req.dry_run)
 
 
 @app.get("/api/photo-sessions")
@@ -1965,8 +2204,10 @@ DASHBOARD_HTML = """
                     <label>Ekran:</label>
                     <select id="telemetry-screen" onchange="renderSelectedTelemetry()"></select>
                     <button class="btn btn-blue" onclick="suggestPiezoThreshold()">Gürültüye göre eşik öner</button>
+                    <button class="btn btn-green" onclick="runFieldCheck()">Saha kontrolü</button>
                     <span id="telemetry-summary">İstemciler bekleniyor…</span>
                 </div>
+                <div id="field-check-result" style="margin:0 0 12px;padding:10px;border-radius:8px;display:none"></div>
                 <canvas id="piezo-chart" width="1000" height="150" style="width:100%;height:150px;background:#111827;border-radius:10px"></canvas>
                 <div class="screens" id="client-health" style="margin-top:12px"></div>
                 <p style="opacity:.72;margin-top:10px">Canlı grafik için Arduino seri hattından <code>PIEZO:123</code> veya <code>RAW:123</code> satırları gönderilmelidir. Öneri yalnızca sliderı değiştirir; Uygula düğmesine basılmadan cihazlara gönderilmez.</p>
@@ -2173,6 +2414,43 @@ DASHBOARD_HTML = """
             renderSelectedTelemetry();
         }
 
+        async function restartClient(screenId) {
+            if (!confirm(`Ekran ${screenId} yeniden başlatılsın mı?`)) return;
+            try {
+                const response = await fetch(`/api/clients/${screenId}/restart`, {method:'POST'});
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.detail || 'Komut gönderilemedi');
+                alert(`Ekran ${screenId} yeniden başlatma komutunu aldı.`);
+            } catch (error) {
+                alert(error.message || 'Client yeniden başlatılamadı');
+            }
+        }
+
+        async function runFieldCheck() {
+            const box = document.getElementById('field-check-result');
+            box.style.display = 'block';
+            box.style.background = '#1f2937';
+            box.textContent = 'Saha kontrolü çalışıyor…';
+            try {
+                const response = await fetch('/api/field-check');
+                const report = await response.json();
+                const clientLines = report.clients
+                    .filter(client => !client.ready)
+                    .map(client => `Ekran ${client.screen_id}: ${client.issues.join(', ')}`);
+                const systemLines = [
+                    report.audio.ready ? '' : `Ses: ${report.audio.error || 'cihaz kullanılamıyor'}`,
+                    report.camera.ready ? '' : `Kamera: ${report.camera.error || 'cihaz kullanılamıyor'}`,
+                ].filter(Boolean);
+                const issues = [...clientLines, ...systemLines];
+                box.style.background = report.ready ? '#14532d' : '#7f1d1d';
+                box.innerHTML = `<strong>${report.ready ? 'Saha hazır' : 'Kontrol gerekli'}</strong> · ${report.online_count}/8 client bağlı` +
+                    (issues.length ? `<br>${issues.join('<br>')}` : '');
+            } catch (error) {
+                box.style.background = '#7f1d1d';
+                box.textContent = 'Saha kontrolü alınamadı';
+            }
+        }
+
         async function loadClientTelemetry() {
             try {
                 const response = await fetch('/api/clients/status');
@@ -2193,7 +2471,9 @@ DASHBOARD_HTML = """
                         <div>RAM: ${client.memory_mb ? client.memory_mb + ' MB' : '—'} · Sıcaklık: ${client.cpu_temp_c != null ? client.cpu_temp_c + ' °C' : '—'}</div>
                         <div>Profil: ${client.performance_profile || '—'} · Kalite: ${client.quality_level || '—'}</div>
                         <div>Render: ${client.render_width && client.render_height ? client.render_width + '×' + client.render_height : '—'} → Çıkış: ${client.output_width && client.output_height ? client.output_width + '×' + client.output_height : '—'} · Direct: ${client.direct_render ? 'Aktif' : 'Kapalı'}</div>
+                        <div>Render yolu: ${client.render_mode || '—'} · Güncellenen: ${client.updated_pixel_ratio != null ? client.updated_pixel_ratio + '%' : '—'} · Bölge: ${client.dirty_rect_count ?? 0}</div>
                         <div>Seri: ${client.serial_connected ? 'OK' : 'Yok'} · Sahne: ${client.active_scene || '—'} · Kuyruk: ${client.queue_depth ?? 0}</div>
+                        <button class="btn btn-orange" style="margin-top:8px" onclick="restartClient(${client.screen_id})" ${client.online ? '' : 'disabled'}>Client'ı yeniden başlat</button>
                     </div>`).join('');
                 renderSelectedTelemetry();
             } catch (error) {

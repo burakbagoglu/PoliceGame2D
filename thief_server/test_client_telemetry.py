@@ -18,6 +18,9 @@ def test_heartbeat_is_sanitized_and_listed_online():
         "output_width": 1280,
         "output_height": 720,
         "direct_render": True,
+        "render_mode": "dirty-rect",
+        "updated_pixel_ratio": 7.456,
+        "dirty_rect_count": 2,
         "serial_connected": True,
         "piezo": {"latest": 90, "peak": 410, "samples": [1, 2, 5000]},
     })
@@ -35,6 +38,9 @@ def test_heartbeat_is_sanitized_and_listed_online():
     assert result["output_width"] == 1280
     assert result["output_height"] == 720
     assert result["direct_render"] is True
+    assert result["render_mode"] == "dirty-rect"
+    assert result["updated_pixel_ratio"] == 7.46
+    assert result["dirty_rect_count"] == 2
     assert result["piezo"]["samples"] == [1, 2, 4095]
     listing = store.list(num_screens=3)
     assert listing["online_count"] == 1

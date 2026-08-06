@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Police Game backup
+
+[Timer]
+OnBootSec=10min
+OnCalendar=*-*-* 04:15:00
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

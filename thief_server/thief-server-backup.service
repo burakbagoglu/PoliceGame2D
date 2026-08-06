@@ -1,0 +1,10 @@
+[Unit]
+Description=Police Game server and photo backup
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/home/pi/thief_server
+ExecStart=/home/pi/thief_server/backup_server.sh
+Nice=10
+IOSchedulingClass=idle

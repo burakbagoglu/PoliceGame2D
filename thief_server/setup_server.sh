@@ -34,10 +34,12 @@ if ! sudo test -f "$PHOTO_ENV_FILE"; then
 fi
 
 # Service dosyasını kopyala
-echo "[3/4] Systemd service kuruluyor..."
-sudo cp thief-server.service /etc/systemd/system/
+echo "[3/4] Systemd servisleri ve gunluk yedekleme kuruluyor..."
+chmod +x backup_server.sh
+sudo cp thief-server.service thief-server-backup.service thief-server-backup.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable thief-server.service
+sudo systemctl enable --now thief-server-backup.timer
 
 # IP adresini göster
 echo "[4/4] Ağ bilgileri..."

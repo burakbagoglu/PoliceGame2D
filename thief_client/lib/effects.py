@@ -33,7 +33,7 @@ class FloatingText:
         
     def draw(self, screen: pygame.Surface, offset_x: int = 0, offset_y: int = 0):
         if self.alpha <= 0:
-            return
+            return None
             
         # Alpha uygulamak için geçici bir yüzey oluştur
         # Pygame'de metinlere doğrudan alpha uygulanmaz, copy'sine uygulanır
@@ -44,7 +44,7 @@ class FloatingText:
         draw_x = int(self.x) - txt_surf.get_width() // 2 + offset_x
         draw_y = int(self.y) + offset_y
         
-        screen.blit(txt_surf, (draw_x, draw_y))
+        return screen.blit(txt_surf, (draw_x, draw_y))
 
 
 class Particle:

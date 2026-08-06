@@ -24,24 +24,31 @@ Bu notlar Pi 4 server ve Pi Zero client kurulumunu sahada daha sorunsuz calistir
 
 ## Client
 
-Her Pi Zero icin:
+Her Pi Zero icin repoyu kopyaladiktan sonra yalnizca ekran numarasini degistirerek tek komut calistir:
 
-1. `thief_client/config.json` icinde benzersiz `screen_id` ver.
-2. `server_base_url` ve `server_url` degerlerini Pi 4 IP adresine gore ayarla:
-   ```json
-   "server_base_url": "http://192.168.1.10:8078",
-   "server_url": "http://192.168.1.10:8078/event"
-   ```
-3. Prod icin `debug` degeri `false` olmali.
-4. Arduino portunu dogrula: `serial_port` genelde `/dev/ttyUSB0` veya `/dev/ttyACM0`.
-5. Kurulum:
-   ```bash
-   cd /home/pi/thief_client
-   ./setup_pi.sh
-   sudo systemctl start thief-game
-   sudo systemctl status thief-game
-   ```
+```bash
+cd /home/pi/polisoyunu
+sudo ./thief_client/setup_pi.sh --screen-id 1 --server 192.168.1.10
+```
 
+Arduino `/dev/ttyACM0` ise:
+
+```bash
+sudo ./thief_client/setup_pi.sh --screen-id 1 --server 192.168.1.10 --serial-port /dev/ttyACM0
+```
+
+Script paketleri kurar, tum projeyi `/opt/polisoyunu` altina kopyalar, 720p Pi Zero profilini yazar,
+kullaniciyi donanim gruplarina ekler ve `thief-game.service` servisini etkinlestirir. Servis bootta acilir;
+oyun temiz kapansa, crash olsa veya elektrik kesilip geri gelse bile `Restart=always` ile tekrar baslar.
+Script tekrar calistirilabilir ve mevcut client config dosyasinin yedegini alir.
+
+Kontrol:
+
+```bash
+sudo systemctl status thief-game
+sudo journalctl -u thief-game -f
+curl http://192.168.1.10:8078/health
+```
 ## Seyir Ekrani (Spectator)
 
 Sunucudaki tarayici tabanli seyir ekrani iki sekilde gosterilebilir:
@@ -187,3 +194,42 @@ icin WAV, muzik icin OGG onerilir.
 - `thief_server/photo_sessions/` klasörü düzenli yedeklenmeli ve yetkisiz ağ paylaşımlarına açılmamalı.
 - Etkinlik sonunda gereksiz fotoğraflar operatör galerisinden silinmeli; aktif oturum silinemez.
 - Fotoğraflı oyun başlamadan önce dashboarddaki onay kutusu yalnız gerçekten gerekli izin alındıysa işaretlenmeli.
+
+## Oturum Kurtarma ve Yedekleme
+
+Server aktif oyunu her kabul edilen vurus sonrasinda atomik olarak `thief_server/runtime_state.json`
+dosyasina kaydeder. Pi 4 yeniden acildiginda sure dolmamissa ekran kotalari, skorlar ve islenmis
+event kimlikleri geri yuklenir; ayni vurus ikinci kez sayilmaz. Oturum zaten bitmis ise eski checkpoint temizlenir.
+
+`setup_server.sh`, `thief-server-backup.timer` zamanlayicisini da kurar. Her gun 04:15 civarinda
+config, sahneler, aktif oturum checkpointi, galeri PIN ortami ve tum fotograflar
+`/var/backups/polisoyunu/` altinda root-only `.tar.gz` arsivine alinir. Varsayilan saklama 30 gundur.
+
+```bash
+sudo systemctl status thief-server-backup.timer
+sudo systemctl start thief-server-backup.service
+sudo ls -lh /var/backups/polisoyunu
+```
+
+Farkli disk ve saklama suresi icin service override'ina `THIEF_BACKUP_DIR` ve
+`THIEF_BACKUP_RETENTION_DAYS` eklenebilir. Arsiv fotograf ve PIN icerdigi icin hedef klasor aga acilmamalidir.
+
+## 8 Ekran Saha Kabul Testi
+
+Dashboarddaki `Saha kontrolu` butonu sekiz ekranin baglantisini, seri/piezo durumunu, FPS,
+sicaklik, uygulama surumu, render yolu, kamera ve sesi tek raporda kontrol eder. Teste baslamadan once
+tum satirlar yesil olmalidir.
+
+30-40 dakikalik normal turda su arizalar sirayla uygulanir:
+
+1. Oyunu yalnizca bir client bagliyken baslat; sekiz ekran kotasi olusmali ve bagli client oynamalidir.
+2. Bir client'i sonradan ac; aktif oturuma katilip kendi kalan kotasini almali.
+3. Bir Pi'nin Wi-Fi baglantisini kesip geri getir; oyun tekrar baslatilmadan telemetri ve spawn akisi donmeli.
+4. Bir Pi'yi yeniden baslat; systemd oyunu otomatik acmali ve mevcut oturum devam etmelidir.
+5. Bir ekran kotasini erken bitir; spawn kesilmeli, jail sahnesi gelmeli ve kamera tek cekim yapmalidir.
+6. Kamera test goruntusunu kontrol et, bulanik cekimi galeriden tekrar cek ve ZIP/yazdirma gorunumunu dene.
+7. Tur boyunca dashboarddan FPS, draw P95, flip P95, sicaklik, render yolu ve guncellenen piksel yuzdesini kaydet.
+
+Pi Zero 2 W icin baslangic kabul esigi: 720p'de oyun esnasinda en az 15 FPS, sicaklik 78 C altinda,
+`static-frozen` bekleme yolunda guncellenen piksel orani yaklasik %0 ve hareketli oyunda mumkun oldugunca
+`dirty-rect`. `full-render` surekli gorunuyorsa optimizasyon yolu devreye girmemistir.
