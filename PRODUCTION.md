@@ -233,3 +233,13 @@ tum satirlar yesil olmalidir.
 Pi Zero 2 W icin baslangic kabul esigi: 720p'de oyun esnasinda en az 15 FPS, sicaklik 78 C altinda,
 `static-frozen` bekleme yolunda guncellenen piksel orani yaklasik %0 ve hareketli oyunda mumkun oldugunca
 `dirty-rect`. `full-render` surekli gorunuyorsa optimizasyon yolu devreye girmemistir.
+## Windows ile SD Kart Hazirlama
+
+Sekiz Pi Zero kartini tek tek elle kurmak yerine Windows aracini kullan:
+
+```text
+sd_card_tool/start_windows.bat
+```
+
+Arac OS yazma, Wi-Fi, ekran ID, server, Arduino portu, 720p/FPS ayarlari ve ilk acilis client
+kurulumunu tek akista yapar. Ayrintilar `sd_card_tool/README.md` dosyasindadir.
