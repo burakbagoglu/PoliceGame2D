@@ -11,6 +11,9 @@ SCREEN_ID=""
 SERVER_ADDRESS=""
 SERIAL_PORT="/dev/ttyUSB0"
 TARGET_USER="${SUDO_USER:-${USER:-pi}}"
+WIFI_SSID=""
+WIFI_PASSWORD=""
+WIFI_COUNTRY="TR"
 SKIP_APT_UPDATE=0
 START_NOW=1
 
@@ -25,6 +28,9 @@ Zorunlu:
 
 Secenekler:
   --serial-port PATH     Arduino seri portu (varsayilan /dev/ttyUSB0)
+  --wifi-ssid SSID       Otomatik baglanilacak Wi-Fi adi
+  --wifi-password PASS   Wi-Fi parolasi (8-63 karakter)
+  --wifi-country CC      Iki harfli ulke kodu (varsayilan TR)
   --user USER            Servisi calistiracak kullanici
   --install-root PATH    Kurulum dizini (varsayilan /opt/polisoyunu)
   --skip-apt-update      apt update adimini atla
@@ -43,6 +49,9 @@ while (($#)); do
         --screen-id) SCREEN_ID="${2:-}"; shift 2 ;;
         --server) SERVER_ADDRESS="${2:-}"; shift 2 ;;
         --serial-port) SERIAL_PORT="${2:-}"; shift 2 ;;
+        --wifi-ssid) WIFI_SSID="${2:-}"; shift 2 ;;
+        --wifi-password) WIFI_PASSWORD="${2:-}"; shift 2 ;;
+        --wifi-country) WIFI_COUNTRY="${2:-}"; shift 2 ;;
         --user) TARGET_USER="${2:-}"; shift 2 ;;
         --install-root) INSTALL_ROOT="${2:-}"; shift 2 ;;
         --skip-apt-update) SKIP_APT_UPDATE=1; shift ;;
@@ -57,6 +66,15 @@ done
 [[ -n "${SERVER_ADDRESS}" ]] || fail "--server zorunlu."
 id "${TARGET_USER}" >/dev/null 2>&1 || fail "Kullanici bulunamadi: ${TARGET_USER}"
 [[ "${INSTALL_ROOT}" == /* ]] || fail "--install-root mutlak bir yol olmali."
+if [[ -n "${WIFI_SSID}" ]]; then
+    [[ "${WIFI_SSID}" != *$'\n'* && "${WIFI_SSID}" != *$'\r'* ]] || fail "Wi-Fi adi satir sonu iceremez."
+    (( ${#WIFI_SSID} <= 32 )) || fail "Wi-Fi adi en fazla 32 karakter olmali."
+    (( ${#WIFI_PASSWORD} >= 8 && ${#WIFI_PASSWORD} <= 63 )) || fail "Wi-Fi parolasi 8-63 karakter olmali."
+    [[ "${WIFI_COUNTRY}" =~ ^[A-Za-z]{2}$ ]] || fail "Wi-Fi ulke kodu iki harf olmali."
+    WIFI_COUNTRY="${WIFI_COUNTRY^^}"
+elif [[ -n "${WIFI_PASSWORD}" ]]; then
+    fail "--wifi-password kullanildiysa --wifi-ssid de zorunlu."
+fi
 case "${INSTALL_ROOT%/}" in
     ""|/|/opt|/usr|/var|/home|/root) fail "Guvenli olmayan install-root: ${INSTALL_ROOT}" ;;
 esac
@@ -82,6 +100,26 @@ log "Pygame, serial, ag ve kurulum araclari yukleniyor"
 apt-get install -y --no-install-recommends \
     python3 python3-pygame python3-serial python3-requests \
     rsync curl ca-certificates
+
+WIFI_RESULT="mevcut sistem ayari"
+if [[ -n "${WIFI_SSID}" ]]; then
+    log "Wi-Fi otomatik baglantisi ayarlaniyor: ${WIFI_SSID}"
+    command -v nmcli >/dev/null 2>&1 || fail "NetworkManager/nmcli bulunamadi; Raspberry Pi OS Bookworm veya daha yenisini kullanin."
+    command -v raspi-config >/dev/null 2>&1 && raspi-config nonint do_wifi_country "${WIFI_COUNTRY}" || true
+    command -v rfkill >/dev/null 2>&1 && rfkill unblock wifi || true
+    nmcli radio wifi on || true
+    WIFI_CONNECTION="polisoyunu-wifi"
+    if nmcli -t -f NAME connection show | grep -Fxq "${WIFI_CONNECTION}"; then
+        nmcli connection modify "${WIFI_CONNECTION}" 802-11-wireless.ssid "${WIFI_SSID}"
+    else
+        nmcli connection add type wifi ifname wlan0 con-name "${WIFI_CONNECTION}" ssid "${WIFI_SSID}"
+    fi
+    nmcli connection modify "${WIFI_CONNECTION}" \
+        connection.autoconnect yes connection.autoconnect-priority 100 \
+        ipv4.method auto ipv6.method auto \
+        wifi-sec.key-mgmt wpa-psk wifi-sec.psk "${WIFI_PASSWORD}"
+    WIFI_RESULT="${WIFI_SSID} (otomatik baglanti)"
+fi
 
 log "Kullanici donanim gruplarina ekleniyor"
 for group in dialout video render input tty; do
@@ -209,6 +247,7 @@ cat <<EOF
  Ekran             : ${SCREEN_ID}
  Server            : ${SERVER_BASE} (${SERVER_RESULT})
  Arduino           : ${SERIAL_PORT}
+ Wi-Fi             : ${WIFI_RESULT}
  Kurulum dizini    : ${INSTALL_ROOT}
  Servis            : ${SERVICE_NAME}.service
 ============================================================

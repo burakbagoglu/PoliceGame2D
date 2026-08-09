@@ -28,8 +28,12 @@ Her Pi Zero icin repoyu kopyaladiktan sonra yalnizca ekran numarasini degistirer
 
 ```bash
 cd /home/pi/polisoyunu
-sudo ./thief_client/setup_pi.sh --screen-id 1 --server 192.168.1.10
+sudo ./thief_client/setup_pi.sh --screen-id 1 --server 192.168.1.10 \
+  --wifi-ssid "AG_ADI" --wifi-password "AG_PAROLASI" --wifi-country TR
 ```
+
+Wi-Fi bilgileri NetworkManager'a `polisoyunu-wifi` profili olarak kaydedilir. Profil otomatik baglanir;
+parolayi public repoya veya dokumana yazmayin.
 
 Arduino `/dev/ttyACM0` ise:
 
