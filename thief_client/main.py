@@ -47,7 +47,6 @@ class ThiefGame:
 
         # Pygame başlat
         pygame.init()
-        pygame.mouse.set_visible(False)
 
         # Ekran oluştur (fiziksel ekran boyutu)
         fullscreen = self.raw.get("fullscreen", True)
@@ -65,6 +64,8 @@ class ThiefGame:
                 (self.screen_width, self.screen_height)
             )
 
+        # Mouse video yuzeyi kurulduktan sonra kullanilabilir.
+        pygame.mouse.set_visible(False)
         pygame.display.set_caption(
             f"Hırsız Oyunu - Ekran {self.raw.get('screen_id', 1)}"
         )

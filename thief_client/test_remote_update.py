@@ -61,6 +61,8 @@ def test_update_scripts_are_argument_free_and_allowlisted():
     assert 'readonly BRANCH="main"' in updater
     assert 'readonly REPO_URL="https://github.com/burakbagoglu/PoliceGame2D.git"' in updater
     assert '[[ "$#" -eq 0 ]]' in updater
+    assert "--filter=blob:none --no-checkout --no-tags" in updater
+    assert "sparse-checkout set '/thief_client/'" in updater
     assert "eval " not in updater
     assert '[ "$#" -eq 0 ]' in helper
     assert "systemctl start --no-block thief-game-update.service" in helper

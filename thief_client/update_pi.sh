@@ -111,12 +111,17 @@ if ! flock -n 9; then
     exit 0
 fi
 
-write_status "running" "" "GitHub main branch indiriliyor"
+write_status "running" "" "GitHub client paketi indiriliyor"
 TMP_ROOT="$(mktemp -d /var/tmp/polisoyunu-update.XXXXXX)"
 STAGE_ROOT="$(mktemp -d /opt/.polisoyunu-stage.XXXXXX)"
 
 log "Kaynak indiriliyor"
-git clone --depth 1 --single-branch --branch "${BRANCH}" -- "${REPO_URL}" "${TMP_ROOT}/source"
+git clone --depth 1 --single-branch --branch "${BRANCH}" \
+    --filter=blob:none --no-checkout --no-tags -- \
+    "${REPO_URL}" "${TMP_ROOT}/source"
+git -C "${TMP_ROOT}/source" sparse-checkout init --no-cone
+git -C "${TMP_ROOT}/source" sparse-checkout set '/thief_client/'
+git -C "${TMP_ROOT}/source" checkout --force "${BRANCH}"
 NEW_VERSION="$(git -C "${TMP_ROOT}/source" rev-parse --short=12 HEAD)"
 
 log "Yeni surum dogrulaniyor: ${NEW_VERSION}"

@@ -16,6 +16,45 @@ _SPEC.loader.exec_module(_CLIENT_MAIN)
 ThiefGame = _CLIENT_MAIN.ThiefGame
 
 
+def test_mouse_is_hidden_after_display_mode_is_created(monkeypatch):
+    events = []
+
+    class StopAfterDisplay(RuntimeError):
+        pass
+
+    monkeypatch.setattr(
+        _CLIENT_MAIN.GameConfig,
+        "read_raw",
+        staticmethod(lambda _path: {
+            "fullscreen": False,
+            "screen_width": 1280,
+            "screen_height": 720,
+            "screen_id": 1,
+        }),
+    )
+    monkeypatch.setattr(pygame, "init", lambda: events.append("pygame-init"))
+    monkeypatch.setattr(
+        pygame.display,
+        "set_mode",
+        lambda *_args, **_kwargs: events.append("display-mode") or object(),
+    )
+    monkeypatch.setattr(pygame.display, "set_caption", lambda *_args: None)
+    monkeypatch.setattr(
+        pygame.mouse,
+        "set_visible",
+        lambda _visible: events.append("mouse-visible"),
+    )
+    monkeypatch.setattr(
+        ThiefGame,
+        "_resolve_sprite_paths",
+        lambda _self: (_ for _ in ()).throw(StopAfterDisplay()),
+    )
+
+    with __import__("pytest").raises(StopAfterDisplay):
+        ThiefGame("config.json")
+
+    assert events == ["pygame-init", "display-mode", "mouse-visible"]
+
 def test_direct_render_present_skips_full_canvas_blit(monkeypatch):
     game = ThiefGame.__new__(ThiefGame)
     game.canvas = object()
