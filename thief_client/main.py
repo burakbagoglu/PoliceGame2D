@@ -12,6 +12,7 @@ import os
 import json
 import math
 import io
+import subprocess
 import pygame
 import time
 from collections import deque
@@ -170,7 +171,7 @@ class ThiefGame:
             return None
 
     def _build_telemetry(self) -> dict:
-        return {
+        telemetry = {
             "fps": float(self.clock.get_fps()),
             "memory_mb": self._read_process_memory_mb(),
             "cpu_temp_c": self._read_cpu_temperature(),
@@ -195,6 +196,50 @@ class ThiefGame:
             "dirty_rect_count": int(getattr(self, "dirty_rect_count", 0)),
             "app_version": "scene-engine-v8-dirty-rect",
         }
+        telemetry.update(self._read_update_status())
+        return telemetry
+
+    @staticmethod
+    def _read_update_status() -> dict:
+        path = os.environ.get(
+            "POLIS_UPDATE_STATUS_FILE",
+            "/var/lib/polisoyunu/update-status.json",
+        )
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            return {
+                "update_state": str(data.get("state", "idle"))[:24],
+                "update_version": str(data.get("version", ""))[:40],
+                "update_error": (
+                    str(data.get("message", ""))[:240]
+                    if data.get("state") == "failed"
+                    else ""
+                ),
+            }
+        except (OSError, ValueError, TypeError):
+            return {"update_state": "idle", "update_version": "", "update_error": ""}
+
+    @staticmethod
+    def _request_remote_update() -> bool:
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "/usr/local/sbin/polisoyunu-request-update"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"[Client] Update servisi baslatilamadi: {exc}")
+            return False
+        if result.returncode != 0:
+            print(f"[Client] Update servisi reddedildi: {result.stdout.strip()}")
+            return False
+        return True
+
     def _set_quality_level(self, quality_level: str):
         if quality_level == self.quality_level:
             return
@@ -626,10 +671,15 @@ class ThiefGame:
                 break
 
             command = self.net_client.consume_command()
-            if command and command.get("type") == "restart":
-                print("[Client] Uzaktan yeniden başlatma komutu alındı.")
-                self.running = False
-                break
+            if command:
+                command_type = command.get("type")
+                if command_type == "restart":
+                    print("[Client] Uzaktan yeniden baslatma komutu alindi.")
+                    self.running = False
+                    break
+                if command_type == "update":
+                    print("[Client] Guvenli uzaktan guncelleme komutu alindi.")
+                    self._request_remote_update()
 
             # Hit kontrolü
             if self.hit_input.get_hit() and not self.net_client.server_screen_complete:

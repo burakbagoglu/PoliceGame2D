@@ -9,7 +9,8 @@ sudo apt update && sudo apt upgrade -y
 
 # Gerekli paketler
 echo "[2/4] Ses ve Python paketleri yükleniyor..."
-sudo apt install -y python3-pip python3-pygame alsa-utils fswebcam v4l-utils
+sudo apt install -y python3-pip python3-pygame alsa-utils fswebcam v4l-utils avahi-daemon libnss-mdns
+sudo systemctl enable --now avahi-daemon
 pip3 install --user -r requirements.txt
 
 # Pi 4 dahili 3.5 mm jakını ses çıkışı olarak seç. Bazı minimal
@@ -44,15 +45,18 @@ sudo systemctl enable --now thief-server-backup.timer
 # IP adresini göster
 echo "[4/4] Ağ bilgileri..."
 IP_ADDR=$(hostname -I | awk '{print $1}')
+MDNS_HOST="$(hostname).local"
 
 echo ""
 echo "=== Kurulum Tamamlandı ==="
 echo ""
 echo "Server IP Adresi: $IP_ADDR"
+echo "Server mDNS Adresi: http://$MDNS_HOST:8078"
 echo ""
 echo "Client'larda config.json içinde şunu ayarlayın:"
 echo "  \"server_url\": \"http://$IP_ADDR:8078/event\""
 echo "  \"server_base_url\": \"http://$IP_ADDR:8078\""
+echo "  mDNS alternatifi: http://$MDNS_HOST:8078"
 echo ""
 echo "Manuel başlatma: python3 main.py"
 echo "Service başlatma: sudo systemctl start thief-server"

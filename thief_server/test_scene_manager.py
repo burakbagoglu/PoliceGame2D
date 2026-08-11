@@ -96,7 +96,7 @@ def test_schema_one_draft_migrates_to_builtin_background(tmp_path):
     manager = SceneManager(tmp_path)
     migrated = manager.get_editor_state()["draft"]
 
-    assert migrated["schema_version"] == 6
+    assert migrated["schema_version"] == 7
     assert "jail" in migrated["scenes"]
     assert any(item["id"] == "screen_quota_text" for item in migrated["scenes"]["gameplay"]["elements"])
     assert migrated["canvas"]["background_asset"] == "__client_background__"
@@ -104,6 +104,64 @@ def test_schema_one_draft_migrates_to_builtin_background(tmp_path):
     assert migrated["scenes"]["waiting"]["elements"][0]["anchor_x"] == "scale"
     assert migrated["scenes"]["waiting"]["elements"][0]["anchor_y"] == "scale"
 
+
+def test_jail_scene_uses_bundled_assets_without_scoreboard(tmp_path):
+    manager = SceneManager(tmp_path)
+    jail = manager.get_editor_state()["draft"]["scenes"]["jail"]
+    elements = jail["elements"]
+
+    assert {item["asset"] for item in elements if item["type"] == "sprite"} == {
+        "jail_background.png",
+        "jail_thief_grabbars.png",
+    }
+    assert not any(item["type"] == "score" or item["id"] == "score_widget" for item in elements)
+    assert manager.resolve_asset("jail_background.png").is_file()
+    assert manager.resolve_asset("jail_thief_grabbars.png").is_file()
+    payload_assets = {item["name"] for item in manager.assets_for_document(manager.get_client_payload(1)["document"])}
+    assert {"jail_background.png", "jail_thief_grabbars.png"} <= payload_assets
+
+
+def test_v6_custom_jail_is_preserved_but_scoreboard_is_removed(tmp_path):
+    document = default_scene_document()
+    document["schema_version"] = 6
+    document["scenes"]["jail"] = {
+        "name": "Ozel Hapis",
+        "background": "#000000",
+        "elements": [
+            {"id": "custom_label", "type": "text", "text": "Bekle", "x": 10, "y": 10,
+             "width": 200, "height": 80, "z": 1},
+            {"id": "score_widget", "type": "score", "x": 0, "y": 0,
+             "width": 200, "height": 100, "z": 2},
+        ],
+    }
+    (tmp_path / "draft.json").write_text(__import__("json").dumps(document), encoding="utf-8")
+
+    jail = SceneManager(tmp_path).get_editor_state()["draft"]["scenes"]["jail"]
+
+    assert jail["name"] == "Ozel Hapis"
+    assert [item["id"] for item in jail["elements"]] == ["custom_label"]
+
+def test_published_schema_migration_bumps_version_and_persists(tmp_path):
+    document = default_scene_document()
+    document["schema_version"] = 6
+    document["scenes"]["jail"] = {
+        "name": "Eski Hapis",
+        "background": "#000000",
+        "elements": [
+            {"id": "jail_card", "type": "rect", "x": 0, "y": 0,
+             "width": 100, "height": 100, "z": 0},
+        ],
+    }
+    document["_published_version"] = 4
+    (tmp_path / "published.json").write_text(__import__("json").dumps(document), encoding="utf-8")
+
+    manager = SceneManager(tmp_path)
+    stored = __import__("json").loads((tmp_path / "published.json").read_text(encoding="utf-8"))
+
+    assert manager.get_client_payload(1)["version"] == "published-5"
+    assert stored["schema_version"] == 7
+    assert stored["_published_version"] == 5
+    assert stored["scenes"]["jail"]["elements"][0]["id"] == "jail_background"
 
 def test_client_screenshot_request_is_one_time_and_served(tmp_path):
     manager = SceneManager(tmp_path)

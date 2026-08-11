@@ -475,7 +475,7 @@ class NetClient:
         if not isinstance(data, dict):
             return
         command_type = str(data.get("type", "")).lower()
-        if command_type not in {"restart"}:
+        if command_type not in {"restart", "update"}:
             return
         if self.command_queue.full():
             self._clear_queue(self.command_queue)

@@ -1,0 +1,14 @@
+[Unit]
+Description=Polis Oyunu - Guvenli Client Guncelleme
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+EnvironmentFile=-/etc/polisoyunu-client-update.conf
+ExecStart=/usr/local/sbin/polisoyunu-client-update
+TimeoutStartSec=10min
+Nice=10
+IOSchedulingClass=idle
+UMask=0022

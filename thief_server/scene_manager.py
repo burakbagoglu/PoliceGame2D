@@ -35,6 +35,7 @@ IMAGE_ASSET_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 AUDIO_ASSET_EXTENSIONS = {".wav", ".ogg", ".mp3"}
 ALLOWED_ASSET_EXTENSIONS = IMAGE_ASSET_EXTENSIONS | AUDIO_ASSET_EXTENSIONS
 SAFE_ASSET_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+SCHEMA_VERSION = 7
 
 
 def _rect(
@@ -100,6 +101,29 @@ def _text(
     }
 
 
+def _sprite(
+    element_id: str,
+    asset: str,
+    x: int,
+    y: int,
+    width: int,
+    height: int,
+    z: int = 0,
+) -> dict:
+    return {
+        "id": element_id,
+        "type": "sprite",
+        "asset": asset,
+        "x": x,
+        "y": y,
+        "width": width,
+        "height": height,
+        "z": z,
+        "opacity": 1.0,
+        "effect": "none",
+        "effect_speed": 1.0,
+    }
+
 def default_scene_document() -> dict:
     """Mevcut oyun temasını editlenebilir başlangıç sahnelerine dönüştür."""
     yellow = "#ffe038"
@@ -109,7 +133,7 @@ def default_scene_document() -> dict:
     white = "#fffff7"
 
     document = {
-        "schema_version": 6,
+        "schema_version": SCHEMA_VERSION,
         "editor": {
             "grid_size": 10, "snap": True, "show_grid": True,
             "guides_x": [], "guides_y": [], "asset_tags": {},
@@ -265,17 +289,27 @@ def default_scene_document() -> dict:
             },
             "jail": {
                 "name": "Hırsız Hapiste",
-                "background": "#17121f",
+                "background": "#090b10",
                 "elements": [
-                    _rect("jail_card", 270, 185, 1380, 710, yellow, purple, radius=48),
-                    _text("jail_title", "YAKALANDI!", 360, 255, 1200, 150, 120, red, purple, effect="pulse"),
-                    _text("jail_progress", "BU EKRAN TAMAMLANDI\n{screen_score} / {screen_target}", 450, 445, 1020, 210, 70, purple, white),
-                    _text("jail_wait", "DİĞER EKRANLAR DEVAM EDİYOR", 470, 710, 980, 80, 42, dark, white),
-                    _rect("jail_bar_1", 360, 170, 62, 740, "#352849", "#130d1c", z=5, radius=8),
-                    _rect("jail_bar_2", 650, 170, 62, 740, "#352849", "#130d1c", z=5, radius=8),
-                    _rect("jail_bar_3", 940, 170, 62, 740, "#352849", "#130d1c", z=5, radius=8),
-                    _rect("jail_bar_4", 1230, 170, 62, 740, "#352849", "#130d1c", z=5, radius=8),
-                    _rect("jail_bar_5", 1520, 170, 62, 740, "#352849", "#130d1c", z=5, radius=8),
+                    _sprite("jail_background", "jail_background.png", 0, 0, 1920, 1080, z=-20),
+                    _sprite("jail_thief", "jail_thief_grabbars.png", 550, 105, 820, 820, z=0),
+                    {
+                        **_rect("jail_status_panel", 420, 900, 1080, 125, "#11151de6", "#e9b84a", z=10, radius=30),
+                        "stroke_width": 4,
+                    },
+                    _text("jail_title", "HIRSIZ HAPİSTE!", 460, 28, 1000, 100, 72, yellow, dark, z=10),
+                    _text(
+                        "jail_wait",
+                        "BU EKRAN TAMAMLANDI • DİĞER EKRANLAR DEVAM EDİYOR",
+                        465,
+                        925,
+                        990,
+                        72,
+                        34,
+                        white,
+                        dark,
+                        z=11,
+                    ),
                 ],
             },
             "win": {
@@ -381,6 +415,7 @@ class SceneManager:
     def __init__(self, data_dir: str | os.PathLike[str]):
         self.data_dir = Path(data_dir)
         self.assets_dir = self.data_dir / "assets"
+        self.bundled_assets_dir = Path(__file__).resolve().parent / "default_scene_assets"
         self.history_dir = self.data_dir / "history"
         self.client_previews_dir = self.data_dir / "client_previews"
         self.draft_path = self.data_dir / "draft.json"
@@ -395,24 +430,42 @@ class SceneManager:
         self.assets_dir.mkdir(parents=True, exist_ok=True)
         self.history_dir.mkdir(parents=True, exist_ok=True)
         self.client_previews_dir.mkdir(parents=True, exist_ok=True)
+        draft_stored_schema = self._stored_schema_version(self.draft_path)
+        published_stored_schema = self._stored_schema_version(self.published_path)
         self._draft = self._load_or_default(self.draft_path)
         self._published = self._load_or_default(self.published_path)
         self._draft_revision = int(self._draft.pop("_draft_revision", 1))
         self._published_version = int(self._published.pop("_published_version", 1))
+        draft_migrated = draft_stored_schema is not None and draft_stored_schema < SCHEMA_VERSION
+        published_migrated = published_stored_schema is not None and published_stored_schema < SCHEMA_VERSION
+        if draft_migrated:
+            self._draft_revision += 1
+        if published_migrated:
+            self._published_version += 1
 
-        if not self.draft_path.exists():
+        if not self.draft_path.exists() or draft_migrated:
             self._write_document(
                 self.draft_path,
                 self._draft,
                 {"_draft_revision": self._draft_revision},
             )
-        if not self.published_path.exists():
+        if not self.published_path.exists() or published_migrated:
             self._write_document(
                 self.published_path,
                 self._published,
                 {"_published_version": self._published_version},
             )
 
+    @staticmethod
+    def _stored_schema_version(path: Path) -> Optional[int]:
+        if not path.is_file():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                value = json.load(handle).get("schema_version")
+            return int(value) if value is not None else 1
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
     def _load_or_default(self, path: Path) -> dict:
         if not path.exists():
             return default_scene_document()
@@ -502,6 +555,30 @@ class SceneManager:
                 if isinstance(profile, dict):
                     profile["screen_count"] = 8
             document["schema_version"] = 6
+            version = 6
+        if version < 7:
+            defaults = default_scene_document()
+            jail = document.setdefault("scenes", {}).get("jail")
+            legacy_ids = {
+                "jail_card", "jail_progress", "jail_bar_1", "jail_bar_2",
+                "jail_bar_3", "jail_bar_4", "jail_bar_5",
+            }
+            current_ids = {
+                str(item.get("id", ""))
+                for item in (jail or {}).get("elements", [])
+                if isinstance(item, dict)
+            }
+            if not isinstance(jail, dict) or current_ids & legacy_ids:
+                document["scenes"]["jail"] = copy.deepcopy(defaults["scenes"]["jail"])
+            else:
+                jail["elements"] = [
+                    item for item in jail.get("elements", [])
+                    if not (
+                        isinstance(item, dict)
+                        and (item.get("type") == "score" or item.get("id") == "score_widget")
+                    )
+                ]
+            document["schema_version"] = 7
         return document
 
     @staticmethod
@@ -1115,16 +1192,27 @@ class SceneManager:
                 info["warning"] = "WAV süre bilgisi okunamadı"
         return info
     def list_assets(self) -> list:
-        assets = []
-        for path in sorted(self.assets_dir.iterdir()):
-            if path.is_file() and path.suffix.lower() in ALLOWED_ASSET_EXTENSIONS:
-                assets.append(self._asset_info(path))
-        return assets
+        paths = {}
+        if self.bundled_assets_dir.is_dir():
+            paths.update({
+                path.name: path
+                for path in self.bundled_assets_dir.iterdir()
+                if path.is_file() and path.suffix.lower() in ALLOWED_ASSET_EXTENSIONS
+            })
+        paths.update({
+            path.name: path
+            for path in self.assets_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in ALLOWED_ASSET_EXTENSIONS
+        })
+        return [self._asset_info(paths[name]) for name in sorted(paths)]
 
     def resolve_asset(self, filename: str) -> Optional[Path]:
         try:
             safe_name = self.sanitize_asset_name(filename)
         except SceneValidationError:
             return None
-        path = self.assets_dir / safe_name
-        return path if path.is_file() else None
+        uploaded = self.assets_dir / safe_name
+        if uploaded.is_file():
+            return uploaded
+        bundled = self.bundled_assets_dir / safe_name
+        return bundled if bundled.is_file() else None

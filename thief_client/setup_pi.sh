@@ -66,6 +66,8 @@ done
 [[ -n "${SERVER_ADDRESS}" ]] || fail "--server zorunlu."
 id "${TARGET_USER}" >/dev/null 2>&1 || fail "Kullanici bulunamadi: ${TARGET_USER}"
 [[ "${INSTALL_ROOT}" == /* ]] || fail "--install-root mutlak bir yol olmali."
+[[ "${TARGET_USER}" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]] || fail "Kullanici adi guvenli degil."
+[[ "${INSTALL_ROOT}" != *[$'\t\r\n ']* ]] || fail "--install-root bosluk veya satir sonu iceremez."
 if [[ -n "${WIFI_SSID}" ]]; then
     [[ "${WIFI_SSID}" != *$'\n'* && "${WIFI_SSID}" != *$'\r'* ]] || fail "Wi-Fi adi satir sonu iceremez."
     (( ${#WIFI_SSID} <= 32 )) || fail "Wi-Fi adi en fazla 32 karakter olmali."
@@ -99,7 +101,9 @@ fi
 log "Pygame, serial, ag ve kurulum araclari yukleniyor"
 apt-get install -y --no-install-recommends \
     python3 python3-pygame python3-serial python3-requests \
-    rsync curl ca-certificates
+    rsync curl git ca-certificates avahi-daemon libnss-mdns
+
+systemctl enable --now avahi-daemon.service || true
 
 WIFI_RESULT="mevcut sistem ayari"
 if [[ -n "${WIFI_SSID}" ]]; then
@@ -183,7 +187,10 @@ finally:
 PY
 
 chown -R "${TARGET_USER}:${TARGET_USER}" "${INSTALL_ROOT}"
-chmod +x "${INSTALL_ROOT}/thief_client/setup_pi.sh"
+chmod +x \
+    "${INSTALL_ROOT}/thief_client/setup_pi.sh" \
+    "${INSTALL_ROOT}/thief_client/update_pi.sh" \
+    "${INSTALL_ROOT}/thief_client/request_update.sh"
 
 log "Systemd servisi olusturuluyor"
 cat >"/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
@@ -215,6 +222,38 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
+
+log "Sinirli uzaktan guncelleme servisi kuruluyor"
+install -o root -g root -m 0755 \
+    "${INSTALL_ROOT}/thief_client/update_pi.sh" \
+    /usr/local/sbin/polisoyunu-client-update
+install -o root -g root -m 0755 \
+    "${INSTALL_ROOT}/thief_client/request_update.sh" \
+    /usr/local/sbin/polisoyunu-request-update
+install -o root -g root -m 0644 \
+    "${INSTALL_ROOT}/thief_client/thief-game-update.service" \
+    /etc/systemd/system/thief-game-update.service
+cat >/etc/polisoyunu-client-update.conf <<EOF
+POLIS_UPDATE_TARGET_USER=${TARGET_USER}
+POLIS_UPDATE_INSTALL_ROOT=${INSTALL_ROOT}
+EOF
+chown root:root /etc/polisoyunu-client-update.conf
+chmod 0600 /etc/polisoyunu-client-update.conf
+
+cat >/etc/sudoers.d/polisoyunu-client-update <<EOF
+${TARGET_USER} ALL=(root) NOPASSWD: /usr/local/sbin/polisoyunu-request-update
+EOF
+chown root:root /etc/sudoers.d/polisoyunu-client-update
+chmod 0440 /etc/sudoers.d/polisoyunu-client-update
+visudo -cf /etc/sudoers.d/polisoyunu-client-update >/dev/null
+
+install -d -o root -g root -m 0755 /var/lib/polisoyunu
+if [[ ! -f /var/lib/polisoyunu/update-status.json ]]; then
+    printf '{"state":"idle","version":"","message":"Guncelleme bekleniyor","updated_at":0}\n' \
+        >/var/lib/polisoyunu/update-status.json
+    chown root:root /var/lib/polisoyunu/update-status.json
+    chmod 0644 /var/lib/polisoyunu/update-status.json
+fi
 
 log "Ekran kararmasi kapatiliyor"
 command -v raspi-config >/dev/null && raspi-config nonint do_blanking 1 || true
@@ -250,6 +289,7 @@ cat <<EOF
  Wi-Fi             : ${WIFI_RESULT}
  Kurulum dizini    : ${INSTALL_ROOT}
  Servis            : ${SERVICE_NAME}.service
+ Uzaktan update    : thief-game-update.service
 ============================================================
 
 Elektrik gidip geldiginde servis boot sirasinda otomatik acilir.

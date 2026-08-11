@@ -186,6 +186,9 @@ class ClientTelemetryRequest(BaseModel):
     events_failed: int = Field(default=0, ge=0)
     queue_depth: int = Field(default=0, ge=0)
     app_version: str = Field(default="", max_length=40)
+    update_state: str = Field(default="idle", max_length=24)
+    update_version: str = Field(default="", max_length=40)
+    update_error: str = Field(default="", max_length=240)
     frame_time_p95_ms: float = Field(default=0, ge=0, le=1000)
     draw_time_p95_ms: float = Field(default=0, ge=0, le=1000)
     blit_time_p95_ms: float = Field(default=0, ge=0, le=1000)
@@ -1064,6 +1067,23 @@ async def restart_client(screen_id: int):
     if not status.get("online"):
         raise HTTPException(status_code=409, detail="İstemci çevrimdışı")
     command = client_commands.queue(screen_id, "restart")
+    return {"success": True, "command": command}
+
+
+@app.post("/api/clients/{screen_id}/update")
+async def update_client(screen_id: int, request: Request):
+    """PIN korumali, allowlist tabanli client updater servisini tetikle."""
+    photo_guard.authorize(request, write=True)
+    if not 1 <= int(screen_id) <= GAME_SCREEN_COUNT:
+        raise HTTPException(status_code=422, detail="Ekran numarasi gecersiz")
+    if spawn_scheduler and spawn_scheduler.get_status().get("is_active"):
+        raise HTTPException(status_code=409, detail="Oyun devam ederken client guncellenemez")
+    status = client_telemetry.list(GAME_SCREEN_COUNT)["clients"][screen_id - 1]
+    if not status.get("online"):
+        raise HTTPException(status_code=409, detail="Istemci cevrimdisi")
+    if status.get("update_state") == "running":
+        raise HTTPException(status_code=409, detail="Bu istemcide guncelleme zaten calisiyor")
+    command = client_commands.queue(screen_id, "update")
     return {"success": True, "command": command}
 
 
@@ -2426,6 +2446,24 @@ DASHBOARD_HTML = """
             }
         }
 
+        async function updateClient(screenId) {
+            if (!photoCsrf) {
+                alert('Client güncellemek için önce galeriye operatör PIN ile giriş yapın.');
+                return;
+            }
+            if (!confirm(`Ekran ${screenId} güvenli şekilde güncellensin mi? Oyun kısa süre yeniden başlayacak.`)) return;
+            try {
+                const response = await fetch(`/api/clients/${screenId}/update`, {
+                    method: 'POST',
+                    headers: {'X-Photo-CSRF': photoCsrf},
+                });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.detail || 'Güncelleme komutu gönderilemedi');
+                alert(`Ekran ${screenId} update komutunu aldı. Durumu client kartından izleyebilirsiniz.`);
+            } catch (error) {
+                alert(error.message || 'Client güncellenemedi');
+            }
+        }
         async function runFieldCheck() {
             const box = document.getElementById('field-check-result');
             box.style.display = 'block';
@@ -2473,7 +2511,9 @@ DASHBOARD_HTML = """
                         <div>Render: ${client.render_width && client.render_height ? client.render_width + '×' + client.render_height : '—'} → Çıkış: ${client.output_width && client.output_height ? client.output_width + '×' + client.output_height : '—'} · Direct: ${client.direct_render ? 'Aktif' : 'Kapalı'}</div>
                         <div>Render yolu: ${client.render_mode || '—'} · Güncellenen: ${client.updated_pixel_ratio != null ? client.updated_pixel_ratio + '%' : '—'} · Bölge: ${client.dirty_rect_count ?? 0}</div>
                         <div>Seri: ${client.serial_connected ? 'OK' : 'Yok'} · Sahne: ${client.active_scene || '—'} · Kuyruk: ${client.queue_depth ?? 0}</div>
+                        <div>Update: ${client.update_state || 'idle'}${client.update_version ? ' · ' + client.update_version : ''}${client.update_error ? ' · ' + client.update_error : ''}</div>
                         <button class="btn btn-orange" style="margin-top:8px" onclick="restartClient(${client.screen_id})" ${client.online ? '' : 'disabled'}>Client'ı yeniden başlat</button>
+                        <button class="btn btn-green" style="margin-top:8px" onclick="updateClient(${client.screen_id})" ${client.online ? '' : 'disabled'}>Güvenli güncelle</button>
                     </div>`).join('');
                 renderSelectedTelemetry();
             } catch (error) {

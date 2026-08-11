@@ -45,6 +45,8 @@ Script paketleri kurar, tum projeyi `/opt/polisoyunu` altina kopyalar, 720p Pi Z
 kullaniciyi donanim gruplarina ekler ve `thief-game.service` servisini etkinlestirir. Servis bootta acilir;
 oyun temiz kapansa, crash olsa veya elektrik kesilip geri gelse bile `Restart=always` ile tekrar baslar.
 Script tekrar calistirilabilir ve mevcut client config dosyasinin yedegini alir.
+Hostname ile kullanimda server Pi'de `avahi-daemon`, clientlarda `libnss-mdns` kurulur. Ornek server
+adresi `http://server.local:8078`; clienttan `curl http://server.local:8078/health` ile dogrulayin.
 
 Kontrol:
 
@@ -247,3 +249,32 @@ sd_card_tool/start_windows.bat
 
 Arac OS yazma, Wi-Fi, ekran ID, server, Arduino portu, 720p/FPS ayarlari ve ilk acilis client
 kurulumunu tek akista yapar. Ayrintilar `sd_card_tool/README.md` dosyasindadir.
+
+## Dashboarddan Guvenli Client Guncelleme
+
+`/opt/polisoyunu` bir Git checkout olmadigi icin client uzerinde `git pull` kullanilmaz.
+Ilk kez bu surume gecerken her Pi Zero'da `setup_pi.sh` bir defa yeniden calistirilmalidir;
+bu islem root-owned updater servisini ve yalniz o servisi baslatabilen dar sudoers kuralini kurar.
+Sonraki surumler server dashboardundaki **Guvenli guncelle** dugmesiyle alinabilir.
+
+- Operator once galeri PIN'iyle giris yapar; update istegi ayni oturum ve CSRF korumasini kullanir.
+- Aktif oyun sirasinda update reddedilir.
+- Client serbest shell komutu, URL veya branch kabul etmez; yalniz sabit GitHub reposunun `main`
+  branch'ini gecici dizine klonlar.
+- Yeni surum Python derleme kontrolunden sonra atomik olarak devreye alinir.
+- `thief-game.service` acilmazsa onceki release otomatik geri yuklenir.
+- Cihaza ozel `thief_client/config.json` korunur.
+
+Client tarafinda durum ve log kontrolu:
+
+```bash
+cat /var/lib/polisoyunu/update-status.json
+sudo systemctl status thief-game-update.service
+sudo journalctl -u thief-game-update.service -n 100 --no-pager
+```
+
+Elle ayni sinirli update'i tetiklemek gerekirse:
+
+```bash
+sudo /usr/local/sbin/polisoyunu-request-update
+```

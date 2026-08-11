@@ -11,7 +11,7 @@ from typing import Dict, Optional
 class ClientCommandStore:
     """Small in-memory command queue; one pending command per screen."""
 
-    ALLOWED_COMMANDS = {"restart"}
+    ALLOWED_COMMANDS = {"restart", "update"}
 
     def __init__(self):
         self._lock = threading.RLock()

@@ -21,6 +21,9 @@ def test_heartbeat_is_sanitized_and_listed_online():
         "render_mode": "dirty-rect",
         "updated_pixel_ratio": 7.456,
         "dirty_rect_count": 2,
+        "update_state": "failed-too-long-for-status-field",
+        "update_version": "abcdef123456",
+        "update_error": "x" * 300,
         "serial_connected": True,
         "piezo": {"latest": 90, "peak": 410, "samples": [1, 2, 5000]},
     })
@@ -41,6 +44,10 @@ def test_heartbeat_is_sanitized_and_listed_online():
     assert result["render_mode"] == "dirty-rect"
     assert result["updated_pixel_ratio"] == 7.46
     assert result["dirty_rect_count"] == 2
+    assert len(result["update_state"]) == 24
+    assert result["update_state"].startswith("failed-too-long")
+    assert result["update_version"] == "abcdef123456"
+    assert len(result["update_error"]) == 240
     assert result["piezo"]["samples"] == [1, 2, 4095]
     listing = store.list(num_screens=3)
     assert listing["online_count"] == 1

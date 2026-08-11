@@ -598,6 +598,30 @@ class TestCombinedPolling:
         assert client._poll_combined() is False
         assert client._combined_poll_supported is False
 
+    @responses.activate
+    def test_combined_poll_accepts_allowlisted_update_command(self):
+        responses.post(
+            "http://test:8000/api/client/poll",
+            json={
+                "spawn_state": {"spawn": False},
+                "piezo_config": {"changed": False},
+                "heartbeat": {"online": True},
+                "command": {"type": "update", "token": "update-1"},
+            },
+            status=200,
+        )
+        client = NetClient(
+            server_url="http://test:8000/event",
+            server_base_url="http://test:8000",
+            screen_id=4,
+        )
+
+        assert client._poll_combined() is True
+        assert client.consume_command() == {
+            "type": "update",
+            "token": "update-1",
+        }
+
 
 def test_offline_events_are_written_in_batches(tmp_path):
     queue_file = str(tmp_path / "event_queue.json")

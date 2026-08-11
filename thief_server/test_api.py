@@ -787,6 +787,35 @@ def _photo_login():
     return response.json()["csrf"]
 
 
+def test_client_update_requires_operator_login_and_queues_allowlisted_command(monkeypatch):
+    import main
+    from client_commands import ClientCommandStore
+    from client_telemetry import ClientTelemetryStore
+
+    telemetry = ClientTelemetryStore()
+    telemetry.update(3, {
+        "fps": 30,
+        "serial_connected": True,
+        "app_version": "scene-engine-v8-dirty-rect",
+        "update_state": "idle",
+    })
+    monkeypatch.setattr(main, "client_telemetry", telemetry)
+    monkeypatch.setattr(main, "client_commands", ClientCommandStore())
+    client.cookies.clear()
+
+    assert client.post("/api/clients/3/update").status_code == 401
+    csrf = _photo_login()
+    queued = client.post(
+        "/api/clients/3/update",
+        headers={"X-Photo-CSRF": csrf},
+    )
+    assert queued.status_code == 200
+
+    poll = client.post("/api/client/poll", json={"screen_id": 3})
+    assert poll.status_code == 200
+    assert poll.json()["command"]["type"] == "update"
+
+
 def test_photo_gallery_requires_operator_login():
     assert client.get("/api/photo-sessions").status_code == 401
     assert client.post("/api/photo-auth/login", json={"pin": "000000"}).status_code == 401
