@@ -35,7 +35,7 @@ IMAGE_ASSET_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 AUDIO_ASSET_EXTENSIONS = {".wav", ".ogg", ".mp3"}
 ALLOWED_ASSET_EXTENSIONS = IMAGE_ASSET_EXTENSIONS | AUDIO_ASSET_EXTENSIONS
 SAFE_ASSET_NAME = re.compile(r"[^A-Za-z0-9._-]+")
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def _rect(
@@ -292,7 +292,17 @@ def default_scene_document() -> dict:
                 "background": "#090b10",
                 "elements": [
                     _sprite("jail_background", "jail_background.png", 0, 0, 1920, 1080, z=-20),
-                    _sprite("jail_thief", "jail_thief_grabbars.png", 550, 105, 820, 820, z=0),
+                    {
+                        **_sprite("jail_thief", "jail_thief_grabbars.png", 550, 105, 820, 820, z=0),
+                        "sprite_sheet": {
+                            "columns": 5,
+                            "rows": 5,
+                            "fps": 12,
+                            "start": 0,
+                            "end": 24,
+                            "loop": True,
+                        },
+                    },
                     {
                         **_rect("jail_status_panel", 420, 900, 1080, 125, "#11151de6", "#e9b84a", z=10, radius=30),
                         "stroke_width": 4,
@@ -579,6 +589,25 @@ class SceneManager:
                     )
                 ]
             document["schema_version"] = 7
+            version = 7
+        if version < 8:
+            jail = document.get("scenes", {}).get("jail", {})
+            if isinstance(jail, dict):
+                for element in jail.get("elements", []):
+                    if (
+                        isinstance(element, dict)
+                        and element.get("type") == "sprite"
+                        and element.get("asset") == "jail_thief_grabbars.png"
+                    ):
+                        element["sprite_sheet"] = {
+                            "columns": 5,
+                            "rows": 5,
+                            "fps": 12,
+                            "start": 0,
+                            "end": 24,
+                            "loop": True,
+                        }
+            document["schema_version"] = 8
         return document
 
     @staticmethod

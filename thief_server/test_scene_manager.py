@@ -96,7 +96,7 @@ def test_schema_one_draft_migrates_to_builtin_background(tmp_path):
     manager = SceneManager(tmp_path)
     migrated = manager.get_editor_state()["draft"]
 
-    assert migrated["schema_version"] == 7
+    assert migrated["schema_version"] == 8
     assert "jail" in migrated["scenes"]
     assert any(item["id"] == "screen_quota_text" for item in migrated["scenes"]["gameplay"]["elements"])
     assert migrated["canvas"]["background_asset"] == "__client_background__"
@@ -115,6 +115,15 @@ def test_jail_scene_uses_bundled_assets_without_scoreboard(tmp_path):
         "jail_thief_grabbars.png",
     }
     assert not any(item["type"] == "score" or item["id"] == "score_widget" for item in elements)
+    thief = next(item for item in elements if item["id"] == "jail_thief")
+    assert thief["sprite_sheet"] == {
+        "columns": 5,
+        "rows": 5,
+        "fps": 12,
+        "start": 0,
+        "end": 24,
+        "loop": True,
+    }
     assert manager.resolve_asset("jail_background.png").is_file()
     assert manager.resolve_asset("jail_thief_grabbars.png").is_file()
     payload_assets = {item["name"] for item in manager.assets_for_document(manager.get_client_payload(1)["document"])}
@@ -159,9 +168,36 @@ def test_published_schema_migration_bumps_version_and_persists(tmp_path):
     stored = __import__("json").loads((tmp_path / "published.json").read_text(encoding="utf-8"))
 
     assert manager.get_client_payload(1)["version"] == "published-5"
-    assert stored["schema_version"] == 7
+    assert stored["schema_version"] == 8
     assert stored["_published_version"] == 5
     assert stored["scenes"]["jail"]["elements"][0]["id"] == "jail_background"
+
+
+def test_v7_jail_sprite_sheet_is_migrated_and_published(tmp_path):
+    document = default_scene_document()
+    document["schema_version"] = 7
+    thief = next(
+        item for item in document["scenes"]["jail"]["elements"]
+        if item["id"] == "jail_thief"
+    )
+    thief.pop("sprite_sheet", None)
+    document["_published_version"] = 8
+    (tmp_path / "published.json").write_text(
+        __import__("json").dumps(document),
+        encoding="utf-8",
+    )
+
+    manager = SceneManager(tmp_path)
+    payload = manager.get_client_payload(1)
+    migrated_thief = next(
+        item for item in payload["document"]["scenes"]["jail"]["elements"]
+        if item["id"] == "jail_thief"
+    )
+
+    assert payload["version"] == "published-9"
+    assert migrated_thief["sprite_sheet"]["columns"] == 5
+    assert migrated_thief["sprite_sheet"]["rows"] == 5
+    assert migrated_thief["sprite_sheet"]["end"] == 24
 
 def test_client_screenshot_request_is_one_time_and_served(tmp_path):
     manager = SceneManager(tmp_path)
