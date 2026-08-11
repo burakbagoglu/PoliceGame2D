@@ -2023,6 +2023,7 @@ DASHBOARD_HTML = """
 <body>
     <div class="container">
         <div style="display:flex;justify-content:flex-end;gap:8px;margin-bottom:10px;">
+            <a href="/operator" style="background:#22c55e;color:#052e16;text-decoration:none;padding:10px 14px;border-radius:8px;font-weight:800;">Kafe Modu</a>
             <a href="/photos" style="background:#e5e7eb;color:#111827;text-decoration:none;padding:10px 14px;border-radius:8px;font-weight:800;">📷 Fotoğraflar</a>
             <a href="/scene-editor" style="background:#fbbf24;color:#111827;text-decoration:none;padding:10px 14px;border-radius:8px;font-weight:800;">🎨 Sahne Editörü</a>
         </div>
@@ -3150,6 +3151,34 @@ SCREEN_HTML = """
 async def dashboard():
     """Ana sayfa - Dashboard"""
     return DASHBOARD_HTML
+
+
+@app.get("/operator", response_class=HTMLResponse)
+@app.get("/kafe", response_class=HTMLResponse)
+async def operator_page():
+    """Kafe ekibi için PIN'i vardiyada bir kez isteyen hızlı oyun başlangıcı."""
+    operator_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "operator.html",
+    )
+    try:
+        with open(operator_path, "r", encoding="utf-8") as handle:
+            content = handle.read()
+        return HTMLResponse(
+            content,
+            headers={
+                "Cache-Control": "private, no-store",
+                "X-Frame-Options": "DENY",
+                "Content-Security-Policy": (
+                    "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+                    "script-src 'self' 'unsafe-inline'; connect-src 'self'; "
+                    "img-src 'self' data:; object-src 'none'; base-uri 'none'; "
+                    "frame-ancestors 'none'; form-action 'self'"
+                ),
+            },
+        )
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="Kafe modu sayfası okunamadı") from exc
 
 
 @app.get("/photos", response_class=HTMLResponse)

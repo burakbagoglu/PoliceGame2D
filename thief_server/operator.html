@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="tr">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Polis Oyunu · Kafe Modu</title>
+    <style>
+        :root {
+            color-scheme: light;
+            --ink: #172033;
+            --muted: #687083;
+            --line: #dfe3ea;
+            --paper: #ffffff;
+            --ground: #f3f4f6;
+            --yellow: #ffd538;
+            --yellow-dark: #e8b900;
+            --green: #16834b;
+            --red: #c83c4d;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            min-height: 100vh;
+            background: var(--ground);
+            color: var(--ink);
+            font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+        }
+        button, input { font: inherit; }
+        button { touch-action: manipulation; }
+        .shell { width: min(920px, calc(100% - 28px)); margin: 0 auto; padding: 24px 0 50px; }
+        header { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
+        .brand { display: flex; align-items: center; gap: 12px; }
+        .mark {
+            display: grid; place-items: center; width: 44px; height: 44px;
+            border-radius: 12px; background: var(--ink); color: white; font-weight: 900;
+        }
+        h1 { margin: 0; font-size: clamp(1.35rem, 4vw, 2rem); letter-spacing: -.035em; }
+        .sub { margin: 2px 0 0; color: var(--muted); font-size: .9rem; }
+        .status-pill {
+            display: inline-flex; align-items: center; gap: 7px; padding: 9px 12px;
+            border: 1px solid var(--line); border-radius: 999px; background: var(--paper);
+            color: var(--muted); font-size: .85rem; font-weight: 750; white-space: nowrap;
+        }
+        .dot { width: 8px; height: 8px; border-radius: 50%; background: #9ca3af; }
+        .dot.ok { background: #19a15f; box-shadow: 0 0 0 4px #19a15f1c; }
+        .card { background: var(--paper); border: 1px solid var(--line); border-radius: 18px; padding: 22px; }
+        .login { max-width: 520px; margin: 9vh auto 0; }
+        .login h2, .game-card h2 { margin: 0 0 7px; font-size: 1.3rem; }
+        .login p { color: var(--muted); line-height: 1.5; }
+        .login-row { display: grid; grid-template-columns: 1fr auto; gap: 10px; margin-top: 18px; }
+        input {
+            width: 100%; min-height: 50px; border: 1px solid #cfd4dc; border-radius: 11px;
+            padding: 0 14px; color: var(--ink); background: #fff; outline: none;
+        }
+        input:focus { border-color: var(--ink); box-shadow: 0 0 0 3px #17203314; }
+        .btn { border: 0; border-radius: 11px; padding: 13px 18px; font-weight: 850; cursor: pointer; }
+        .btn:disabled { opacity: .45; cursor: not-allowed; }
+        .btn-dark { color: white; background: var(--ink); }
+        .btn-light { color: var(--ink); background: #edf0f4; }
+        .btn-danger { color: var(--red); background: #fff0f2; }
+        .error { min-height: 22px; margin-top: 12px; color: var(--red); font-weight: 700; }
+        #operatorPanel[hidden], #loginPanel[hidden] { display: none; }
+        .live {
+            display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 16px;
+            margin-bottom: 14px; padding: 16px 18px; border: 1px solid var(--line);
+            border-radius: 15px; background: var(--paper);
+        }
+        .live strong { display: block; font-size: 1.05rem; }
+        .live span { color: var(--muted); font-size: .9rem; }
+        .live.active { border-color: #8bd4ad; background: #f0fbf5; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+        .full { grid-column: 1 / -1; }
+        label { display: block; margin-bottom: 7px; color: var(--muted); font-size: .82rem; font-weight: 800; }
+        .stepper { display: grid; grid-template-columns: 52px 1fr 52px; gap: 8px; }
+        .stepper button { border: 1px solid var(--line); border-radius: 11px; background: #f5f6f8; font-size: 1.35rem; font-weight: 900; }
+        .stepper input { text-align: center; font-size: 1.1rem; font-weight: 850; }
+        .section-title { margin: 22px 0 10px; font-size: .83rem; color: var(--muted); text-transform: uppercase; letter-spacing: .09em; }
+        .profiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+        .profile {
+            min-height: 112px; padding: 15px; text-align: left; border: 2px solid var(--line);
+            border-radius: 14px; background: white; color: var(--ink); cursor: pointer;
+        }
+        .profile strong { display: block; margin-bottom: 7px; font-size: 1rem; }
+        .profile span { color: var(--muted); font-size: .82rem; line-height: 1.4; }
+        .profile.selected { border-color: var(--ink); background: #f7f8fa; box-shadow: inset 0 0 0 1px var(--ink); }
+        .consent-note {
+            margin-top: 16px; padding: 11px 13px; border-radius: 10px; background: #f7f8fa;
+            color: var(--muted); font-size: .82rem; line-height: 1.45;
+        }
+        .start {
+            width: 100%; min-height: 76px; margin-top: 14px; border: 0; border-radius: 15px;
+            background: var(--yellow); color: #241d00; font-size: clamp(1.15rem, 4vw, 1.55rem);
+            font-weight: 950; letter-spacing: .01em; cursor: pointer;
+            box-shadow: 0 5px 0 var(--yellow-dark);
+        }
+        .start:active:not(:disabled) { transform: translateY(3px); box-shadow: 0 2px 0 var(--yellow-dark); }
+        .start:disabled { opacity: .5; cursor: not-allowed; box-shadow: none; }
+        .footer-links { display: flex; justify-content: center; gap: 16px; margin-top: 18px; }
+        .footer-links a, .footer-links button { color: var(--muted); background: none; border: 0; text-decoration: none; cursor: pointer; font-size: .82rem; }
+        @media (max-width: 680px) {
+            .shell { width: min(100% - 18px, 920px); padding-top: 14px; }
+            header { align-items: flex-start; }
+            .sub { display: none; }
+            .card { padding: 16px; border-radius: 14px; }
+            .grid, .profiles { grid-template-columns: 1fr; }
+            .login-row { grid-template-columns: 1fr; }
+            .profile { min-height: 82px; }
+        }
+    </style>
+</head>
+<body>
+<div class="shell">
+    <header>
+        <div class="brand">
+            <div class="mark">P</div>
+            <div><h1>Polis Oyunu</h1><p class="sub">Kafe ekibi hızlı başlangıç ekranı</p></div>
+        </div>
+        <div class="status-pill"><i class="dot" id="connectionDot"></i><span id="connectionText">Kontrol ediliyor</span></div>
+    </header>
+
+    <section class="card login" id="loginPanel" hidden>
+        <h2>Vardiyayı aç</h2>
+        <p>Bu cihazda sekiz saat boyunca hızlı oyun başlatmak için operatör PIN’ini bir kez girin.</p>
+        <form class="login-row" id="loginForm">
+            <input id="pin" type="password" inputmode="numeric" autocomplete="current-password" placeholder="Operatör PIN" required>
+            <button class="btn btn-dark" type="submit">Devam et</button>
+        </form>
+        <div class="error" id="loginError"></div>
+    </section>
+
+    <main id="operatorPanel" hidden>
+        <div class="live" id="liveCard">
+            <div><strong id="gameState">Oyun bekleniyor</strong><span id="gameMeta">Clientlar kontrol ediliyor…</span></div>
+            <button class="btn btn-danger" id="endButton" type="button" hidden>Oyunu bitir</button>
+        </div>
+
+        <section class="card game-card">
+            <h2>Yeni oyun</h2>
+            <div class="grid">
+                <div class="full">
+                    <label for="sessionName">Grup veya etkinlik adı</label>
+                    <input id="sessionName" maxlength="80" placeholder="Örn. Ece’nin doğum günü">
+                </div>
+                <div class="full">
+                    <label for="childCount">Çocuk sayısı</label>
+                    <div class="stepper">
+                        <button id="minus" type="button" aria-label="Azalt">−</button>
+                        <input id="childCount" type="number" min="1" max="100" value="5">
+                        <button id="plus" type="button" aria-label="Artır">+</button>
+                    </div>
+                </div>
+            </div>
+
+            <h3 class="section-title">Oyun temposu</h3>
+            <div class="profiles" id="profiles"></div>
+
+            <div class="consent-note">Fotoğraf izni girişte alınmış kabul edilir ve oturuma otomatik kaydedilir.</div>
+            <button class="start" id="startButton" type="button">OYUNU BAŞLAT</button>
+            <div class="error" id="startError"></div>
+        </section>
+
+        <div class="footer-links">
+            <a href="/dashboard">Teknik panel</a>
+            <a href="/photos">Fotoğraflar</a>
+            <button id="logoutButton" type="button">Vardiyayı kapat</button>
+        </div>
+    </main>
+</div>
+
+<script>
+    'use strict';
+    let csrf = null;
+    let profiles = {};
+    let selectedProfile = 'standard';
+    let gameActive = false;
+
+    const byId = id => document.getElementById(id);
+    const setConnection = (ok, text) => {
+        byId('connectionDot').classList.toggle('ok', Boolean(ok));
+        byId('connectionText').textContent = text;
+    };
+    const apiJson = async (url, options = {}) => {
+        const response = await fetch(url, options);
+        let data = {};
+        try { data = await response.json(); } catch (_) {}
+        if (!response.ok) throw new Error(data.detail || data.message || 'İşlem tamamlanamadı');
+        return data;
+    };
+    const setLocked = locked => {
+        byId('loginPanel').hidden = !locked;
+        byId('operatorPanel').hidden = locked;
+        if (locked) byId('pin').focus();
+    };
+    const difficultyName = value => ({easy: 'Kolay', normal: 'Normal', hard: 'Zor'})[value] || value;
+
+    function renderProfiles() {
+        const root = byId('profiles');
+        root.replaceChildren();
+        const entries = Object.entries(profiles);
+        if (!entries.length) {
+            profiles = {standard: {name: 'Standart', duration_minutes: 35, difficulty: 'normal', child_count: 5}};
+        }
+        Object.entries(profiles).forEach(([id, profile]) => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'profile' + (id === selectedProfile ? ' selected' : '');
+            button.dataset.profile = id;
+            const title = document.createElement('strong');
+            title.textContent = profile.name || id;
+            const meta = document.createElement('span');
+            meta.textContent = `${profile.duration_minutes || 35} dk · ${difficultyName(profile.difficulty || 'normal')}`;
+            button.append(title, meta);
+            button.addEventListener('click', () => {
+                selectedProfile = id;
+                renderProfiles();
+            });
+            root.appendChild(button);
+        });
+    }
+
+    async function loadProfiles() {
+        const data = await apiJson('/api/game/profiles');
+        profiles = data.profiles || {};
+        if (!profiles[selectedProfile]) selectedProfile = Object.keys(profiles)[0] || 'standard';
+        renderProfiles();
+    }
+
+    async function refreshStatus() {
+        try {
+            const [status, clients] = await Promise.all([
+                apiJson('/api/game/status'),
+                apiJson('/api/clients/status'),
+            ]);
+            gameActive = Boolean(status.is_active);
+            setConnection(true, `${clients.online_count || 0}/8 ekran bağlı`);
+            byId('liveCard').classList.toggle('active', gameActive);
+            byId('gameState').textContent = gameActive ? 'Oyun devam ediyor' : 'Oyun bekleniyor';
+            const score = status.current_score ?? status.score_data?.total_score ?? 0;
+            const target = status.target_score ?? '—';
+            const seconds = Number(status.remaining_seconds || 0);
+            const timeText = seconds ? `${Math.floor(seconds / 60)} dk ${seconds % 60} sn` : '';
+            byId('gameMeta').textContent = gameActive
+                ? `${score} / ${target}${timeText ? ' · ' + timeText : ''}`
+                : 'Yeni grup için bilgileri girin';
+            byId('startButton').disabled = gameActive;
+            byId('endButton').hidden = !gameActive;
+        } catch (error) {
+            setConnection(false, 'Server bağlantısı yok');
+        }
+    }
+
+    async function checkAuth() {
+        try {
+            const auth = await apiJson('/api/photo-auth/status');
+            csrf = auth.authenticated ? auth.csrf : null;
+            setLocked(!csrf);
+            if (csrf) await Promise.all([loadProfiles(), refreshStatus()]);
+        } catch (error) {
+            setLocked(true);
+            byId('loginError').textContent = error.message;
+        }
+    }
+
+    byId('loginForm').addEventListener('submit', async event => {
+        event.preventDefault();
+        byId('loginError').textContent = '';
+        try {
+            const data = await apiJson('/api/photo-auth/login', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({pin: byId('pin').value}),
+            });
+            csrf = data.csrf;
+            byId('pin').value = '';
+            setLocked(false);
+            await Promise.all([loadProfiles(), refreshStatus()]);
+        } catch (error) {
+            byId('loginError').textContent = error.message;
+        }
+    });
+
+    const changeChildren = delta => {
+        const input = byId('childCount');
+        input.value = Math.max(1, Math.min(100, Number(input.value || 1) + delta));
+    };
+    byId('minus').addEventListener('click', () => changeChildren(-1));
+    byId('plus').addEventListener('click', () => changeChildren(1));
+
+    byId('startButton').addEventListener('click', async () => {
+        if (gameActive || !csrf) return;
+        byId('startError').textContent = '';
+        const button = byId('startButton');
+        button.disabled = true;
+        button.textContent = 'BAŞLATILIYOR…';
+        const now = new Date();
+        const automaticName = `Kafe ${now.toLocaleDateString('tr-TR')} ${now.toLocaleTimeString('tr-TR', {hour: '2-digit', minute: '2-digit'})}`;
+        try {
+            await apiJson('/api/game/start', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json', 'X-Photo-CSRF': csrf},
+                body: JSON.stringify({
+                    profile_id: selectedProfile,
+                    child_count: Number(byId('childCount').value || 1),
+                    session_name: byId('sessionName').value.trim() || automaticName,
+                    capture_photos: true,
+                    photo_consent: true,
+                }),
+            });
+            byId('sessionName').value = '';
+            await refreshStatus();
+        } catch (error) {
+            byId('startError').textContent = error.message;
+            button.disabled = false;
+        } finally {
+            button.textContent = 'OYUNU BAŞLAT';
+        }
+    });
+
+    byId('endButton').addEventListener('click', async () => {
+        if (!confirm('Aktif oyun bitirilsin mi?')) return;
+        try {
+            await apiJson('/api/game/end', {method: 'POST'});
+            await refreshStatus();
+        } catch (error) {
+            byId('startError').textContent = error.message;
+        }
+    });
+
+    byId('logoutButton').addEventListener('click', async () => {
+        try {
+            await apiJson('/api/photo-auth/logout', {
+                method: 'POST', headers: {'X-Photo-CSRF': csrf || ''},
+            });
+        } catch (_) {}
+        csrf = null;
+        setLocked(true);
+    });
+
+    checkAuth();
+    setInterval(() => { if (csrf) refreshStatus(); }, 1500);
+</script>
+</body>
+</html>

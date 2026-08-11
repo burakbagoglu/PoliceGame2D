@@ -618,6 +618,20 @@ class TestHealth:
         assert res.status_code == 200
         assert 'Kontrol Paneli' in res.text
 
+    def test_operator_route_is_touch_friendly_and_protected(self):
+        res = client.get("/operator")
+        assert res.status_code == 200
+        assert "Kafe ekibi hızlı başlangıç ekranı" in res.text
+        assert "OYUNU BAŞLAT" in res.text
+        assert "capture_photos: true" in res.text
+        assert "photo_consent: true" in res.text
+        assert "X-Photo-CSRF" in res.text
+        assert res.headers["cache-control"] == "private, no-store"
+        assert res.headers["x-frame-options"] == "DENY"
+
+        alias = client.get("/kafe")
+        assert alias.status_code == 200
+
     def test_screen_route(self):
         res = client.get("/screen")
         assert res.status_code == 200
