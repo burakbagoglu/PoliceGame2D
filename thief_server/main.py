@@ -9,6 +9,7 @@ import time
 import threading
 import subprocess
 import base64
+import tempfile
 import binascii
 from datetime import datetime
 from typing import Any, Dict, Set, Optional, Literal
@@ -27,6 +28,7 @@ from scene_manager import (
 from scene_audio_runtime import SceneAudioRuntime
 from client_telemetry import ClientTelemetryStore
 from client_commands import ClientCommandStore
+from client_settings import ClientSettingsStore
 from runtime_state import RuntimeStateStore
 from photo_manager import PhotoSessionManager
 from photo_auth import PhotoAccessGuard
@@ -43,10 +45,14 @@ from spawn_engine import (
 
 # ============== Config ==============
 
+def _config_path(filepath: str = "config.json") -> str:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.environ.get("THIEF_SERVER_CONFIG") or os.path.join(script_dir, filepath)
+
+
 def load_config(filepath: str = "config.json") -> dict:
     """Config dosyasını yükle"""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    config_path = os.environ.get("THIEF_SERVER_CONFIG") or os.path.join(script_dir, filepath)
+    config_path = _config_path(filepath)
 
     if os.path.exists(config_path):
         with open(config_path, "r", encoding="utf-8") as f:
@@ -98,9 +104,46 @@ def load_config(filepath: str = "config.json") -> dict:
     return config
 
 
+CONFIG_PATH = _config_path()
 CONFIG = load_config()
 GAME_SCREEN_COUNT = 8
 CONFIG["num_screens"] = GAME_SCREEN_COUNT
+CONFIG_WRITE_LOCK = threading.RLock()
+
+
+def persist_server_config(updates: Dict[str, Any]):
+    """Merge validated dashboard settings into config.json using an atomic replace."""
+    def merge(target: dict, source: dict):
+        for key, value in source.items():
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
+                merge(target[key], value)
+            else:
+                target[key] = value
+
+    with CONFIG_WRITE_LOCK:
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+                document = json.load(handle)
+        except FileNotFoundError:
+            document = dict(CONFIG)
+        if not isinstance(document, dict):
+            raise ValueError("Server config root must be an object")
+        merge(document, updates)
+        directory = os.path.dirname(os.path.abspath(CONFIG_PATH))
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=".config.", suffix=".tmp", dir=directory
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(document, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, CONFIG_PATH)
+        finally:
+            if os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+        merge(CONFIG, updates)
 
 
 # ============== Models ==============
@@ -157,6 +200,39 @@ class AudioTestRequest(BaseModel):
     sound_type: Literal["hit", "start", "success", "end", "go", "music"]
 
 
+class ClientPlayareaSettingsRequest(BaseModel):
+    enabled: bool = False
+    mode: Literal["manual_px", "physical"] = "manual_px"
+    x: int = Field(default=0, ge=0, le=7680)
+    y: int = Field(default=0, ge=0, le=4320)
+    width: int = Field(default=1280, ge=1, le=7680)
+    height: int = Field(default=720, ge=1, le=4320)
+    screen_diagonal_in: float = Field(default=24.0, ge=5.0, le=100.0)
+    plexi_width_cm: float = Field(default=50.0, ge=1.0, le=300.0)
+    plexi_height_cm: float = Field(default=30.0, ge=1.0, le=300.0)
+    align_x: Literal["left", "center", "right", "custom"] = "center"
+    align_y: Literal["top", "center", "bottom", "custom"] = "center"
+    margin_left_cm: float = Field(default=0.0, ge=0.0, le=300.0)
+    margin_top_cm: float = Field(default=0.0, ge=0.0, le=300.0)
+
+
+class ClientManagedSettingsRequest(BaseModel):
+    fps: int = Field(default=30, ge=15, le=60)
+    performance_profile: Literal["pi_zero_2w", "balanced", "high"] = "pi_zero_2w"
+    render_width: int = Field(default=1280, ge=320, le=1920)
+    render_height: int = Field(default=720, ge=180, le=1080)
+    adaptive_quality: bool = True
+    min_fps: float = Field(default=24.0, ge=15.0, le=60.0)
+    playarea: ClientPlayareaSettingsRequest = Field(
+        default_factory=ClientPlayareaSettingsRequest
+    )
+
+
+class ClientSettingsBatchRequest(BaseModel):
+    screen_ids: list[int] = Field(min_length=1, max_length=GAME_SCREEN_COUNT)
+    settings: ClientManagedSettingsRequest
+
+
 class SceneDraftRequest(BaseModel):
     document: Dict[str, Any]
     base_revision: Optional[int] = Field(default=None, ge=1)
@@ -197,6 +273,11 @@ class ClientTelemetryRequest(BaseModel):
     quality_level: str = Field(default="", max_length=16)
     render_width: int = Field(default=0, ge=0, le=7680)
     render_height: int = Field(default=0, ge=0, le=4320)
+    config_fps: int = Field(default=0, ge=0, le=240)
+    adaptive_quality: bool = True
+    min_fps: float = Field(default=0, ge=0, le=240)
+    remote_settings_revision: int = Field(default=0, ge=0)
+    playarea: Dict[str, Any] = Field(default_factory=dict)
     output_width: int = Field(default=0, ge=0, le=7680)
     output_height: int = Field(default=0, ge=0, le=4320)
     direct_render: bool = False
@@ -209,6 +290,7 @@ class ClientTelemetryRequest(BaseModel):
 class ClientPollRequest(BaseModel):
     screen_id: int = Field(ge=1, le=GAME_SCREEN_COUNT)
     telemetry: Optional[Dict[str, Any]] = None
+    settings_revision: int = Field(default=0, ge=0)
 
 
 class PhotoLoginRequest(BaseModel):
@@ -380,6 +462,12 @@ client_telemetry = ClientTelemetryStore(
     offline_after_seconds=CONFIG.get("client_offline_after_seconds", 15)
 )
 client_commands = ClientCommandStore()
+client_settings = ClientSettingsStore(
+    os.environ.get(
+        "THIEF_CLIENT_SETTINGS_FILE",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "client_settings.json"),
+    )
+)
 runtime_state_store = RuntimeStateStore(
     os.environ.get(
         "THIEF_RUNTIME_STATE_FILE",
@@ -998,6 +1086,10 @@ async def set_piezo_config(req: PiezoConfigRequest):
     if req.refractory_ms < 50 or req.refractory_ms > 5000:
         raise HTTPException(status_code=400, detail="Refractory 50-5000ms arasında olmalı")
 
+    persist_server_config({
+        "default_piezo_threshold": req.threshold,
+        "default_piezo_refractory_ms": req.refractory_ms,
+    })
     piezo_config.update(req.threshold, req.refractory_ms)
 
     if CONFIG.get("debug"):
@@ -1049,6 +1141,7 @@ async def combined_client_poll(req: ClientPollRequest):
         "piezo_config": {"changed": bool(piezo_state), **(piezo_state or {})},
         "heartbeat": heartbeat,
         "command": client_commands.poll(req.screen_id),
+        "client_settings": client_settings.payload(req.screen_id, req.settings_revision),
     }
 
 
@@ -1056,6 +1149,42 @@ async def combined_client_poll(req: ClientPollRequest):
 async def get_client_status():
     """Dashboard için çevrimiçi istemci, FPS, sıcaklık ve piezo özetini getir."""
     return client_telemetry.list(GAME_SCREEN_COUNT)
+
+
+@app.get("/api/clients/{screen_id}/settings")
+async def get_client_settings(screen_id: int):
+    if not 1 <= int(screen_id) <= GAME_SCREEN_COUNT:
+        raise HTTPException(status_code=422, detail="Ekran numarası geçersiz")
+    desired = client_settings.get(screen_id)
+    telemetry = client_telemetry.list(GAME_SCREEN_COUNT)["clients"][screen_id - 1]
+    return {
+        "screen_id": screen_id,
+        "desired": desired,
+        "applied_revision": int(telemetry.get("remote_settings_revision", 0) or 0),
+        "online": bool(telemetry.get("online", False)),
+        "current": {
+            "fps": telemetry.get("config_fps", 0),
+            "performance_profile": telemetry.get("performance_profile", ""),
+            "render_width": telemetry.get("render_width", 0),
+            "render_height": telemetry.get("render_height", 0),
+            "adaptive_quality": telemetry.get("adaptive_quality", True),
+            "min_fps": telemetry.get("min_fps", 0),
+            "playarea": telemetry.get("playarea", {}),
+        },
+    }
+
+
+@app.post("/api/clients/settings")
+async def set_client_settings(req: ClientSettingsBatchRequest):
+    screen_ids = sorted(set(int(value) for value in req.screen_ids))
+    if any(value < 1 or value > GAME_SCREEN_COUNT for value in screen_ids):
+        raise HTTPException(status_code=422, detail="Ekran numarası geçersiz")
+    settings = req.settings.model_dump()
+    records = {
+        str(screen_id): client_settings.set(screen_id, settings)
+        for screen_id in screen_ids
+    }
+    return {"success": True, "screen_ids": screen_ids, "records": records}
 
 
 @app.post("/api/clients/{screen_id}/restart")
@@ -1102,7 +1231,7 @@ async def field_check():
             temperature = client.get("cpu_temp_c")
             if temperature is not None and float(temperature) >= 78:
                 issues.append("yüksek sıcaklık")
-            if client.get("app_version") != "scene-engine-v8-dirty-rect":
+            if client.get("app_version") != "scene-engine-v9-remote-config":
                 issues.append("client sürümü eski")
             if float(client.get("fps", 0) or 0) < 15:
                 issues.append("FPS düşük")
@@ -1313,6 +1442,12 @@ async def get_audio_status():
 @app.post("/api/audio/config")
 async def set_audio_config(req: AudioConfigRequest):
     """Çalışma zamanı ses seviyelerini uygula."""
+    persist_server_config({"audio": {
+        "enabled": req.enabled,
+        "master_volume": req.master_volume,
+        "music_volume": req.music_volume,
+        "sfx_volume": req.sfx_volume,
+    }})
     status = audio_manager.configure(
         enabled=req.enabled,
         master_volume=req.master_volume,
@@ -2234,6 +2369,76 @@ DASHBOARD_HTML = """
                 <p style="opacity:.72;margin-top:10px">Canlı grafik için Arduino seri hattından <code>PIEZO:123</code> veya <code>RAW:123</code> satırları gönderilmelidir. Öneri yalnızca sliderı değiştirir; Uygula düğmesine basılmadan cihazlara gönderilmez.</p>
             </div>
 
+            <div class="card grid-full">
+                <h3>Client Ayarları</h3>
+                <p style="opacity:.72;margin-top:0">FPS, render profili ve oynanabilir alan serverda kalıcı saklanır. Client çevrimdışıysa bağlandığında alır ve bir kez yeniden başlar. Screen ID, server adresi, seri port ve Wi-Fi kurulum tarafından kilitlidir.</p>
+                <div class="controls" style="margin-bottom:14px">
+                    <label>Ekran:</label>
+                    <select id="client-settings-screen" onchange="loadClientSettings()">
+                        <option value="1">Ekran 1</option><option value="2">Ekran 2</option>
+                        <option value="3">Ekran 3</option><option value="4">Ekran 4</option>
+                        <option value="5">Ekran 5</option><option value="6">Ekran 6</option>
+                        <option value="7">Ekran 7</option><option value="8">Ekran 8</option>
+                    </select>
+                    <label><input type="checkbox" id="client-settings-all"> Aynı ayarı 8 ekrana uygula</label>
+                    <span id="client-settings-status">Ayar bekleniyor…</span>
+                </div>
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px">
+                    <label>Performans profili
+                        <select id="client-profile" style="display:block;width:100%;margin-top:5px">
+                            <option value="pi_zero_2w">Pi Zero 2 W</option>
+                            <option value="balanced">Dengeli</option>
+                            <option value="high">Yüksek kalite</option>
+                        </select>
+                    </label>
+                    <label>FPS sınırı
+                        <input id="client-fps" type="number" min="15" max="60" value="30" style="display:block;width:100%;margin-top:5px">
+                    </label>
+                    <label>Render genişliği
+                        <input id="client-render-width" type="number" min="320" max="1920" value="1280" style="display:block;width:100%;margin-top:5px">
+                    </label>
+                    <label>Render yüksekliği
+                        <input id="client-render-height" type="number" min="180" max="1080" value="720" style="display:block;width:100%;margin-top:5px">
+                    </label>
+                    <label>Minimum FPS
+                        <input id="client-min-fps" type="number" min="15" max="60" step="1" value="24" style="display:block;width:100%;margin-top:5px">
+                    </label>
+                    <label style="align-self:end;padding-bottom:8px"><input id="client-adaptive-quality" type="checkbox" checked> Otomatik kalite düşür/yükselt</label>
+                </div>
+
+                <h4 style="margin:20px 0 10px">Oynanabilir alan</h4>
+                <div class="controls" style="margin-bottom:12px">
+                    <label><input id="client-playarea-enabled" type="checkbox" onchange="toggleClientPlayarea()"> Özel alan kullan</label>
+                    <label>Ölçü modu:</label>
+                    <select id="client-playarea-mode" onchange="toggleClientPlayarea()">
+                        <option value="manual_px">Piksel</option>
+                        <option value="physical">Fiziksel ölçü</option>
+                    </select>
+                </div>
+                <div id="client-playarea-manual" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px">
+                    <label>X <input id="client-playarea-x" type="number" min="0" max="7680" value="0" style="display:block;width:100%;margin-top:5px"></label>
+                    <label>Y <input id="client-playarea-y" type="number" min="0" max="4320" value="0" style="display:block;width:100%;margin-top:5px"></label>
+                    <label>Genişlik <input id="client-playarea-width" type="number" min="1" max="7680" value="1920" style="display:block;width:100%;margin-top:5px"></label>
+                    <label>Yükseklik <input id="client-playarea-height" type="number" min="1" max="4320" value="1080" style="display:block;width:100%;margin-top:5px"></label>
+                </div>
+                <div id="client-playarea-physical" style="display:none;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px">
+                    <label>Ekran köşegeni (inç) <input id="client-screen-diagonal" type="number" min="5" max="100" step="0.1" value="24" style="display:block;width:100%;margin-top:5px"></label>
+                    <label>Pleksi genişliği (cm) <input id="client-plexi-width" type="number" min="1" max="300" step="0.1" value="50" style="display:block;width:100%;margin-top:5px"></label>
+                    <label>Pleksi yüksekliği (cm) <input id="client-plexi-height" type="number" min="1" max="300" step="0.1" value="30" style="display:block;width:100%;margin-top:5px"></label>
+                    <label>Yatay hizalama
+                        <select id="client-align-x" style="display:block;width:100%;margin-top:5px"><option value="left">Sol</option><option value="center">Orta</option><option value="right">Sağ</option><option value="custom">Özel</option></select>
+                    </label>
+                    <label>Dikey hizalama
+                        <select id="client-align-y" style="display:block;width:100%;margin-top:5px"><option value="top">Üst</option><option value="center">Orta</option><option value="bottom">Alt</option><option value="custom">Özel</option></select>
+                    </label>
+                    <label>Soldan boşluk (cm) <input id="client-margin-left" type="number" min="0" max="300" step="0.1" value="0" style="display:block;width:100%;margin-top:5px"></label>
+                    <label>Üstten boşluk (cm) <input id="client-margin-top" type="number" min="0" max="300" step="0.1" value="0" style="display:block;width:100%;margin-top:5px"></label>
+                </div>
+                <div class="controls" style="margin-top:16px">
+                    <button class="btn btn-blue" onclick="saveClientSettings()">Ayarı kaydet ve uygula</button>
+                </div>
+            </div>
+
             <!-- Son Olaylar -->
             <div class="card grid-full">
                 <h3>📜 Son Olaylar</h3>
@@ -2465,6 +2670,109 @@ DASHBOARD_HTML = """
                 alert(error.message || 'Client güncellenemedi');
             }
         }
+
+        function toggleClientPlayarea() {
+            const enabled = document.getElementById('client-playarea-enabled').checked;
+            const physical = document.getElementById('client-playarea-mode').value === 'physical';
+            document.getElementById('client-playarea-manual').style.opacity = enabled ? '1' : '.45';
+            document.getElementById('client-playarea-physical').style.opacity = enabled ? '1' : '.45';
+            document.getElementById('client-playarea-manual').style.display = physical ? 'none' : 'grid';
+            document.getElementById('client-playarea-physical').style.display = physical ? 'grid' : 'none';
+        }
+
+        function setClientSettingsForm(settings) {
+            settings = settings || {};
+            const playarea = settings.playarea || {};
+            document.getElementById('client-profile').value = settings.performance_profile || 'pi_zero_2w';
+            document.getElementById('client-fps').value = settings.fps || 30;
+            document.getElementById('client-render-width').value = settings.render_width || 1280;
+            document.getElementById('client-render-height').value = settings.render_height || 720;
+            document.getElementById('client-min-fps').value = settings.min_fps || 24;
+            document.getElementById('client-adaptive-quality').checked = settings.adaptive_quality !== false;
+            document.getElementById('client-playarea-enabled').checked = Boolean(playarea.enabled);
+            document.getElementById('client-playarea-mode').value = playarea.mode || 'manual_px';
+            document.getElementById('client-playarea-x').value = playarea.x ?? 0;
+            document.getElementById('client-playarea-y').value = playarea.y ?? 0;
+            document.getElementById('client-playarea-width').value = playarea.width || 1920;
+            document.getElementById('client-playarea-height').value = playarea.height || 1080;
+            document.getElementById('client-screen-diagonal').value = playarea.screen_diagonal_in || 24;
+            document.getElementById('client-plexi-width').value = playarea.plexi_width_cm || 50;
+            document.getElementById('client-plexi-height').value = playarea.plexi_height_cm || 30;
+            document.getElementById('client-align-x').value = playarea.align_x || 'center';
+            document.getElementById('client-align-y').value = playarea.align_y || 'center';
+            document.getElementById('client-margin-left').value = playarea.margin_left_cm ?? 0;
+            document.getElementById('client-margin-top').value = playarea.margin_top_cm ?? 0;
+            toggleClientPlayarea();
+        }
+
+        async function loadClientSettings() {
+            const screenId = parseInt(document.getElementById('client-settings-screen').value) || 1;
+            const status = document.getElementById('client-settings-status');
+            status.textContent = 'Yükleniyor…';
+            try {
+                const response = await fetch(`/api/clients/${screenId}/settings`);
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.detail || 'Ayar alınamadı');
+                const settings = data.desired?.settings || data.current || {};
+                setClientSettingsForm(settings);
+                const desiredRevision = data.desired?.revision || 0;
+                status.textContent = desiredRevision
+                    ? `Revizyon ${data.applied_revision}/${desiredRevision} · ${data.online ? 'bağlı' : 'çevrimdışı'}`
+                    : `Henüz uzaktan ayar yok · ${data.online ? 'bağlı' : 'çevrimdışı'}`;
+            } catch (error) {
+                status.textContent = error.message || 'Ayar yüklenemedi';
+            }
+        }
+
+        function readClientSettingsForm() {
+            const number = id => Number(document.getElementById(id).value);
+            return {
+                fps: number('client-fps'),
+                performance_profile: document.getElementById('client-profile').value,
+                render_width: number('client-render-width'),
+                render_height: number('client-render-height'),
+                adaptive_quality: document.getElementById('client-adaptive-quality').checked,
+                min_fps: number('client-min-fps'),
+                playarea: {
+                    enabled: document.getElementById('client-playarea-enabled').checked,
+                    mode: document.getElementById('client-playarea-mode').value,
+                    x: number('client-playarea-x'),
+                    y: number('client-playarea-y'),
+                    width: number('client-playarea-width'),
+                    height: number('client-playarea-height'),
+                    screen_diagonal_in: number('client-screen-diagonal'),
+                    plexi_width_cm: number('client-plexi-width'),
+                    plexi_height_cm: number('client-plexi-height'),
+                    align_x: document.getElementById('client-align-x').value,
+                    align_y: document.getElementById('client-align-y').value,
+                    margin_left_cm: number('client-margin-left'),
+                    margin_top_cm: number('client-margin-top'),
+                },
+            };
+        }
+
+        async function saveClientSettings() {
+            const selected = parseInt(document.getElementById('client-settings-screen').value) || 1;
+            const all = document.getElementById('client-settings-all').checked;
+            const screenIds = all ? Array.from({length: 8}, (_, index) => index + 1) : [selected];
+            if (all && !confirm('Bu performans ve oynanabilir alan ayarı 8 ekranın tamamına uygulansın mı?')) return;
+            const status = document.getElementById('client-settings-status');
+            status.textContent = 'Kaydediliyor…';
+            try {
+                const response = await fetch('/api/clients/settings', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({screen_ids: screenIds, settings: readClientSettingsForm()}),
+                });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.detail?.[0]?.msg || data.detail || 'Ayar kaydedilemedi');
+                status.textContent = `${screenIds.length} ekran için kaydedildi; bağlı clientlar yeniden başlayacak.`;
+                setTimeout(loadClientSettings, 1800);
+            } catch (error) {
+                status.textContent = error.message || 'Ayar kaydedilemedi';
+            }
+        }
+
         async function runFieldCheck() {
             const box = document.getElementById('field-check-result');
             box.style.display = 'block';
@@ -2750,6 +3058,7 @@ DASHBOARD_HTML = """
         loadPiezoConfig();
         loadAudioStatus(true);
         loadClientTelemetry();
+        loadClientSettings();
 
         setInterval(updateStatus, 1000);
         setInterval(loadClientTelemetry, 2000);

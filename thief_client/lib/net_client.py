@@ -56,6 +56,7 @@ class NetClient:
         scene_cache_dir: Optional[str] = None,
         debug: bool = False,
         telemetry_provider=None,
+        settings_revision: int = 0,
     ):
         """
         Args:
@@ -81,6 +82,7 @@ class NetClient:
         self.offline_flush_interval_s = 2.0
         self._stop_event = threading.Event()
         self.telemetry_provider = telemetry_provider
+        self.settings_revision = max(0, int(settings_revision or 0))
         self._started_at = time.monotonic()
         self._last_heartbeat = 0.0
         self.heartbeat_interval_s = 5.0
@@ -100,6 +102,9 @@ class NetClient:
 
         # Dashboard'dan gelen sınırlı operasyon komutları
         self.command_queue: queue.Queue = queue.Queue(maxsize=2)
+
+        # Dashboard'dan gelen kalıcı, allowlist ile sınırlı client ayarları
+        self.remote_config_queue: queue.Queue = queue.Queue(maxsize=1)
 
         # Server skor reset bildirimi
         self.score_reset_queue: queue.Queue = queue.Queue()
@@ -231,6 +236,18 @@ class NetClient:
             while True:
                 try:
                     latest = self.command_queue.get_nowait()
+                except queue.Empty:
+                    return latest
+        except queue.Empty:
+            return None
+
+    def consume_remote_config(self) -> Optional[Dict[str, Any]]:
+        """Dashboard'dan gelen son kalıcı ayar belgesini ana threade aktar."""
+        try:
+            latest = self.remote_config_queue.get_nowait()
+            while True:
+                try:
+                    latest = self.remote_config_queue.get_nowait()
                 except queue.Empty:
                     return latest
         except queue.Empty:
@@ -407,7 +424,11 @@ class NetClient:
         try:
             response = self._poll_http.post(
                 f"{self.server_base_url}/api/client/poll",
-                json={"screen_id": self.screen_id, "telemetry": telemetry},
+                json={
+                    "screen_id": self.screen_id,
+                    "telemetry": telemetry,
+                    "settings_revision": self.settings_revision,
+                },
                 timeout=3.0,
             )
             if response.status_code in (404, 405):
@@ -421,6 +442,7 @@ class NetClient:
             self._apply_spawn_payload(data.get("spawn_state", {}))
             self._apply_piezo_payload(data.get("piezo_config", {}))
             self._apply_command_payload(data.get("command"))
+            self._apply_remote_config_payload(data.get("client_settings"))
             if include_telemetry:
                 self._last_heartbeat = now
             return True
@@ -485,6 +507,27 @@ class NetClient:
         })
         if self.debug:
             print(f"[NetClient] Operasyon komutu alındı: {command_type}")
+
+    def _apply_remote_config_payload(self, data):
+        if not isinstance(data, dict) or not data.get("changed"):
+            return
+        if not isinstance(data.get("settings"), dict):
+            return
+        try:
+            revision = int(data.get("revision", 0))
+        except (TypeError, ValueError):
+            return
+        if revision < 1:
+            return
+        if self.remote_config_queue.full():
+            self._clear_queue(self.remote_config_queue)
+        self.remote_config_queue.put({
+            "changed": True,
+            "revision": revision,
+            "settings": data["settings"],
+        })
+        if self.debug:
+            print(f"[NetClient] Client ayar revizyonu alındı: {revision}")
 
     def _apply_piezo_payload(self, data: dict):
         if not data.get("changed"):

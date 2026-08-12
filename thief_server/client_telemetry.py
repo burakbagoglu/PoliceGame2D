@@ -43,6 +43,11 @@ class ClientTelemetryStore:
             "quality_level": str(payload.get("quality_level", ""))[:16],
             "render_width": max(0, min(7680, int(payload.get("render_width", 0) or 0))),
             "render_height": max(0, min(4320, int(payload.get("render_height", 0) or 0))),
+            "config_fps": max(0, min(240, int(payload.get("config_fps", 0) or 0))),
+            "adaptive_quality": bool(payload.get("adaptive_quality", True)),
+            "min_fps": round(max(0.0, min(240.0, float(payload.get("min_fps", 0) or 0))), 1),
+            "remote_settings_revision": max(0, int(payload.get("remote_settings_revision", 0) or 0)),
+            "playarea": self._clean_playarea(payload.get("playarea")),
             "output_width": max(0, min(7680, int(payload.get("output_width", 0) or 0))),
             "output_height": max(0, min(4320, int(payload.get("output_height", 0) or 0))),
             "direct_render": bool(payload.get("direct_render", False)),
@@ -82,6 +87,26 @@ class ClientTelemetryStore:
             "sample_count": max(0, int(value.get("sample_count", len(samples)) or 0)),
             "hit_count": max(0, int(value.get("hit_count", 0) or 0)),
             "samples": samples,
+        }
+
+    @staticmethod
+    def _clean_playarea(value: Any) -> dict:
+        if not isinstance(value, dict):
+            return {}
+        return {
+            "enabled": bool(value.get("enabled", False)),
+            "mode": str(value.get("mode", "manual_px"))[:16],
+            "x": max(0, min(7680, int(value.get("x", 0) or 0))),
+            "y": max(0, min(4320, int(value.get("y", 0) or 0))),
+            "width": max(0, min(7680, int(value.get("width", 0) or 0))),
+            "height": max(0, min(4320, int(value.get("height", 0) or 0))),
+            "screen_diagonal_in": max(5.0, min(100.0, float(value.get("screen_diagonal_in", 24) or 24))),
+            "plexi_width_cm": max(1.0, min(300.0, float(value.get("plexi_width_cm", 50) or 50))),
+            "plexi_height_cm": max(1.0, min(300.0, float(value.get("plexi_height_cm", 30) or 30))),
+            "align_x": str(value.get("align_x", "center"))[:12],
+            "align_y": str(value.get("align_y", "center"))[:12],
+            "margin_left_cm": max(0.0, min(300.0, float(value.get("margin_left_cm", 0) or 0))),
+            "margin_top_cm": max(0.0, min(300.0, float(value.get("margin_top_cm", 0) or 0))),
         }
 
     def _with_status(self, client: dict, now: float) -> dict:

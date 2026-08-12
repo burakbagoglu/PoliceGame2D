@@ -31,6 +31,7 @@ copy_if_present "$SCRIPT_DIR/config.json" config.json
 copy_if_present "$SCRIPT_DIR/scene_data" scene_data
 copy_if_present "$SCRIPT_DIR/photo_sessions" photo_sessions
 copy_if_present "$SCRIPT_DIR/runtime_state.json" runtime_state.json
+copy_if_present "$SCRIPT_DIR/client_settings.json" client_settings.json
 copy_if_present /etc/police-game/photos.env photos.env
 
 cat >"$STAGING/manifest.txt" <<EOF

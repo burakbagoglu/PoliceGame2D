@@ -28,6 +28,7 @@ from lib.game import GameLogic, GameState
 from lib.effects import FloatingText, Particle, Confetti
 from lib.scene_renderer import SceneRenderer
 from lib.setup_wizard import SetupWizard
+from lib.remote_config import apply_remote_settings
 import random
 
 
@@ -136,6 +137,9 @@ class ThiefGame:
             scene_cache_dir=os.path.join(self.script_dir, "scene_cache"),
             debug=self.config.debug,
             telemetry_provider=self._build_telemetry,
+            settings_revision=int(
+                self.raw.get("remote_settings_revision", 0) or 0
+            ),
         )
         self.net_client.start()
         self._last_scene_payload = None
@@ -186,6 +190,12 @@ class ThiefGame:
             "quality_level": self.quality_level,
             "render_width": getattr(self, "view_w", self.config.render_width),
             "render_height": getattr(self, "view_h", self.config.render_height),
+            "config_fps": self.config.fps,
+            "adaptive_quality": self.config.adaptive_quality,
+            "min_fps": self.config.min_fps,
+            "playarea": self.config.playarea.to_dict(),
+            "remote_settings_revision": int(
+                self.raw.get("remote_settings_revision", 0) or 0),
             "output_width": getattr(self, "output_view_w", self.screen_width),
             "output_height": getattr(self, "output_view_h", self.screen_height),
             "direct_render": bool(getattr(self, "direct_render", False)),
@@ -195,7 +205,7 @@ class ThiefGame:
                 2,
             ),
             "dirty_rect_count": int(getattr(self, "dirty_rect_count", 0)),
-            "app_version": "scene-engine-v8-dirty-rect",
+            "app_version": "scene-engine-v9-remote-config",
         }
         telemetry.update(self._read_update_status())
         return telemetry
@@ -681,6 +691,21 @@ class ThiefGame:
                 if command_type == "update":
                     print("[Client] Guvenli uzaktan guncelleme komutu alindi.")
                     self._request_remote_update()
+
+            remote_config = self.net_client.consume_remote_config()
+            if remote_config:
+                try:
+                    changed = apply_remote_settings(
+                        self.config_file,
+                        remote_config,
+                    )
+                except (OSError, ValueError, TypeError) as exc:
+                    print(f"[Client] Uzaktan ayar uygulanamadi: {exc}")
+                else:
+                    if changed:
+                        print("[Client] Uzaktan ayar kaydedildi; yeniden baslatiliyor.")
+                        self.running = False
+                        break
 
             # Hit kontrolü
             if self.hit_input.get_hit() and not self.net_client.server_screen_complete:

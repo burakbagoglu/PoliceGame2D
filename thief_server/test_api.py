@@ -1,6 +1,7 @@
 """
 Server API endpoint testleri - FastAPI TestClient ile
 """
+import json
 import time
 import base64
 import pytest
@@ -18,6 +19,7 @@ def reset_state(monkeypatch, tmp_path):
     from photo_auth import PhotoAccessGuard
     from photo_manager import PhotoSessionManager
     from runtime_state import RuntimeStateStore
+    from client_settings import ClientSettingsStore
 
     def fake_capture(path):
         Image.new("RGB", (960, 540), (30, 100, 190)).save(path, "JPEG", quality=88)
@@ -31,6 +33,14 @@ def reset_state(monkeypatch, tmp_path):
         "runtime_state_store",
         RuntimeStateStore(tmp_path / "runtime_state.json"),
     )
+    monkeypatch.setattr(
+        main,
+        "client_settings",
+        ClientSettingsStore(tmp_path / "client_settings.json"),
+    )
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(main.CONFIG), encoding="utf-8")
+    monkeypatch.setattr(main, "CONFIG_PATH", str(config_path))
     monkeypatch.setattr(main, "photo_guard", PhotoAccessGuard(pin="123456"))
     client.cookies.clear()
     score_manager.reset()
@@ -508,6 +518,11 @@ class TestPiezoConfigAPI:
         data = res.json()
         assert data['success'] is True
         assert data['threshold'] == 150
+        import main
+        with open(main.CONFIG_PATH, encoding="utf-8") as handle:
+            persisted = json.load(handle)
+        assert persisted["default_piezo_threshold"] == 150
+        assert persisted["default_piezo_refractory_ms"] == 300
 
     def test_set_config_invalid_threshold(self):
         res = client.post("/api/piezo/config", json={
@@ -567,6 +582,10 @@ class TestAudioAPI:
         assert res.status_code == 200
         assert res.json()["success"] is True
         assert captured["master_volume"] == 0.7
+        import main
+        with open(main.CONFIG_PATH, encoding="utf-8") as handle:
+            persisted = json.load(handle)
+        assert persisted["audio"]["master_volume"] == 0.7
 
     @pytest.mark.parametrize("field,value", [
         ("master_volume", -0.1),
@@ -735,7 +754,7 @@ def test_online_client_can_receive_restart_command(monkeypatch):
     telemetry.update(3, {
         "fps": 30,
         "serial_connected": True,
-        "app_version": "scene-engine-v8-dirty-rect",
+        "app_version": "scene-engine-v9-remote-config",
     })
     monkeypatch.setattr(main, "client_telemetry", telemetry)
     monkeypatch.setattr(main, "client_commands", ClientCommandStore())
@@ -771,7 +790,7 @@ def test_field_check_combines_clients_audio_and_camera(monkeypatch):
         telemetry.update(screen_id, {
             "fps": 30,
             "serial_connected": True,
-            "app_version": "scene-engine-v8-dirty-rect",
+            "app_version": "scene-engine-v9-remote-config",
             "cpu_temp_c": 55,
         })
     monkeypatch.setattr(main, "client_telemetry", telemetry)
@@ -810,7 +829,7 @@ def test_client_update_requires_operator_login_and_queues_allowlisted_command(mo
     telemetry.update(3, {
         "fps": 30,
         "serial_connected": True,
-        "app_version": "scene-engine-v8-dirty-rect",
+        "app_version": "scene-engine-v9-remote-config",
         "update_state": "idle",
     })
     monkeypatch.setattr(main, "client_telemetry", telemetry)
@@ -937,3 +956,53 @@ def test_screen_completion_creates_protected_session_photo():
         f"/api/photo-sessions/{session_id}", headers={"X-Photo-CSRF": csrf}
     )
     assert deleted.status_code == 200
+
+
+class TestClientSettingsAPI:
+    def test_settings_are_saved_and_delivered_until_client_applies_revision(self):
+        payload = {
+            "screen_ids": [3],
+            "settings": {
+                "fps": 30,
+                "performance_profile": "pi_zero_2w",
+                "render_width": 1200,
+                "render_height": 675,
+                "adaptive_quality": True,
+                "min_fps": 23,
+                "playarea": {
+                    "enabled": True,
+                    "mode": "manual_px",
+                    "x": 10,
+                    "y": 20,
+                    "width": 1100,
+                    "height": 620,
+                },
+            },
+        }
+        saved = client.post("/api/clients/settings", json=payload)
+        assert saved.status_code == 200
+        assert saved.json()["records"]["3"]["revision"] == 1
+
+        pending = client.post("/api/client/poll", json={
+            "screen_id": 3,
+            "settings_revision": 0,
+        })
+        assert pending.status_code == 200
+        assert pending.json()["client_settings"]["changed"] is True
+        assert pending.json()["client_settings"]["settings"]["render_width"] == 1200
+
+        applied = client.post("/api/client/poll", json={
+            "screen_id": 3,
+            "settings_revision": 1,
+        })
+        assert applied.json()["client_settings"] == {
+            "changed": False,
+            "revision": 1,
+        }
+
+    def test_invalid_client_settings_are_rejected(self):
+        response = client.post("/api/clients/settings", json={
+            "screen_ids": [1],
+            "settings": {"fps": 200},
+        })
+        assert response.status_code == 422
