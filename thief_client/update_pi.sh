@@ -127,6 +127,8 @@ NEW_VERSION="$(git -C "${TMP_ROOT}/source" rev-parse --short=12 HEAD)"
 log "Yeni surum dogrulaniyor: ${NEW_VERSION}"
 [[ -f "${TMP_ROOT}/source/thief_client/main.py" ]] || fail "Client main.py pakette yok."
 [[ -f "${TMP_ROOT}/source/thief_client/update_pi.sh" ]] || fail "Updater pakette yok."
+[[ -f "${TMP_ROOT}/source/thief_client/assets/thief.png" ]] \
+    || fail "Zorunlu hirsiz sprite'i pakette yok."
 python3 -m py_compile \
     "${TMP_ROOT}/source/thief_client/main.py" \
     "${TMP_ROOT}/source/thief_client/lib/"*.py
@@ -155,13 +157,26 @@ fi
 mv -- "${STAGE_ROOT}" "${INSTALL_ROOT}"
 STAGE_ROOT=""
 
+RESTARTS_BEFORE="$(systemctl show thief-game.service --property=NRestarts --value)"
 if ! systemctl restart thief-game.service; then
     fail "thief-game yeniden baslatilamadi."
 fi
-sleep 3
-if ! systemctl is-active --quiet thief-game.service; then
+
+# Pygame yukleme hatalari ilk birkac saniyede ortaya cikabilir. Servisin yalniz
+# anlik olarak active olmasi yeterli degildir; 15 saniye boyunca calisir durumda
+# kalmali ve systemd otomatik restart sayaci artmamalidir.
+for ((attempt = 1; attempt <= 15; attempt++)); do
+    sleep 1
+    if ! systemctl is-active --quiet thief-game.service; then
+        journalctl -u thief-game.service -n 60 --no-pager >&2 || true
+        fail "Yeni client servisi kararlilik kontrolunde durdu (${attempt}. saniye)."
+    fi
+done
+
+RESTARTS_AFTER="$(systemctl show thief-game.service --property=NRestarts --value)"
+if [[ "${RESTARTS_AFTER}" != "${RESTARTS_BEFORE}" ]]; then
     journalctl -u thief-game.service -n 60 --no-pager >&2 || true
-    fail "Yeni client servisi aktif olmadi."
+    fail "Yeni client servisi kararlilik kontrolunde yeniden basladi."
 fi
 
 # Basarili release kendi updater/service dosyalarini da yeniler.

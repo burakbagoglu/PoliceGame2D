@@ -58,11 +58,16 @@ def test_update_scripts_are_argument_free_and_allowlisted():
     helper = (root / "request_update.sh").read_text(encoding="utf-8")
     setup = (root / "setup_pi.sh").read_text(encoding="utf-8")
 
+    assert (root / "assets" / "thief.png").is_file()
+
     assert 'readonly BRANCH="main"' in updater
     assert 'readonly REPO_URL="https://github.com/burakbagoglu/PoliceGame2D.git"' in updater
     assert '[[ "$#" -eq 0 ]]' in updater
     assert "--filter=blob:none --no-checkout --no-tags" in updater
     assert "sparse-checkout set '/thief_client/'" in updater
+    assert "source/thief_client/assets/thief.png" in updater
+    assert "attempt <= 15" in updater
+    assert "--property=NRestarts" in updater
     assert "eval " not in updater
     assert '[ "$#" -eq 0 ]' in helper
     assert "systemctl start --no-block thief-game-update.service" in helper
