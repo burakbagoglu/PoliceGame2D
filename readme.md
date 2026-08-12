@@ -1,317 +1,866 @@
-Interaktif Hırsız Oyunu — Pygame Teknik Dokümanı (v2)
-1) Kapsam
+# Polis Oyunu
+
+Sekiz fiziksel ekranda çalışan, cama yapılan vuruşları algılayan ve yaklaşık 30–40 dakikalık oyun oturumlarını merkezi olarak yöneten interaktif bir çocuk oyunu sistemi.
+
+Her oyun ekranında bir Raspberry Pi Zero 2 W bulunur. Ekrana bağlı piezo/Arduino düzeneği vuruşları algılar, Pygame client hırsız animasyonunu oynatır ve geçerli isabetleri Raspberry Pi 4 servera gönderir. Pi4; oyun durumunu, ekran kotalarını, müziği, kamera çekimlerini, dashboardu, sahne editörünü ve güvenli client güncellemelerini yönetir.
+
+> Bu README’ye Wi-Fi parolası, operatör PIN’i, Tailscale anahtarı, SSH özel anahtarı veya cihaz parolası yazmayın. Örneklerdeki `<...>` alanlarını kendi kurulumunuza göre doldurun.
+
+## İçindekiler
+
+- [Öne çıkan özellikler](#öne-çıkan-özellikler)
+- [Sistem mimarisi](#sistem-mimarisi)
+- [Oyun akışı](#oyun-akışı)
+- [Donanım](#donanım)
+- [Repository yapısı](#repository-yapısı)
+- [Hızlı başlangıç](#hızlı-başlangıç)
+- [Pi4 server kurulumu](#pi4-server-kurulumu)
+- [Pi Zero client kurulumu](#pi-zero-client-kurulumu)
+- [Spectator kurulumu](#spectator-kurulumu)
+- [Dashboard ve operatör ekranları](#dashboard-ve-operatör-ekranları)
+- [Sahne editörü](#sahne-editörü)
+- [Ses ve kamera](#ses-ve-kamera)
+- [Güncelleme sistemi](#güncelleme-sistemi)
+- [Private repository geçişi](#private-repository-geçişi)
+- [Config ve çalışma verileri](#config-ve-çalışma-verileri)
+- [Testler](#testler)
+- [Sorun giderme](#sorun-giderme)
+- [Güvenlik ve veri yönetimi](#güvenlik-ve-veri-yönetimi)
+- [Diğer belgeler](#diğer-belgeler)
+
+## Öne çıkan özellikler
+
+- Sekiz ekranın tamamı çocuk sayısından bağımsız olarak açık kalır.
+- Her ekranın ayrı vurulması gereken hırsız kotası vardır.
+- Kotalar çocuk sayısı ve zorluk profiline göre server tarafından dağıtılır.
+- Bir ekran kotasını bitirdiğinde hırsızın hapiste olduğu jail sahnesine geçer.
+- Eksik veya sonradan bağlanan clientlar oyunun başlamasını engellemez.
+- Event ID tabanlı tekrar koruması aynı vuruşun iki kez sayılmasını önler.
+- Ağ kesintilerinde client event kuyruğu bağlantı gelince tekrar gönderilebilir.
+- Elektrik kesintisinde aktif oyun checkpoint üzerinden kurtarılır.
+- Pi Zero 2 W için 720p, dirty-rect ve static-frozen render optimizasyonları bulunur.
+- Dashboard sekiz clientın FPS, sıcaklık, RAM, render yolu ve update durumunu gösterir.
+- Client ayarları kimlik/ağ alanları korunarak dashboarddan yayınlanabilir.
+- Photoshop benzeri sahne editöründe sürükleme, çoklu seçim, timeline, prefab ve olay kuralları bulunur.
+- Pi4 üzerinde merkezi müzik ve efekt sesleri çalışır.
+- USB kamera, ekran kotası tamamlandığında fotoğraf çekebilir.
+- Oturum fotoğrafları PIN korumalı galeriden görüntülenebilir ve indirilebilir.
+- Clientlar dashboarddan allowlist tabanlı, atomik ve rollback destekli şekilde güncellenebilir.
+- Server, client ve spectator systemd ile açılışta otomatik başlayabilir.
+
+## Sistem mimarisi
+
+```mermaid
+flowchart LR
+    subgraph Clients["8 × Oyun Ekranı"]
+        PZ["Raspberry Pi Zero 2 W\nPygame client"]
+        MCU["Arduino + piezo"]
+        TV["HDMI ekran"]
+        MCU -->|"USB serial: HIT"| PZ
+        PZ --> TV
+    end
+
+    subgraph Server["Merkezi Raspberry Pi 4"]
+        API["FastAPI oyun serverı\n:8078"]
+        GAME["Oyun, kota ve checkpoint"]
+        AUDIO["Müzik + efektler\n3.5 mm analog çıkış"]
+        CAMERA["USB kamera + fotoğraf galerisi"]
+        EDITOR["Dashboard + sahne editörü"]
+        API --- GAME
+        API --- AUDIO
+        API --- CAMERA
+        API --- EDITOR
+    end
+
+    PZ <-->|"HTTP event, poll, telemetri, sahne ve komut"| API
+    API --> SPEC["Spectator / büyük skor ekranı"]
+    OP["Kafe operatörü"] -->|"Tarayıcı"| EDITOR
+```
+
+### Bileşenler
+
+| Bileşen | Görevi | Çalıştığı cihaz |
+|---|---|---|
+| `thief_server` | API, oyun oturumu, kota, skor, dashboard, ses, kamera, galeri ve sahne yayınlama | Raspberry Pi 4 |
+| `thief_client` | Pygame render, seri vuruş okuma, event kuyruğu, telemetri ve sahne cache’i | 8 × Pi Zero 2 W |
+| `thief_spectator` | Seyirci/merkezi skor görünümü | Pi4 veya ayrı ekran cihazı |
+| `arduino` | Piezo sinyalini debounce ederek `HIT` mesajına dönüştürme | Arduino |
+| `sd_card_tool` | Windows üzerinden Pi Zero SD kartı hazırlama | Operatör/geliştirici bilgisayarı |
+
+### Varsayılan ağ modeli
+
+- Pi4 hostname: `server`
+- Server mDNS adresi: `server.local`
+- Server portu: `8078`
+- Client hostname örnekleri: `zero-1` … `zero-8`
+- Oyun ağı: aynı LAN/Wi-Fi
+- Uzaktan bakım: tercihen Tailscale + SSH
+
+Clientlar mümkün olduğunda IP yerine şu adresi kullanır:
+
+```text
+http://server.local:8078
+```
+
+## Oyun akışı
+
+1. Operatör hızlı başlatma veya dashboard ekranını açar.
+2. Oturum adı ve çocuk sayısı girilir.
+3. Server sekiz ekran için hedef hırsız sayılarını hesaplar.
+4. Clientlarda bekleme sahnesi gösterilir.
+5. Başlangıçta “HIRSIZLARI VUR” uyarısı, ardından 3–2–1 geri sayımı oynar.
+6. Oyun aktif olduğunda hırsızlar ekranlarda hareket eder.
+7. Arduino `HIT` ürettiğinde client isabet koşulunu değerlendirir.
+8. Geçerli isabet benzersiz `event_id` ile servera gönderilir.
+9. Server ekran skorunu, toplam skoru ve kalan kotayı günceller.
+10. Ekran kotası tamamlanınca jail sahnesi açılır ve yapılandırılmışsa fotoğraf çekilir.
+11. Sekiz ekranın hedefleri tamamlandığında veya süre dolduğunda sonuç sahnesi açılır.
+12. Oturum verileri ve fotoğrafları dashboard üzerinden incelenebilir.
+
+Bir client çevrimdışıysa diğer ekranlar çalışmaya devam eder. Client sonradan bağlandığında güncel oyun/sahne durumunu serverdan alır.
+
+## Donanım
+
+### Server
+
+- Raspberry Pi 4, en az 2 GB RAM
+- Raspberry Pi OS Bookworm veya uyumlu sürüm
+- Ethernet veya kararlı 5/2.4 GHz ağ bağlantısı
+- 3.5 mm analog ses çıkışı veya desteklenen USB ses kartı
+- İsteğe bağlı USB kamera
+- Yeterli ve kaliteli güç adaptörü
+
+### Her client ekranı
+
+- Raspberry Pi Zero 2 W
+- microSD kart
+- HDMI ekran
+- Arduino
+- Piezo sensör ve cam/pleksi vuruş düzeneği
+- Arduino–Pi USB bağlantısı
+- Kararlı güç adaptörü
+
+### Önerilen client görüntü ayarı
+
+- Fiziksel çıkış: `1280×720`
+- Hedef FPS: `30`
+- Profil: `pi_zero_2w`
+- Kalite: `minimal`
+- Render yolu: statik sahnede `static-frozen`, hareketli sahnede mümkünse `dirty-rect`
+
+1080p çıkış Pi Zero 2 W üzerinde gereksiz ölçekleme ve yüksek P95 çizim süresi oluşturabilir.
+
+## Repository yapısı
+
+```text
+PoliceGame2D/
+├── arduino/                       # Piezo/Arduino kodları
+├── sd_card_tool/                  # Windows SD kart hazırlama aracı
+├── thief-1.0/                     # Kaynak hırsız sprite paketi ve lisansı
+├── thief_client/                  # Pi Zero oyun clientı
+│   ├── assets/                    # Client runtime görselleri
+│   ├── lib/                       # Render, ağ, input ve oyun modülleri
+│   ├── main.py                    # Client giriş noktası
+│   ├── config.json                # Örnek client config’i
+│   ├── setup_pi.sh                # İlk kurulum
+│   ├── update_pi.sh               # Güvenli atomik updater
+│   └── thief-game.service         # Systemd servis şablonu
+├── thief_server/                  # Pi4 merkezi server
+│   ├── main.py                    # FastAPI uygulaması
+│   ├── config.json                # Örnek server config’i
+│   ├── setup_server.sh            # Server kurulum scripti
+│   └── backup_server.sh           # Günlük yedekleme
+├── thief_spectator/               # Spectator görünümü
+├── simulate.py                    # Yerel simülasyon aracı
+├── DASHBOARD_GUIDE.md             # Dashboard kullanım kılavuzu
+├── SCENE_EDITOR_GUIDE.md          # Sahne editörü kılavuzu
+├── PRODUCTION.md                  # Production notları
+└── SISTEM_KURULUM_VE_ISLETIM_REHBERI.md
+```
+
+## Hızlı başlangıç
+
+### Geliştirme bilgisayarına klonlama
+
+Repository public durumdayken:
+
+```bash
+git clone https://github.com/burakbagoglu/PoliceGame2D.git
+cd PoliceGame2D
+```
+
+Repository private olduktan sonra SSH erişimi hazırlanmış bilgisayarda:
+
+```bash
+git clone git@github.com:burakbagoglu/PoliceGame2D.git
+cd PoliceGame2D
+```
+
+### Python ortamı
+
+Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r thief_server\requirements.txt
+python -m pip install -r thief_client\requirements.txt
+```
+
+Linux/macOS:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r thief_server/requirements.txt
+python -m pip install -r thief_client/requirements.txt
+```
+
+### Serverı geliştirme modunda çalıştırma
+
+```bash
+cd thief_server
+python main.py
+```
+
+Tarayıcı:
+
+```text
+http://localhost:8078/dashboard
+```
+
+### Simülasyon
+
+Gerçek Pi/Arduino olmadan temel akışı denemek için:
+
+```bash
+python simulate.py
+```
+
+## Pi4 server kurulumu
+
+Production için ayrıntılı ve güncel komutlar [Sistem Kurulum ve İşletim Rehberi](SISTEM_KURULUM_VE_ISLETIM_REHBERI.md) içinde tutulur. Aşağıdaki bölüm hızlı özettir.
+
+### 1. Hostname
+
+```bash
+sudo hostnamectl set-hostname server
+sudo sed -i 's/^127\.0\.1\.1.*/127.0.1.1\tserver/' /etc/hosts
+```
+
+Terminal istemi `<kullanıcı>@server` şeklinde görünür. Soldaki değer Linux kullanıcı adı, sağdaki değer hostname’dir.
+
+### 2. Repository
+
+```bash
+mkdir -p "$HOME/Desktop"
+cd "$HOME/Desktop"
+git clone --depth 1 --single-branch --branch main \
+  https://github.com/burakbagoglu/PoliceGame2D.git
+cd PoliceGame2D/thief_server
+```
+
+### 3. Kurulum
+
+```bash
+chmod +x setup_server.sh backup_server.sh
+bash setup_server.sh
+```
+
+Repo içindeki servis şablonu tarihsel olarak `User=pi` ve `/home/pi/thief_server` varsayar. Gerçek kullanıcı veya repository yolu farklıysa systemd override zorunludur. Örneğin kullanıcı `server` ise:
+
+```ini
+[Service]
+User=server
+WorkingDirectory=/home/server/Desktop/PoliceGame2D/thief_server
+Environment=
+Environment=PYTHONUNBUFFERED=1
+Environment=THIEF_SERVER_CONFIG=/home/server/Desktop/PoliceGame2D/thief_server/config.json
+Environment=SDL_AUDIODRIVER=alsa
+EnvironmentFile=-/etc/police-game/photos.env
+ExecStart=
+ExecStart=/usr/bin/python3 -u /home/server/Desktop/PoliceGame2D/thief_server/main.py
+Restart=always
+RestartSec=3
+```
+
+Override oluşturmak için:
+
+```bash
+sudo systemctl edit thief-server.service
+sudo systemctl daemon-reload
+sudo systemctl enable thief-server.service
+sudo systemctl restart thief-server.service
+```
+
+### 4. Kontrol
+
+```bash
+systemctl is-enabled thief-server.service
+systemctl is-active thief-server.service
+curl http://localhost:8078/health
+sudo journalctl -b -u thief-server.service -n 60 --no-pager
+```
+
+Beklenen durum `enabled`, `active` ve health cevabında `"status":"healthy"` olmasıdır.
+
+## Pi Zero client kurulumu
+
+Her clientın farklı `screen_id` değeri vardır: `1`–`8`.
+
+### Kaynak repository ile ilk kurulum
+
+```bash
+cd "$HOME"
+git clone --depth 1 --single-branch --branch main \
+  https://github.com/burakbagoglu/PoliceGame2D.git
+cd PoliceGame2D/thief_client
+```
+
+Örnek ekran 1 kurulumu:
+
+```bash
+sudo bash setup_pi.sh \
+  --screen-id 1 \
+  --server server.local \
+  --serial-port /dev/ttyUSB0 \
+  --user "$(whoami)"
+```
+
+Diğer ekranlarda yalnız `--screen-id` değiştirilir.
 
 Kurulum:
 
-8 ekran → 8 ayrı Raspberry Pi Zero 2 W (client)
+- Runtime dosyalarını `/opt/polisoyunu` altına kopyalar.
+- Cihaza özel config’i oluşturur veya korur.
+- `thief-game.service` servisini kurar.
+- Kısıtlı uzaktan update helper ve servisini kurar.
+- Kullanıcıyı gerekli donanım gruplarına ekler.
+- Avahi/mDNS desteğini etkinleştirir.
 
-Her ekranda cam + piezo → Arduino → Pi Zero (hit input)
+`/opt/polisoyunu` içinde `.git` bulunmaması normaldir. Bu dizin source checkout değil, atomik olarak değiştirilen production release’tir.
 
-Tüm skorlar → Raspberry Pi 4 2 GB (server)
+### KMSDRM ve konsol modu
 
-Oyun:
+Pi Zero client doğrudan DRM/KMS ekranını kullanır. Masaüstü compositorü aynı ekranı tutarsa `kmsdrm not available` hatası oluşabilir.
 
-Hırsız sprite’ı sağdan sola sürekli koşar.
+```bash
+sudo systemctl disable --now display-manager.service || true
+sudo systemctl set-default multi-user.target
+sudo reboot
+```
 
-Ekranda sabit “hedef band” vardır.
+### Client kontrolü
 
-Hit geldiği anda hırsız band içindeyse: düşer +1 puan.
+```bash
+systemctl is-enabled thief-game.service
+systemctl is-active thief-game.service
+sudo journalctl -b -u thief-game.service -n 60 --no-pager
+```
 
-Her skor artışı Pi 4’e event olarak gönderilir.
+## Windows SD kart hazırlama aracı
 
-2) Donanım ve Bağlantılar
-2.1 Client (her ekran)
+`sd_card_tool`, Pi Zero 2 W kartlarını tek tek elle hazırlama yükünü azaltır.
 
-Raspberry Pi Zero 2 W
+```powershell
+cd sd_card_tool
+.\start_windows.bat
+```
 
-Arduino (piezo okuma + debounce)
+Araç genel olarak:
 
-Bağlantı: Arduino USB → Pi (Serial)
+- Raspberry Pi OS imajını seçer/indirir.
+- Çıkarılabilir SD kartı seçer.
+- Hostname, ekran numarası ve server adresini ayarlar.
+- Wi-Fi ve SSH ilk açılış ayarlarını hazırlar.
+- Client kurulumunun ilk bootta tamamlanmasını sağlar.
 
-Arduino görevi:
+Kart yazma işlemi hedef diskteki tüm verileri siler. Sistem diskini veya iç diski seçmeyin.
 
-Piezo analog okuyup “tek hit” üretmek
+Ayrıntılar: [SD kart aracı README](sd_card_tool/README.md).
 
-Debounce/refractory: 150–300 ms
+## Spectator kurulumu
 
-Serial output: HIT\n
+Spectator merkezi skor ve oyun durumunu tam ekran gösterir. Pi4 üzerinde veya ayrı bir Raspberry Pi’de çalışabilir.
 
-2.2 Server (merkez)
+Ana giriş noktası:
 
-Raspberry Pi 4 2 GB
+```text
+thief_spectator/screen.py
+```
 
-Aynı LAN (router/AP)
+Config içinde server adresi `http://server.local:8078` olarak ayarlanabilir. Production servisinde `User`, `WorkingDirectory` ve `ExecStart` değerlerinin gerçek Linux kullanıcısına göre düzenlendiğini doğrulayın.
 
-3) Yazılım Mimarisi
-3.1 Pi Zero (Client) bileşenleri
+```bash
+systemctl is-enabled thief-spectator.service
+systemctl is-active thief-spectator.service
+sudo journalctl -b -u thief-spectator.service -n 60 --no-pager
+```
 
-Pygame render + game loop (30 FPS)
+## Dashboard ve operatör ekranları
 
-HitInput (serial okuyucu thread)
+| Sayfa | Adres | Amaç |
+|---|---|---|
+| Dashboard | `/dashboard` | Oyun, clientlar, telemetri, ses, kamera ve ayarlar |
+| Hızlı başlangıç | `/operator` | Kafe çalışanının oturumu birkaç adımda başlatması |
+| Spectator web ekranı | `/screen` | Merkezi skor/seyirci görünümü |
+| Sahne editörü | `/scene-editor` | Görsel sahne hazırlama ve yayınlama |
+| Fotoğraf galerisi | `/photos` | Oturum ve fotoğraf yönetimi |
+| Health | `/health` | Server çalışma ve ses durumu |
 
-GameState (RUN/FALL/RESET/COOLDOWN)
+Yerel ağdan örnek:
 
-Animator (run/fall frame oynatma)
+```text
+http://server.local:8078/dashboard
+```
 
-NetClient (Pi 4’e HTTP event post)
+### Client telemetrisi
 
-Config (screen_id, speed, band, vb.)
+Dashboard her ekran için şunları gösterebilir:
 
-3.2 Pi 4 (Server) bileşenleri
+- Bağlı/çevrimdışı durumu
+- FPS ve P95 kare süresi
+- P95 çizim, kopyalama ve flip süresi
+- RAM ve sıcaklık
+- Performans profili ve kalite seviyesi
+- Render/çıkış çözünürlüğü
+- Direct scaling durumu
+- `static-frozen`, `dirty-rect` veya `full-render` yolu
+- Güncellenen piksel oranı ve dirty bölge sayısı
+- Seri port durumu
+- Aktif sahne ve event kuyruğu
+- Uygulama ve update sürümü
 
-HTTP API: POST /event
+### Client ayarlarını yayınlama
 
-Idempotency (event_id tekrarlarını ignore)
+Dashboardda render çözünürlüğü, FPS, kalite, adaptif kalite, oyun alanı, gölge ve benzeri izin verilen ayarlar düzenlenebilir.
 
-Skor tutma: ekran bazlı + toplam
+Güvenlik nedeniyle aşağıdaki kimlik/ağ alanları uzaktan config yayınıyla değiştirilmez:
 
-Opsiyonel dashboard: GET /score
+- `screen_id`
+- `server_url`
+- `server_base_url`
+- `serial_port`
 
-4) Asset Gereksinimleri (Pygame’e uygun)
-4.1 Zorunlu
+Bu alanları değiştirmek için ilgili clientta `setup_pi.sh` yeniden çalıştırılır.
 
-Hırsız animasyonları
+Ayrıntılar: [Dashboard Kullanım Rehberi](DASHBOARD_GUIDE.md).
 
-thief_run/frame_0001.png ...
+## Sahne editörü
 
-thief_fall/frame_0001.png ...
+Sahne editörü, Pygame client ekranlarını tarayıcıda görsel olarak tasarlamak için kullanılır.
 
-Target band (tek PNG veya çizim)
+Başlıca özellikler:
 
-ui/band.png (veya pygame ile rect çizilir)
+- Canvas üzerinde seçme, taşıma ve köşeden boyutlandırma
+- Zoom, pan, ızgara ve hizalama çizgileri
+- Çoklu seçim
+- Katman kilitleme ve gizleme
+- Gruplama ve prefab oluşturma
+- Özel sahne oluşturma, kopyalama ve silme
+- Timeline ve keyframe animasyonları
+- Fade, slide ve zoom sahne geçişleri
+- Skor, süre, isabet, kazanma ve kaybetme tetikleyicileri
+- Merkezi ses timeline’ı
+- Sprite-sheet animasyon ayarları
+- Pi Zero performans bütçesi ve uyarılar
+- Taslak kaydetme, önizleme, yayınlama ve sürüm geçmişi
 
-Arka plan
+Yayınlanan sahneler clientlar tarafından alınır ve yerel cache içinde tutulur. Ayrıntılar: [Sahne Editörü Rehberi](SCENE_EDITOR_GUIDE.md).
 
-bg/bg.png (tek görsel)
+## Ses ve kamera
 
-(opsiyonel parallax: bg_far.png, bg_mid.png, bg_near.png)
+### Merkezi ses
 
-Gölge (önerilir)
+Müzik ve efektler Pi4 üzerinden çalınır; client ekranlarında hoparlör gerekmez.
 
-misc/shadow.png
+Pi4 analog çıkış kontrolü:
 
-4.2 Önerilen efektler
+```bash
+aplay -l
+amixer scontrols
+speaker-test -c 2 -t wav
+```
 
-Hit effect: effects/hit/frame_0001.png...
+Health çıktısında aşağıdaki alanlar kontrol edilir:
 
-Miss icon: effects/miss.png
+```bash
+curl -s http://localhost:8078/health | python3 -m json.tool
+```
 
-UI skor panel: ui/score_panel.png
+- `audio.available: true`
+- `audio.device_active`
+- `audio.last_error: null`
+- `using_fallback_music`
+- `using_fallback_sfx`
 
-Performans notu:
+`using_fallback_music: true`, özel müzik yüklenmediği ve sentetik yedek müziğin kullanıldığı anlamına gelir.
 
-Video kullanma (Pi Zero’da risk)
+### USB kamera
 
-PNG’leri makul boyutta tut (256–512 px karakter yüksekliği)
+```bash
+v4l2-ctl --list-devices
+ls -l /dev/video*
+fswebcam --no-banner /tmp/kamera-test.jpg
+```
 
-Run: 8–16 frame, Fall: 6–12 frame
+Fotoğraf sistemi ekran kotası tamamlanınca çekim yapabilir. Oturum fotoğrafları Git’e girmez ve PIN korumalı galeride tutulur.
 
-Animasyon FPS: 12–15
+## Güncelleme sistemi
 
-5) Oyun Mantığı
-5.1 Hedef Band
+### Geliştirme bilgisayarından GitHub’a
 
-Band = x_min ile x_max arası dikey bölge
+Yalnız ilgili dosyaları stage edin:
 
-Hit geldiği anda:
+```bash
+git status
+git diff --check
+python -m pytest thief_client thief_server -q
+git add <ilgili-dosyalar>
+git commit -m "fix: kısa ve açıklayıcı mesaj"
+git push origin main
+```
 
-thief_rect.centerx band aralığında mı?
+Karışık çalışma ağacında bilinçsizce `git add -A` kullanmayın.
 
-Band ayarı:
+### Pi4 server güncellemesi
 
-Ortaya koy: band_center = width/2
+```bash
+cd "$HOME/Desktop/PoliceGame2D"
+git status
+git pull --ff-only origin main
+sudo systemctl restart thief-server.service
+sudo systemctl restart thief-spectator.service
+```
 
-Genişlik: 80–140 px (zorluk)
+Production `config.json` dashboard tarafından değiştirilmiş olabilir. Pull öncesinde `git status` ve `git diff -- thief_server/config.json` kontrol edilmelidir; config körlemesine silinmemelidir.
 
-5.2 State Machine
+### Client güvenli güncellemesi
 
-RUN: hırsız hareket + run animasyonu
+Clientlarda doğrudan `/opt/polisoyunu` içinde `git pull` yapılmaz.
 
-FALL: fall animasyonu, bitince reset
+Dashboarddaki **Güvenli güncelle** düğmesi:
 
-COOLDOWN: hit spam engeli (200 ms)
+1. Clientın normal poll kanalına `update` komutu bırakır.
+2. Client yalnız sabit allowlist helperını çalıştırır.
+3. Root updater `main` dalından yalnız `thief_client/` paketini sparse clone ile indirir.
+4. Zorunlu sprite ve Python dosyaları doğrulanır.
+5. Cihaza özel config korunur.
+6. Release atomik olarak `/opt/polisoyunu` altına geçirilir.
+7. Client servisi 15 saniye boyunca kararlılık kontrolünden geçer.
+8. Servis çöker veya yeniden başlarsa eski release geri yüklenir.
+9. Başarılı sürüm `/var/lib/polisoyunu/update-status.json` içine yazılır.
 
-RESET: hırsız sağdan spawn → RUN
+Clientta kontrol:
 
-5.3 Skor
+```bash
+cat /var/lib/polisoyunu/update-status.json
+systemctl is-active thief-game.service
+sudo journalctl -u thief-game-update.service -n 80 --no-pager
+```
 
-Başarı: +1
+Sekiz clientı aynı anda güncellemek yerine önce bir clientta doğrulayın, ardından diğerlerini sırayla güncelleyin.
 
-Fail: +0 (opsiyonel miss efekt/ses)
+## Private repository geçişi
 
-6) Network: Event gönderimi (Pi Zero → Pi 4)
-6.1 Endpoint
+> **Kritik:** Mevcut client updater `https://github.com/burakbagoglu/PoliceGame2D.git` adresinden kimlik doğrulamasız clone yapar. Repository private yapıldığı anda dashboarddan güvenli client güncellemesi GitHub kimlik doğrulaması olmadığı için çalışmayı bırakır.
 
-POST http://<PI4_IP>:8078/event
+Repository’yi private yapmadan önce aşağıdaki kararlardan biri uygulanmalıdır.
 
-Payload:
+### Önerilen model: Pi4 update dağıtıcısı
 
-{
-  "event_id": "uuid",
-  "screen_id": 3,
-  "points": 1,
-  "ts_ms": 1730000000000
-}
+En güvenli saha mimarisi:
 
-6.2 Idempotency
+1. Yalnız Pi4 private GitHub repository’ye read-only deploy key ile erişir.
+2. Pi4 güncel client release paketini indirir ve doğrular.
+3. Clientlar paketi yalnız yerel `server.local` adresinden alır.
+4. Paket checksum veya imza ile doğrulanır.
+5. Sekiz Pi Zero üzerinde GitHub anahtarı/tokenı tutulmaz.
 
-Client her başarıya unique event_id üretir.
+Bu model henüz mevcut GitHub-clone updater’ın davranışı değildir; private geçişten önce ayrıca uygulanmalıdır.
 
-Server aynı event_id tekrar gelirse ignore eder.
+### Alternatif: Her cihaza read-only deploy key
 
-6.3 Offline davranışı (önerilen)
+Her clienta ayrı read-only deploy key verilebilir ve updater SSH URL kullanacak şekilde değiştirilebilir. Dezavantajları:
 
-Server’a gönderim başarısızsa event’i local kuyruğa yaz (dosya)
+- Sekiz cihazda ayrı anahtar yönetimi gerekir.
+- `known_hosts` güvenli biçimde hazırlanmalıdır.
+- Bir cihaz kaybolursa ilgili deploy key GitHub’dan iptal edilmelidir.
+- Mevcut updater hardcoded HTTPS URL kullandığı için kod değişikliği gerekir.
 
-Bağlantı gelince sırayla gönder
+GitHub Personal Access Token’ı source code, config, systemd unit veya shell history içine yazmayın.
 
-7) Client Proje Yapısı (önerilen)
-thief_client/
-  main.py
-  config.json
-  requirements.txt
-  assets/
-    thief_run/
-    thief_fall/
-    bg/
-      bg.png
-    ui/
-      band.png
-      score_panel.png
-    effects/
-      hit/
-      miss.png
-    misc/
-      shadow.png
-  lib/
-    config.py
-    animation.py
-    hit_input.py
-    net_client.py
-    game.py
+### Pi4 için read-only deploy key özeti
 
-8) config.json (ekran bazlı ayar)
-{
-  "screen_id": 1,
-  "server_url": "http://192.168.1.10:8078/event",
-  "fps": 30,
-  "thief_speed_px_s": 360,
-  "spawn_x": 2100,
-  "reset_x": -200,
-  "band_x_min": 900,
-  "band_x_max": 1020,
-  "hit_cooldown_ms": 200,
-  "fullscreen": true
-}
+Pi4 üzerinde:
 
-9) Client Çalışma Akışı (Pygame)
-9.1 Başlatma
+```bash
+ssh-keygen -t ed25519 -f "$HOME/.ssh/polisoyunu_github" -C "polisoyunu-server"
+cat "$HOME/.ssh/polisoyunu_github.pub"
+```
 
-config oku
+Public anahtar GitHub repository ayarlarında read-only deploy key olarak eklenir. Özel anahtar Pi4 dışına çıkarılmaz.
 
-pygame init
+`~/.ssh/config` örneği:
 
-fullscreen window oluştur
+```sshconfig
+Host github-polisoyunu
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/polisoyunu_github
+    IdentitiesOnly yes
+```
 
-tüm assetleri preload et
+Server repository remote’u:
 
-serial okuyucu thread başlat (hit queue)
+```bash
+cd "$HOME/Desktop/PoliceGame2D"
+git remote set-url origin \
+  git@github-polisoyunu:burakbagoglu/PoliceGame2D.git
+ssh -T git@github-polisoyunu
+git fetch origin main
+```
 
-ana loop başlat
+### Private geçiş kontrol listesi
 
-9.2 Ana loop (30 FPS)
+- [ ] Public geçmişte gerçek parola, PIN, token veya özel anahtar bulunmadığı doğrulandı.
+- [ ] GitHub secret scanning sonuçları kontrol edildi.
+- [ ] Pi4 için read-only repository erişimi hazırlandı.
+- [ ] Geliştirme bilgisayarının SSH erişimi doğrulandı.
+- [ ] Client update dağıtım yöntemi seçildi ve test edildi.
+- [ ] Private geçişten önce tüm clientlar çalışan son public release’e güncellendi.
+- [ ] Repository private yapıldıktan sonra Pi4 üzerinde `git fetch` test edildi.
+- [ ] Bir test clientında sonraki update akışı doğrulandı.
+- [ ] Eski veya sızmış olabilecek kimlik bilgileri iptal edildi.
 
-Her frame:
+Repository’yi private yapmak daha önce Git geçmişine yazılmış bir sırrı güvenli hale getirmez. Böyle bir durum varsa sır rotate edilmeli ve gerekirse Git geçmişinden temizlenmelidir.
 
-pygame event pump (QUIT, ESC)
+## Config ve çalışma verileri
 
-hit queue kontrol
+### Server
 
-hit varsa check_band()
+| Yol | İçerik | Git durumu |
+|---|---|---|
+| `thief_server/config.json` | Oyun, ses, kamera ve server ayarları | Takip edilir; production farkını pull öncesi kontrol edin |
+| `thief_server/scene_data/` | Sahne taslakları, yayınlar, assetler ve sürümler | Takip edilmez |
+| `thief_server/photo_sessions/` | Oturum fotoğrafları | Takip edilmez |
+| `thief_server/runtime_state.json` | Aktif oyun checkpoint’i | Takip edilmez |
+| `thief_server/client_settings.json` | Client config revizyonları | Takip edilmez |
+| `/etc/police-game/photos.env` | Operatör PIN’i | Kesinlikle Git’e girmez |
 
-state’e göre update (pos + anim)
+### Client
 
-draw (bg → band → shadow → thief → ui)
+| Yol | İçerik |
+|---|---|
+| `/opt/polisoyunu/thief_client/config.json` | Cihaza özel client ayarları |
+| `/opt/polisoyunu/thief_client/scene_cache/` | Yayınlanan sahne asset cache’i |
+| `/var/lib/polisoyunu/update-status.json` | Son güvenli update durumu |
+| `/etc/polisoyunu-client-update.conf` | Updater hedef kullanıcı/install root bilgisi |
+| `/etc/systemd/system/thief-game.service` | Client otomatik açılış servisi |
 
-pygame.display.flip()
+### Yedekleme
 
-10) Hit Input Tasarımı
-10.1 Önerilen model: Thread + Queue
+Pi4 üzerindeki `thief-server-backup.timer` günlük yedek üretir.
 
-Serial dinleme thread’i HIT gördüğünde queue.put("HIT")
+```bash
+systemctl status thief-server-backup.timer --no-pager
+sudo systemctl start thief-server-backup.service
+sudo journalctl -u thief-server-backup.service -n 40 --no-pager
+sudo ls -lh /var/backups/polisoyunu
+```
 
-Ana thread queue.get_nowait() ile alır
+Yedekler fotoğraf ve PIN içerebileceği için herkese açık ağ paylaşımına konulmamalıdır.
 
-Neden?
+## Testler
 
-Serial I/O bloklar; oyun döngüsü asla bloklanmamalı.
+### Tüm client ve server testleri
 
-11) Performans Kuralları (Pi Zero 2 W için)
+```bash
+python -m pytest thief_client thief_server -q
+```
 
-FPS: 30 sabit
+### Yalnız client
 
-Convert:
+```bash
+python -m pytest thief_client -q
+```
 
-surface = pygame.image.load(...).convert_alpha()
+### Yalnız server
 
-Her frame yeni Surface/Rect üretme, reuse et
+```bash
+python -m pytest thief_server -q
+```
 
-Asset boyutlarını küçült (özellikle alpha)
+### Saha kabul testi
 
-Parallax varsa 2–3 layer yeter
+- [ ] Sekiz ekran dashboardda doğru numarayla bağlı.
+- [ ] Clientlar 720p çıkış ve beklenen FPS değerinde.
+- [ ] Her piezo yalnız kendi ekranında isabet oluşturuyor.
+- [ ] Wi-Fi kopup geldiğinde event kuyruğu boşalıyor.
+- [ ] Bir client yeniden başladığında oyuna geri katılıyor.
+- [ ] Eksik client oyunun başlamasını engellemiyor.
+- [ ] Kota tamamlanınca doğru ekranda jail sahnesi açılıyor.
+- [ ] Kamera doğru anda fotoğraf çekiyor.
+- [ ] Müzik ve efektler analog çıkıştan duyuluyor.
+- [ ] Fotoğraf galerisi PIN olmadan açılmıyor.
+- [ ] Bir test clientında güvenli update ve rollback kontrol edildi.
+- [ ] Pi4 yeniden başladığında server ve spectator otomatik açılıyor.
+- [ ] Elektrik kesintisi simülasyonunda aktif oturum kurtarılıyor.
+- [ ] En az 30–40 dakikalık tam oyun saha testi tamamlandı.
 
-12) Dağıtım (8 client + 1 server)
-12.1 Ağ
+## Sorun giderme
 
-Pi 4 statik IP: 192.168.1.10 önerilir
+### Server `217/USER`
 
-Pi Zero’lar DHCP reservation veya statik:
+Systemd unit içindeki `User=` hesabı cihazda yoktur.
 
-192.168.1.21 … 192.168.1.25
+```bash
+whoami
+systemctl show thief-server.service -p User -p WorkingDirectory -p ExecStart
+```
 
-12.2 Tek imaj stratejisi
+Gerçek kullanıcı ve `/home/<kullanıcı>/...` yolu için systemd override oluşturun.
 
-1 Pi’yi kur → SD imaj al → 5 SD’ye yaz
+### Client `video system not initialized`
 
-Sadece config.json içinde screen_id değiştir
+SDL video sürücüsü veya ekran oturumu doğru hazırlanmamıştır. Service environment içinde `SDL_VIDEODRIVER=kmsdrm` bulunduğunu ve HDMI/DRM cihazının mevcut olduğunu kontrol edin.
 
-12.3 Otomatik başlatma
+### Client `kmsdrm not available`
 
-systemd service ile oyun boot’ta başlasın
+Masaüstü compositorü DRM cihazını tutuyor olabilir.
 
-crash olursa restart
+```bash
+sudo systemctl disable --now display-manager.service || true
+sudo systemctl set-default multi-user.target
+sudo reboot
+```
 
-13) Test Planı (etkinlik öncesi zorunlu)
-13.1 Fonksiyon
+### Client sürekli yeniden başlıyor
 
-Band içi hit: her seferinde +1
+```bash
+systemctl status thief-game.service --no-pager -l
+sudo journalctl -b -u thief-game.service -n 80 --no-pager
+```
 
-Band dışı: +0
+`systemctl is-active` restart döngüsünde kısa süre `active` gösterebilir. Journal ve `NRestarts` birlikte kontrol edilmelidir:
 
-Cooldown: art arda vuruşlar çift saymıyor
+```bash
+systemctl show thief-game.service -p NRestarts -p ActiveState -p SubState
+```
 
-13.2 Dayanıklılık
+### Sprite bulunamadı
 
-2 saat aralıksız çalıştır
+Güncel release içinde şu dosya bulunmalıdır:
 
-Arduino çek-tak testi
+```text
+/opt/polisoyunu/thief_client/assets/thief.png
+```
 
-Wi-Fi kopma/geri gelme testi
+Kontrol:
 
-13.3 8 ekran entegrasyon
+```bash
+ls -lh /opt/polisoyunu/thief_client/assets/thief.png
+```
 
-Server toplam skor doğru mu?
+`6119727` ve sonraki sürümlerde zorunlu sprite client paketinin içindedir.
 
-Bir client kapanınca diğerleri devam ediyor mu?
+### Client update `running` durumunda kaldı
 
-14) Minimum teslim edilecekler (MVP)
+```bash
+cat /var/lib/polisoyunu/update-status.json
+systemctl status thief-game-update.service --no-pager
+sudo journalctl -u thief-game-update.service -n 100 --no-pager
+```
 
-Hırsız run + fall
+Public repository döneminde en yaygın neden GitHub/Wi-Fi erişimidir. Private geçişten sonra kimlik doğrulama hazırlanmamışsa clone işlemi başarısız olur.
 
-Target band
+### `server.local` çözülmüyor
 
-Background
+```bash
+hostname
+systemctl is-active avahi-daemon
+getent hosts server.local
+```
 
-Local score
+Gerekirse geçici olarak serverın LAN IP adresini kullanın; kalıcı çözüm mDNS/Avahi veya DHCP reservation olmalıdır.
 
-Pi 4’e event gönderimi + total skor
+### Ses az veya hiç yok
+
+```bash
+aplay -l
+amixer scontrols
+amixer get Master
+speaker-test -c 2 -t wav
+curl -s http://localhost:8078/health | python3 -m json.tool
+```
+
+Dashboard master/müzik/SFX seviyesi ile sistem ALSA seviyesi farklı katmanlardır. İkisinin de düşük olmadığını kontrol edin.
+
+## Güvenlik ve veri yönetimi
+
+- Operatör PIN’i `/etc/police-game/photos.env` içinde ve `0600` izinle tutulmalıdır.
+- Fotoğraf klasörleri web server dışında doğrudan paylaşılmamalıdır.
+- Dashboardun yönetim fonksiyonları güvenilmeyen internete port-forward edilmemelidir.
+- Uzaktan bakım için doğrudan router portu açmak yerine Tailscale benzeri özel ağ tercih edilmelidir.
+- Pi cihazlarında varsayılan veya ortak SSH parolası kullanılmamalıdır.
+- Mümkünse SSH anahtar erişimi ve sınırlı sudo kuralları kullanılmalıdır.
+- GitHub tokenı veya deploy private key repository’ye commit edilmemelidir.
+- Private repository erişimi her cihaz için en az yetkiyle verilmelidir.
+- Kaybolan/servisten çıkan cihazların deploy key’i ve Tailscale erişimi iptal edilmelidir.
+- Fotoğraf saklama ve silme politikası işletmenin açık prosedürüne göre belirlenmelidir.
+- Production yedeklerinin geri yükleme testi düzenli yapılmalıdır.
+
+## Geliştirme notları
+
+- Client render yolunda kare başına yeni büyük `Surface` üretmekten kaçının.
+- Görselleri yüklerken mümkün olduğunda `convert()`/`convert_alpha()` ile önceden dönüştürün.
+- Statik sahnelerde `static-frozen`, sınırlı hareketlerde dirty rect kullanın.
+- Ağ ve serial I/O ana render döngüsünü bloklamamalıdır.
+- Client kimliği ve server adresi environment/config ayrımına dikkat edilerek değiştirilmelidir.
+- Server eventleri idempotent olmalı; aynı `event_id` ikinci kez skor üretmemelidir.
+- Production verilerini test fixture veya Git commit’i içine koymayın.
+- Yeni updater değişikliklerinde atomik release, config koruma ve rollback testleri zorunludur.
+
+## Asset ve lisans notu
+
+`thief-1.0/` altındaki üçüncü taraf sprite paketinin kendi `LICENSE.txt` ve kaynak notları vardır. Assetleri dağıtmadan veya ticari ortamda kullanmadan önce ilgili lisans dosyalarını inceleyin.
+
+Repository kökünde proje geneline ait ayrı bir lisans dosyası yoksa kodun kullanım/dağıtım hakları hakkında varsayım yapmayın; proje sahibi tarafından açık bir lisans eklenmelidir.
+
+## Diğer belgeler
+
+- [Detaylı Sistem Kurulum ve İşletim Rehberi](SISTEM_KURULUM_VE_ISLETIM_REHBERI.md)
+- [Dashboard Kullanım Rehberi](DASHBOARD_GUIDE.md)
+- [Sahne Editörü Kullanım Rehberi](SCENE_EDITOR_GUIDE.md)
+- [Production Notları](PRODUCTION.md)
+- [SD Kart Hazırlama Aracı](sd_card_tool/README.md)
+
+## Günlük hızlı kontrol
+
+Pi4:
+
+```bash
+systemctl is-active thief-server.service
+systemctl is-active thief-spectator.service
+curl -s http://localhost:8078/health | python3 -m json.tool
+```
+
+Bir client:
+
+```bash
+systemctl is-active thief-game.service
+cat /var/lib/polisoyunu/update-status.json
+sudo journalctl -b -u thief-game.service -n 20 --no-pager
+```
+
+Operatör:
+
+```text
+http://server.local:8078/operator
+```
+
+Teknik dashboard:
+
+```text
+http://server.local:8078/dashboard
+```
